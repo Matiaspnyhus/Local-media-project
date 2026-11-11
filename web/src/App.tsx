@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
-import { api, ApiError, type Folders, type Home, type Item, type PlayInfo, type Season, type Show, type State } from './api'
+import { api, ApiError, type Folders, type Home, type Item, type PlayInfo, type Season, type Settings, type Show, type State } from './api'
 import { measureCaps } from './caps'
 
 type Screen = { name: 'library' } | { name: 'watch'; id: string } | { name: 'show'; id: string }
@@ -212,12 +212,18 @@ function formatTime(ms: number): string {
   return (h ? h + ':' + String(m).padStart(2, '0') : String(m)) + ':' + String(sec).padStart(2, '0')
 }
 
+function containerLabel(c: string): string {
+  const names: Record<string, string> = { matroska: 'MKV', mpegts: 'TS', asf: 'WMV', mov: 'MOV' }
+  return names[c] || c.toUpperCase()
+}
+
 const NEEDS = 'Needs converting, which arrives in a later version'
 
 function itemLabel(it: Item, withShow: boolean): string {
   if (it.kind !== 'episode') return it.title + (it.year ? ` (${it.year})` : '')
-  const ep = it.episodeEnd ? `Episodes ${it.episode}–${it.episodeEnd}` : `Episode ${it.episode}`
-  return withShow ? `${it.showTitle} · Season ${it.season} · ${ep}` : ep
+  const num = it.episodeEnd ? `Episodes ${it.episode}–${it.episodeEnd}` : `Episode ${it.episode}`
+  const ep = /^Episodes? \d/.test(it.title) ? num : `${it.episode}. ${it.title}`
+  return withShow ? `${it.showTitle} · Season ${it.season} · ${num}` : ep
 }
 
 function Library({
@@ -241,6 +247,7 @@ function Library({
   const [note, setNote] = useState('')
   const [urls, setUrls] = useState<string[]>([])
   const [showConnect, setShowConnect] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
   const isOwner = state.user?.role === 'owner'
 
   const load = useCallback(() => {
@@ -254,7 +261,7 @@ function Library({
     api.connect().then((r) => setUrls(r.urls)).catch(() => undefined)
   }, [])
   // While files are still being inspected, look again every few seconds.
-  const pending = home?.inspection.available ? home.inspection.pending : 0
+  const pending = (home?.inspection.available ? home.inspection.pending : 0) + (home?.lookups.on ? home.lookups.pending : 0)
   useEffect(() => {
     if (!pending) return
     const t = window.setTimeout(load, 4000)
@@ -301,9 +308,15 @@ function Library({
             Export support bundle
           </a>
         )}
+        {isOwner && (
+          <button onClick={() => setShowSettings((v) => !v)} aria-expanded={showSettings}>
+            Settings
+          </button>
+        )}
         <button onClick={signOut}>Sign out</button>
       </div>
 
+      {showSettings && isOwner && <SettingsCard onChanged={load} />}
       {showConnect && (
         <div className="card" data-testid="connect">
           <h2 style={{ marginTop: 0 }}>Open on a phone, tablet or another PC</h2>
@@ -394,7 +407,7 @@ function Library({
                   Shows ({shows.length})
                 </button>
               </div>
-              {tab === 'films' ? <ItemList items={movies} onPlay={onPlay} withShow /> : <ShowList shows={shows} onShow={onShow} />}
+              {tab === 'films' ? <ItemList items={movies} onPlay={onPlay} withShow posters /> : <ShowList shows={shows} onShow={onShow} />}
               {tab === 'films' && movies.length === 0 && <p className="dim">No films found.</p>}
               {tab === 'shows' && shows.length === 0 && <p className="dim">No shows found.</p>}
             </section>
@@ -403,7 +416,8 @@ function Library({
       )}
       <p className="dim" style={{ marginTop: '2rem' }}>
         Local Media {state.version}. This early version plays only files your browser can play by itself. The others
-        are marked; converting them arrives in a later version.
+        are marked; converting them arrives in a later version. Posters and descriptions come from TMDB: this product
+        uses the TMDB API but is not endorsed or certified by TMDB.
       </p>
     </main>
   )
@@ -429,14 +443,18 @@ function ShowList({ shows, onShow }: { shows: Show[]; onShow: (id: string) => vo
     <ul className="list">
       {shows.map((sh) => (
         <li key={sh.id}>
-          <button className="row" onClick={() => onShow(sh.id)}>
-            <div className="title">
-              {sh.title}
-              {sh.year ? ` (${sh.year})` : ''}
-            </div>
-            <div className="meta">
-              {sh.episodes} {sh.episodes === 1 ? 'episode' : 'episodes'}
-              {sh.watched > 0 ? ` · ${sh.watched} watched` : ''}
+          <button className="row withposter" onClick={() => onShow(sh.id)}>
+            <Poster id={sh.id} has={sh.poster} />
+            <div>
+              <div className="title">
+                {sh.title}
+                {sh.year ? ` (${sh.year})` : ''}
+              </div>
+              <div className="meta">
+                {sh.episodes} {sh.episodes === 1 ? 'episode' : 'episodes'}
+                {sh.watched > 0 ? ` · ${sh.watched} watched` : ''}
+              </div>
+              {sh.overview && <div className="overview">{sh.overview}</div>}
             </div>
           </button>
         </li>
@@ -445,24 +463,120 @@ function ShowList({ shows, onShow }: { shows: Show[]; onShow: (id: string) => vo
   )
 }
 
-function ItemList({ items, onPlay, withShow }: { items: Item[]; onPlay: (id: string) => void; withShow?: boolean }) {
+function Poster({ id, has }: { id: string; has: boolean }) {
+  return has ? (
+    <img className="poster" src={`/api/items/${id}/poster`} alt="" loading="lazy" />
+  ) : (
+    <div className="poster none" aria-hidden="true" />
+  )
+}
+
+function SettingsCard({ onChanged }: { onChanged: () => void }) {
+  const [st, setSt] = useState<Settings | null>(null)
+  const [key, setKey] = useState('')
+  const [msg, setMsg] = useState('')
+  const [busy, setBusy] = useState(false)
+  const load = useCallback(() => {
+    api.settings().then(setSt).catch((e: ApiError) => setMsg(e.message))
+  }, [])
+  useEffect(load, [load])
+  const working = !!st && st.tmdbKeySaved && st.online && (st.lookups.running || st.lookups.pending > 0) && !st.lookups.problem
+  useEffect(() => {
+    if (!working) return
+    const t = window.setTimeout(() => {
+      load()
+      onChanged()
+    }, 3000)
+    return () => window.clearTimeout(t)
+  }, [working, st, load, onChanged])
+
+  const save = (e: FormEvent) => {
+    e.preventDefault()
+    setBusy(true)
+    setMsg('')
+    api
+      .setTmdbKey(key)
+      .then(() => {
+        setKey('')
+        setMsg('Key saved. Looking up your films and shows now.')
+        load()
+      })
+      .catch((err: ApiError) => setMsg(err.message))
+      .then(() => setBusy(false))
+  }
+  const toggle = (on: boolean) => api.setOnline(on).then(load, (e: ApiError) => setMsg(e.message))
+  const remove = () => api.setTmdbKey('').then(load, (e: ApiError) => setMsg(e.message))
+
+  return (
+    <div className="card" data-testid="settings">
+      <h2 style={{ marginTop: 0 }}>Posters and descriptions from the internet</h2>
+      <p className="dim">
+        They come from TMDB, a free film and TV database. Only titles and years are sent, never file names or anything
+        else about your PC. Your key stays on this PC.
+      </p>
+      {st && st.tmdbKeySaved ? (
+        <>
+          <p>
+            A TMDB key is saved. {st.lookups.found} found, {st.lookups.notFound} not found
+            {st.lookups.pending > 0 ? `, ${st.lookups.pending} still to look up` : ''}.
+          </p>
+          {st.lookups.problem && <p className="error">Lookups stopped: {st.lookups.problem}.</p>}
+          <p>
+            <label className="check">
+              <input type="checkbox" checked={st.online} onChange={(e) => toggle(e.target.checked)} /> Look up new films
+              and shows online
+            </label>
+          </p>
+          <button onClick={remove}>Remove the key</button>
+        </>
+      ) : (
+        <form onSubmit={save}>
+          <label htmlFor="tmdbkey">TMDB API key (the short one, 32 letters and digits)</label>
+          <input id="tmdbkey" type="password" autoComplete="off" value={key} onChange={(e) => setKey(e.target.value)} />
+          <p>
+            <button className="primary" type="submit" disabled={busy || !key.trim()}>
+              {busy ? 'Checking the key…' : 'Save key'}
+            </button>
+          </p>
+        </form>
+      )}
+      {msg && <p className="note" role="status">{msg}</p>}
+    </div>
+  )
+}
+
+function ItemList({
+  items,
+  onPlay,
+  withShow,
+  posters,
+}: {
+  items: Item[]
+  onPlay: (id: string) => void
+  withShow?: boolean
+  posters?: boolean
+}) {
   return (
     <ul className="list">
       {items.map((it) => (
         <li key={it.id}>
-          <button className="row" onClick={() => onPlay(it.id)}>
+          <button className={posters ? 'row withposter' : 'row'} onClick={() => onPlay(it.id)}>
+            {posters && <Poster id={it.id} has={it.poster} />}
+            <div>
             <div className="title">{itemLabel(it, !!withShow)}</div>
             <div className="meta">
               {it.durationMs > 0 ? formatTime(it.durationMs) + ' · ' : ''}
-              {it.container.toUpperCase()}
+              {containerLabel(it.container)}
               {it.played ? ' · Watched' : it.positionMs > 0 ? ` · Stopped at ${formatTime(it.positionMs)}` : ''}
             </div>
             {it.playable === 'no' && <div className="needs">{NEEDS}</div>}
+            {posters && it.overview && <div className="overview">{it.overview}</div>}
             {it.positionMs > 0 && it.durationMs > 0 && !it.played && (
               <div className="progress">
                 <div style={{ width: Math.min(100, (it.positionMs / it.durationMs) * 100) + '%' }} />
               </div>
             )}
+            </div>
           </button>
         </li>
       ))}
@@ -499,6 +613,7 @@ function ShowPage({
         </h1>
       </div>
       {error && <p className="error" role="alert">{error}</p>}
+      {data?.show.overview && <p className="dim">{data.show.overview}</p>}
       {data?.seasons.map((se) => (
         <section key={se.number}>
           <h2>{se.title}</h2>

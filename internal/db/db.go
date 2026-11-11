@@ -156,6 +156,18 @@ CREATE TABLE sidecars (
   UNIQUE (file_id, rel_path)
 );
 `,
+	// 3: online lookups. match_key is the title as the file names it,
+	// which is what the scan matches on; the title shown may then be
+	// replaced by the proper one from TMDB without confusing the scan.
+	`
+ALTER TABLE items ADD COLUMN match_key TEXT NOT NULL DEFAULT '';
+ALTER TABLE items ADD COLUMN tmdb_id INTEGER NOT NULL DEFAULT 0;
+-- 0 = not looked up yet, 1 = found, 2 = looked up and not found
+ALTER TABLE items ADD COLUMN lookup_state INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE items ADD COLUMN lookup_at INTEGER NOT NULL DEFAULT 0;
+-- file name of the poster in the artwork folder, '' when there is none
+ALTER TABLE items ADD COLUMN poster TEXT NOT NULL DEFAULT '';
+`,
 }
 
 // SchemaVersion is the version this build expects.

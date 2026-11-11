@@ -2,6 +2,7 @@ package server
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Matiaspnyhus/Local-media-project/internal/ids"
+	"github.com/Matiaspnyhus/Local-media-project/internal/metadata"
 	"github.com/Matiaspnyhus/Local-media-project/internal/playback"
 )
 
@@ -31,6 +33,8 @@ type itemView struct {
 	Played     bool     `json:"played"`
 	Playable   string   `json:"playable"` // yes, no, unknown
 	Reasons    []string `json:"reasons"`
+	Overview   string   `json:"overview,omitempty"`
+	Poster     bool     `json:"poster"`
 
 	fileID    string
 	probed    bool
@@ -41,7 +45,11 @@ type itemView struct {
 // Display is the name shown above the player.
 func (v itemView) Display() string {
 	if v.Kind == "episode" {
-		return fmt.Sprintf("%s · S%d E%d", v.ShowTitle, v.Season, v.Episode)
+		name := fmt.Sprintf("%s · S%d E%d", v.ShowTitle, v.Season, v.Episode)
+		if !strings.HasPrefix(v.Title, "Episode") {
+			name += " · " + v.Title
+		}
+		return name
 	}
 	if v.Year > 0 {
 		return fmt.Sprintf("%s (%d)", v.Title, v.Year)
@@ -98,7 +106,7 @@ func (s *Server) loadItems(u *User, where, order string, args ...any) ([]itemVie
 	}
 	q := `SELECT i.id, i.kind, i.title, i.year, COALESCE(i.season_number,0), COALESCE(i.episode_number,0), COALESCE(i.episode_end,0),
 		COALESCE(sh.id,''), COALESCE(sh.title,''), f.id, f.rel_path, f.probed, f.container, f.duration_ms,
-		COALESCE(p.position_ms,0), COALESCE(p.duration_ms,0), COALESCE(p.played,0), COALESCE(p.updated_at,0)
+		COALESCE(p.position_ms,0), COALESCE(p.duration_ms,0), COALESCE(p.played,0), COALESCE(p.updated_at,0), i.overview, i.poster <> ''
 		FROM items i
 		LEFT JOIN items se ON se.id = i.parent_id AND i.kind = 'episode'
 		LEFT JOIN items sh ON sh.id = se.parent_id
@@ -119,7 +127,7 @@ func (s *Server) loadItems(u *User, where, order string, args ...any) ([]itemVie
 		var probed, played int
 		var fileDur, progDur int64
 		if err := rows.Scan(&v.ID, &v.Kind, &v.Title, &v.Year, &v.Season, &v.Episode, &v.EpisodeEnd, &v.ShowID, &v.ShowTitle,
-			&v.fileID, &rel, &probed, &v.Container, &fileDur, &v.PositionMs, &progDur, &played, &v.updatedAt); err != nil {
+			&v.fileID, &rel, &probed, &v.Container, &fileDur, &v.PositionMs, &progDur, &played, &v.updatedAt, &v.Overview, &v.Poster); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -200,9 +208,11 @@ type showView struct {
 	Year     int    `json:"year,omitempty"`
 	Episodes int    `json:"episodes"`
 	Watched  int    `json:"watched"`
+	Overview string `json:"overview,omitempty"`
+	Poster   bool   `json:"poster"`
 }
 
-const showQuery = `SELECT sh.id, sh.title, sh.year, count(DISTINCT e.id), count(DISTINCT CASE WHEN p.played = 1 THEN e.id END)
+const showQuery = `SELECT sh.id, sh.title, sh.year, count(DISTINCT e.id), count(DISTINCT CASE WHEN p.played = 1 THEN e.id END), sh.overview, sh.poster <> ''
 	FROM items sh
 	JOIN items se ON se.parent_id = sh.id
 	JOIN items e ON e.parent_id = se.id AND e.kind = 'episode'
@@ -221,7 +231,7 @@ func (s *Server) loadShows(u *User, where string, args ...any) ([]showView, erro
 	out := []showView{}
 	for rows.Next() {
 		var v showView
-		if err := rows.Scan(&v.ID, &v.Title, &v.Year, &v.Episodes, &v.Watched); err != nil {
+		if err := rows.Scan(&v.ID, &v.Title, &v.Year, &v.Episodes, &v.Watched, &v.Overview, &v.Poster); err != nil {
 			return nil, err
 		}
 		out = append(out, v)
@@ -253,7 +263,8 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "Could not read the library.")
 		return
 	}
-	var movies, shows, pending, unreadable int
+	var movies, shows, pending, unreadable, lookupsPending int
+	s.db.QueryRow(`SELECT count(*) FROM items WHERE kind IN ('movie','show') AND lookup_state=0`).Scan(&lookupsPending)
 	s.db.QueryRow(`SELECT count(*) FROM items i WHERE i.kind IN ('movie','video') AND EXISTS (SELECT 1 FROM versions v JOIN files f ON f.version_id=v.id WHERE v.item_id=i.id AND f.missing=0)`).Scan(&movies)
 	s.db.QueryRow(`SELECT count(*) FROM items WHERE kind='show'`).Scan(&shows)
 	s.db.QueryRow(`SELECT count(*) FROM files WHERE missing=0 AND probed=0`).Scan(&pending)
@@ -261,6 +272,7 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"continue": orEmpty(cont), "nextUp": orEmpty(next),
 		"counts":     map[string]int{"movies": movies, "shows": shows},
+		"lookups":    map[string]any{"on": s.lookupsOn(), "pending": lookupsPending, "running": s.enriching.Load()},
 		"inspection": map[string]any{"available": s.ffprobe != "", "pending": pending, "unreadable": unreadable, "running": s.inspecting.Load()},
 	})
 }
@@ -456,3 +468,89 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 var _ = sql.ErrNoRows
+
+// handlePoster serves a poster from the artwork folder. The file name comes
+// from the database, never from the request.
+func (s *Server) handlePoster(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	var name string
+	if !ids.Valid(id) || s.db.QueryRow(`SELECT poster FROM items WHERE id=?`, id).Scan(&name) != nil || name == "" {
+		writeErr(w, http.StatusNotFound, "No poster.")
+		return
+	}
+	f, st, err := openMedia(s.artworkDir(), name)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, "No poster.")
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Cache-Control", "private, max-age=86400")
+	http.ServeContent(w, r, name, st.ModTime(), f)
+}
+
+// handleSettings reports the owner's settings. The key itself is never
+// sent back, only whether one is saved.
+func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
+	var pending, notFound, found int
+	s.db.QueryRow(`SELECT count(*) FROM items WHERE kind IN ('movie','show') AND lookup_state=0`).Scan(&pending)
+	s.db.QueryRow(`SELECT count(*) FROM items WHERE kind IN ('movie','show') AND lookup_state=2`).Scan(&notFound)
+	s.db.QueryRow(`SELECT count(*) FROM items WHERE kind IN ('movie','show') AND lookup_state=1`).Scan(&found)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"tmdbKeySaved": s.setting("tmdb_key") != "",
+		"online":       s.setting("online_lookups") != "off",
+		"lookups":      map[string]any{"pending": pending, "found": found, "notFound": notFound, "running": s.enriching.Load(), "problem": s.lookupErr.Load()},
+	})
+}
+
+func (s *Server) handleSetTMDB(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Key string `json:"key"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	key := strings.TrimSpace(in.Key)
+	if key == "" {
+		s.setSetting("tmdb_key", "")
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	if len(key) > 600 || strings.ContainsAny(key, " \t\r\n") {
+		writeErr(w, http.StatusBadRequest, "That does not look like a TMDB key.")
+		return
+	}
+	if err := s.newTMDB(key).Check(r.Context()); err != nil {
+		msg := "TMDB could not be reached, so the key was not saved. Check the PC's internet connection and try again."
+		if errors.Is(err, metadata.ErrBadKey) {
+			msg = "TMDB did not accept that key. Copy it again from TMDB's API settings page."
+		}
+		writeErr(w, http.StatusBadRequest, msg)
+		return
+	}
+	if err := s.setSetting("tmdb_key", key); err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not save the key.")
+		return
+	}
+	s.log.Printf("a TMDB key was saved")
+	s.enrichSoon()
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleSetOnline(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		On bool `json:"on"`
+	}
+	if !readJSON(w, r, &in) {
+		return
+	}
+	v := "off"
+	if in.On {
+		v = "on"
+	}
+	if err := s.setSetting("online_lookups", v); err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not save the setting.")
+		return
+	}
+	s.enrichSoon()
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}

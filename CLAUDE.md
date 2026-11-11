@@ -2,7 +2,9 @@
 
 The project plan is in `PLAN.md`. Read it before doing any work. It defines the milestones (M0 to M9), the technical design, the acceptance tests for each milestone, and the rules that hold throughout.
 
-Status: M0 passed the owner's check on a Windows PC (2026-11-11). M1 (the library) is in progress: name recognition and the library itself are done (slices 1 and 2 in `docs/decisions.md`); what remains is listed at the end of slice 2 there.
+Status: M0 passed the owner's check on a Windows PC (2026-11-11). M1 (the library) is in progress: name recognition, the library itself and online posters and descriptions are done (slices 1 to 3 in `docs/decisions.md`); what remains is listed at the end of slice 3 there.
+
+Build environment: this project has its own cloud environment ("Local-media-project") that may reach `api.themoviedb.org` and `image.tmdb.org`; the owner's TMDB token is saved on it and added to requests on the way out. `LM_LIVE_TMDB=1 go test ./internal/metadata -run TestLive` talks to the real TMDB.
 
 Owner's answers so far (2026-11-11):
 - The phone is an iPhone. Safari's engine is checked on a macOS runner from M0, Safari on iOS is a first-class target from M3, and Streamyfin and Infuse are the first store apps in M5.

@@ -40,6 +40,7 @@ func (s *Server) routeTable() []Route {
 		{"GET", "/api/shows/{id}", Session, s.handleShow},
 		{"GET", "/api/search", Session, s.handleSearch},
 		{"POST", "/api/items/{id}/play", Session, s.handlePlay},
+		{"GET", "/api/items/{id}/poster", Session, s.handlePoster},
 		{"PUT", "/api/items/{id}/progress", Session, s.handleProgress},
 		{"GET", "/api/connect", Session, s.handleConnect},
 		{"GET", "/api/connect/qr.png", Session, s.handleQR},
@@ -50,6 +51,9 @@ func (s *Server) routeTable() []Route {
 		{"POST", "/api/libraries", Owner, s.handleAddLibrary},
 		{"POST", "/api/libraries/scan", Owner, s.handleScan},
 		{"GET", "/api/support-bundle", Owner, s.handleSupportBundle},
+		{"GET", "/api/settings", Owner, s.handleSettings},
+		{"PUT", "/api/settings/tmdb", Owner, s.handleSetTMDB},
+		{"PUT", "/api/settings/online", Owner, s.handleSetOnline},
 
 		{"GET", "/stream/{fileID}", SignedLink, s.handleStream},
 	}
@@ -130,6 +134,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 	s.log.Printf("setup finished; first scan found %d video files", res.Total)
 	s.inspectSoon()
+	s.enrichSoon()
 	if err := s.startSession(w, r, userID); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Account created, but sign-in failed. Please sign in.")
 		return
@@ -341,6 +346,7 @@ func (s *Server) handleAddLibrary(w http.ResponseWriter, r *http.Request) {
 	}
 	res, _ := library.Scan(s.db, id)
 	s.inspectSoon()
+	s.enrichSoon()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "scan": res})
 }
 
@@ -353,6 +359,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.inspectSoon()
+	s.enrichSoon()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "scan": res})
 }
 
@@ -391,6 +398,7 @@ func (s *Server) ScanAll() {
 		s.log.Printf("scan: %d video files, %d new, %d moved, %d missing", res.Total, res.Added, res.Moved, res.Missing)
 	}
 	s.inspectSoon()
+	s.enrichSoon()
 }
 
 // handleStream serves the original file with range requests. Its policy is
@@ -470,7 +478,20 @@ func (s *Server) handleSupportBundle(w http.ResponseWriter, r *http.Request) {
 		enc.SetIndent("", "  ")
 		enc.Encode(v)
 	}
+	// What the library could not match online, so the recogniser can be
+	// improved. These are titles as read from file names, nothing more.
+	unmatched := []string{}
+	if rows, err := s.db.Query(`SELECT kind || ': ' || title || CASE WHEN year>0 THEN ' (' || year || ')' ELSE '' END FROM items WHERE kind IN ('movie','show') AND lookup_state=2 ORDER BY sort_title LIMIT 2000`); err == nil {
+		for rows.Next() {
+			var line string
+			rows.Scan(&line)
+			unmatched = append(unmatched, line)
+		}
+		rows.Close()
+	}
+	info["onlineLookups"] = map[string]any{"keySaved": s.setting("tmdb_key") != "", "on": s.lookupsOn(), "lastProblem": s.lookupErr.Load()}
 	add("info.json", info)
+	add("not-found-online.json", unmatched)
 	add("playback-problems.json", s.events.all())
 	if f, err := zw.Create("log.txt"); err == nil {
 		f.Write(s.log.tail(512 << 10))

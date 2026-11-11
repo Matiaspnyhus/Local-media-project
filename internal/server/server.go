@@ -28,6 +28,7 @@ import (
 
 	"github.com/Matiaspnyhus/Local-media-project/internal/auth"
 	"github.com/Matiaspnyhus/Local-media-project/internal/library"
+	"github.com/Matiaspnyhus/Local-media-project/internal/metadata"
 	"github.com/Matiaspnyhus/Local-media-project/internal/playback"
 )
 
@@ -91,12 +92,17 @@ type Server struct {
 	ffprobe    string
 	inspectMu  sync.Mutex
 	inspecting atomic.Bool
-	capsMu     sync.Mutex
-	caps       map[string]*playback.Caps // by session
-	ctx        context.Context
-	stop       context.CancelFunc
-	handler    http.Handler
-	routes     []Route
+	background sync.WaitGroup
+	enriching  atomic.Bool
+	lookupErr  atomic.Value // string: why the last round of lookups stopped
+	// newTMDB builds the lookup client; tests replace it.
+	newTMDB func(key string) *metadata.Client
+	capsMu  sync.Mutex
+	caps    map[string]*playback.Caps // by session
+	ctx     context.Context
+	stop    context.CancelFunc
+	handler http.Handler
+	routes  []Route
 }
 
 type ctxKey int
@@ -124,6 +130,8 @@ func New(cfg Config) (*Server, error) {
 		limiter: newLoginLimiter(), events: &eventLog{}, ffprobe: cfg.FFprobe, caps: map[string]*playback.Caps{},
 	}
 	s.ctx, s.stop = context.WithCancel(context.Background())
+	s.newTMDB = metadata.New
+	s.lookupErr.Store("")
 	var err error
 	if s.log, err = newLogger(cfg.DataDir, cfg.LogOut); err != nil {
 		return nil, err
@@ -163,8 +171,7 @@ func checkRoutes(routes []Route) error {
 // Close releases the log file. The database belongs to the caller.
 func (s *Server) Close() error {
 	s.stop()
-	s.inspectMu.Lock() // wait for a running inspection to notice
-	s.inspectMu.Unlock()
+	s.background.Wait() // let running inspection and lookups notice
 	return s.log.file.Close()
 }
 
@@ -174,10 +181,12 @@ func (s *Server) inspectSoon() {
 	if s.ffprobe == "" || !s.inspecting.CompareAndSwap(false, true) {
 		return
 	}
-	s.inspectMu.Lock()
+	s.background.Add(1)
 	go func() {
-		defer s.inspectMu.Unlock()
+		defer s.background.Done()
 		defer s.inspecting.Store(false)
+		s.inspectMu.Lock() // one background job at a time
+		defer s.inspectMu.Unlock()
 		res, err := library.ProbePending(s.ctx, s.db, s.ffprobe)
 		if err != nil && s.ctx.Err() == nil {
 			s.log.Printf("inspecting files failed: %v", err)
@@ -186,6 +195,55 @@ func (s *Server) inspectSoon() {
 			s.log.Printf("inspected %d files, %d could not be read", res.Inspected, res.Failed)
 		}
 	}()
+}
+
+func (s *Server) setting(key string) string {
+	var v []byte
+	s.db.QueryRow(`SELECT value FROM settings WHERE key=?`, key).Scan(&v)
+	return string(v)
+}
+
+func (s *Server) setSetting(key, value string) error {
+	_, err := s.db.Exec(`INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, []byte(value))
+	return err
+}
+
+func (s *Server) artworkDir() string { return filepath.Join(s.dataDir, "artwork") }
+
+// lookupsOn reports whether online lookups may run: a key is saved and the
+// owner has not switched them off.
+func (s *Server) lookupsOn() bool {
+	return s.setting("tmdb_key") != "" && s.setting("online_lookups") != "off"
+}
+
+// enrichSoon looks new films and shows up in the background.
+func (s *Server) enrichSoon() {
+	if !s.lookupsOn() || !s.enriching.CompareAndSwap(false, true) {
+		return
+	}
+	s.background.Add(1)
+	go func() {
+		defer s.background.Done()
+		defer s.enriching.Store(false)
+		s.inspectMu.Lock()
+		defer s.inspectMu.Unlock()
+		s.lookupErr.Store("")
+		sum, err := metadata.Enrich(s.ctx, s.db, s.newTMDB(s.setting("tmdb_key")), s.artworkDir())
+		if err != nil && s.ctx.Err() == nil {
+			s.lookupErr.Store(err.Error())
+			s.log.Printf("online lookups stopped: %v", err)
+		}
+		if sum.Found+sum.NotFound > 0 {
+			s.log.Printf("online lookups: %d found, %d not found", sum.Found, sum.NotFound)
+		}
+	}()
+}
+
+// EnrichNow runs lookups and waits; tests use it.
+func (s *Server) EnrichNow() {
+	if s.lookupsOn() {
+		metadata.Enrich(s.ctx, s.db, s.newTMDB(s.setting("tmdb_key")), s.artworkDir())
+	}
 }
 
 // InspectNow inspects pending files and waits; tests use it.

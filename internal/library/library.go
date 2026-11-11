@@ -344,7 +344,7 @@ type tree struct {
 }
 
 func (t *tree) load() error {
-	rows, err := t.tx.Query(`SELECT id, kind, title, year, COALESCE(parent_id,''), COALESCE(season_number,0) FROM items WHERE library_id=? AND kind IN ('show','season','movie')`, t.lib)
+	rows, err := t.tx.Query(`SELECT id, kind, CASE WHEN match_key<>'' THEN match_key ELSE title END, year, COALESCE(parent_id,''), COALESCE(season_number,0) FROM items WHERE library_id=? AND kind IN ('show','season','movie')`, t.lib)
 	if err != nil {
 		return err
 	}
@@ -356,10 +356,16 @@ func (t *tree) load() error {
 		switch kind {
 		case "show":
 			t.shows[naming.Fold(title)] = id
+
 		case "season":
 			t.seasons[fmt.Sprintf("%s/%d", parent, season)] = id
 		case "movie":
-			t.movies[fmt.Sprintf("%s/%d", naming.Fold(title), year)] = id
+			// match_key already carries the year; an older row does not.
+			if strings.Contains(title, "/") {
+				t.movies[title] = id
+			} else {
+				t.movies[fmt.Sprintf("%s/%d", naming.Fold(title), year)] = id
+			}
 		}
 	}
 	return rows.Err()
@@ -382,8 +388,8 @@ func (t *tree) show(title string, year int) (string, error) {
 		return id, nil
 	}
 	id := ids.New()
-	if _, err := t.tx.Exec(`INSERT INTO items(id,library_id,kind,title,sort_title,year,name_source,created_at) VALUES(?,?,?,?,?,?,?,?)`,
-		id, t.lib, "show", title, sortTitle(title), year, "file", time.Now().Unix()); err != nil {
+	if _, err := t.tx.Exec(`INSERT INTO items(id,library_id,kind,title,sort_title,year,name_source,match_key,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+		id, t.lib, "show", title, sortTitle(title), year, "file", key, time.Now().Unix()); err != nil {
 		return "", err
 	}
 	t.shows[key] = id
@@ -443,7 +449,8 @@ func (t *tree) place(itemID, rel string) (string, error) {
 				itemID, t.lib, seasonID, "episode", title, sortKey, info.Season, info.Episode, end, "file", now)
 			return itemID, err
 		}
-		_, err = t.tx.Exec(`UPDATE items SET parent_id=?, kind='episode', title=?, sort_title=?, year=0, season_number=?, episode_number=?, episode_end=?, name_source='file' WHERE id=?`,
+		_, err = t.tx.Exec(`UPDATE items SET parent_id=?, kind='episode', title=?, sort_title=?, year=0, season_number=?, episode_number=?, episode_end=?,
+			name_source='file', match_key='', tmdb_id=0, lookup_state=0, overview='', poster='' WHERE id=?`,
 			seasonID, title, sortKey, info.Season, info.Episode, end, itemID)
 		if err == nil {
 			_, err = t.tx.Exec(`DELETE FROM item_fts WHERE item_id=?`, itemID)
@@ -456,12 +463,13 @@ func (t *tree) place(itemID, rel string) (string, error) {
 			return id, nil
 		}
 		itemID = ids.New()
-		if _, err := t.tx.Exec(`INSERT INTO items(id,library_id,kind,title,sort_title,year,name_source,created_at) VALUES(?,?,?,?,?,?,?,?)`,
-			itemID, t.lib, "movie", info.Title, sortTitle(info.Title), info.Year, "file", now); err != nil {
+		if _, err := t.tx.Exec(`INSERT INTO items(id,library_id,kind,title,sort_title,year,name_source,match_key,created_at) VALUES(?,?,?,?,?,?,?,?,?)`,
+			itemID, t.lib, "movie", info.Title, sortTitle(info.Title), info.Year, "file", key, now); err != nil {
 			return "", err
 		}
-	} else if _, err := t.tx.Exec(`UPDATE items SET parent_id=NULL, kind='movie', title=?, sort_title=?, year=?, season_number=NULL, episode_number=NULL, episode_end=NULL, name_source='file' WHERE id=?`,
-		info.Title, sortTitle(info.Title), info.Year, itemID); err != nil {
+	} else if _, err := t.tx.Exec(`UPDATE items SET parent_id=NULL, kind='movie', title=?, sort_title=?, year=?, season_number=NULL, episode_number=NULL, episode_end=NULL,
+		name_source='file', match_key=?, tmdb_id=0, lookup_state=0, overview='', poster='' WHERE id=? AND match_key<>?`,
+		info.Title, sortTitle(info.Title), info.Year, key, itemID, key); err != nil {
 		return "", err
 	}
 	t.movies[key] = itemID

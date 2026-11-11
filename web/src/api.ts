@@ -56,6 +56,8 @@ export interface Item {
   played: boolean
   playable: 'yes' | 'no' | 'unknown'
   reasons: string[]
+  overview?: string
+  poster: boolean
 }
 export interface Show {
   id: string
@@ -63,6 +65,8 @@ export interface Show {
   year?: number
   episodes: number
   watched: number
+  overview?: string
+  poster: boolean
 }
 export interface Season {
   number: number
@@ -74,6 +78,12 @@ export interface Home {
   nextUp: Item[]
   counts: { movies: number; shows: number }
   inspection: { available: boolean; pending: number; unreadable: number; running: boolean }
+  lookups: { on: boolean; pending: number; running: boolean }
+}
+export interface Settings {
+  tmdbKeySaved: boolean
+  online: boolean
+  lookups: { pending: number; found: number; notFound: number; running: boolean; problem: string }
 }
 export interface Folders {
   path: string
@@ -112,6 +122,9 @@ export const api = {
   shows: () => call<{ shows: Show[] }>('GET', '/api/shows'),
   show: (id: string) => call<{ show: Show; seasons: Season[] }>('GET', `/api/shows/${id}`),
   search: (q: string) => call<{ items: Item[]; shows: Show[] }>('GET', '/api/search?q=' + encodeURIComponent(q)),
+  settings: () => call<Settings>('GET', '/api/settings'),
+  setTmdbKey: (key: string) => call<{ ok: boolean }>('PUT', '/api/settings/tmdb', { key }),
+  setOnline: (on: boolean) => call<{ ok: boolean }>('PUT', '/api/settings/online', { on }),
   capabilities: (c: Caps) => call<{ ok: boolean }>('POST', '/api/capabilities', c),
   play: (id: string) => call<PlayInfo>('POST', `/api/items/${id}/play`),
   progress: (id: string, positionMs: number, durationMs: number) =>
