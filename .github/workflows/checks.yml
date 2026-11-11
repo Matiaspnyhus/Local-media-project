@@ -179,6 +179,9 @@ jobs:
           if ((Get-ItemProperty $run -ErrorAction SilentlyContinue).LocalMedia) { throw "uninstalling left start-with-Windows behind" }
           if (-not (Test-Path (Join-Path $data "kept-from-before.txt")) -or -not (Test-Path (Join-Path $data "localmedia.db"))) { throw "uninstalling removed the owner's data" }
           Write-Host "Installed, started, installed again over a running copy, and uninstalled. The data folder was never touched."
+          # "Rule not found" is the answer wanted above, but netsh reports it
+          # as an error code, which would otherwise fail this step.
+          exit 0
       - uses: actions/upload-artifact@v4
         with:
           name: LocalMedia-Setup
