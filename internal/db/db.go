@@ -168,6 +168,18 @@ ALTER TABLE items ADD COLUMN lookup_at INTEGER NOT NULL DEFAULT 0;
 -- file name of the poster in the artwork folder, '' when there is none
 ALTER TABLE items ADD COLUMN poster TEXT NOT NULL DEFAULT '';
 `,
+	// 4: speed at 50,000 files. Each episode remembers its show directly,
+	// so a show's episodes are one index lookup instead of two joins.
+	`
+ALTER TABLE items ADD COLUMN show_id TEXT;
+UPDATE items SET show_id = (SELECT se.parent_id FROM items se WHERE se.id = items.parent_id) WHERE kind = 'episode';
+CREATE INDEX items_show ON items(show_id, season_number, episode_number);
+-- only the files still waiting to be inspected, so the planner is never
+-- tempted to start a library query from this index
+CREATE INDEX files_pending ON files(probed) WHERE probed = 0;
+CREATE INDEX items_lookup ON items(lookup_state, kind);
+CREATE INDEX progress_recent ON progress(user_id, updated_at);
+`,
 }
 
 // SchemaVersion is the version this build expects.
@@ -180,15 +192,18 @@ func Open(dataDir string) (*sql.DB, error) {
 		return nil, err
 	}
 	path := filepath.Join(dataDir, FileName)
+	// WAL lets readers carry on while one writer writes. Every transaction
+	// takes the write lock at its start (_txlock=immediate) and waits its
+	// turn (busy_timeout), so two writers queue instead of failing.
 	dsn := "file:" + filepath.ToSlash(path) +
-		"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
+		"?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
 	d, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	// One connection: every write is serialised, which is the simple and
-	// safe choice for a household server. Revisit with a read pool in M1.
-	d.SetMaxOpenConns(1)
+	// A few connections: a long scan no longer makes every page wait.
+	d.SetMaxOpenConns(4)
+	d.SetMaxIdleConns(4)
 	if err := migrate(d, dataDir); err != nil {
 		d.Close()
 		return nil, err

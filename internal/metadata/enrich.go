@@ -29,10 +29,10 @@ func Enrich(ctx context.Context, d *sql.DB, c *Client, artworkDir string) (Summa
 		return sum, err
 	}
 	type todo struct {
-		id, kind, title, rel string
-		year                 int
+		id, kind, title, rel, source, poster string
+		year, tmdb                           int
 	}
-	rows, err := d.Query(`SELECT i.id, i.kind, i.title, i.year, COALESCE((
+	rows, err := d.Query(`SELECT i.id, i.kind, i.title, i.year, i.name_source, i.poster, i.tmdb_id, COALESCE((
 			SELECT f.rel_path FROM files f JOIN versions v ON v.id = f.version_id
 			WHERE v.item_id = i.id OR v.item_id IN (SELECT e.id FROM items e JOIN items se ON se.id = e.parent_id WHERE se.parent_id = i.id) LIMIT 1), '')
 		FROM items i WHERE i.kind IN ('movie','show') AND i.lookup_state = 0 ORDER BY i.created_at`)
@@ -42,7 +42,7 @@ func Enrich(ctx context.Context, d *sql.DB, c *Client, artworkDir string) (Summa
 	var list []todo
 	for rows.Next() {
 		var t todo
-		rows.Scan(&t.id, &t.kind, &t.title, &t.year, &t.rel)
+		rows.Scan(&t.id, &t.kind, &t.title, &t.year, &t.source, &t.poster, &t.tmdb, &t.rel)
 		list = append(list, t)
 	}
 	rows.Close()
@@ -57,7 +57,11 @@ func Enrich(ctx context.Context, d *sql.DB, c *Client, artworkDir string) (Summa
 		}
 		var hit Result
 		found := false
-		if id := HintID(t.rel); id > 0 {
+		hinted := HintID(t.rel)
+		if hinted == 0 {
+			hinted = t.tmdb // from a local info file
+		}
+		if id := hinted; id > 0 {
 			hit, err = c.ByID(ctx, kind, id)
 			if err == nil {
 				found = true
@@ -87,8 +91,8 @@ func Enrich(ctx context.Context, d *sql.DB, c *Client, artworkDir string) (Summa
 			sum.NotFound++
 			continue
 		}
-		poster := ""
-		if hit.PosterPath != "" {
+		poster := t.poster
+		if hit.PosterPath != "" && !strings.HasPrefix(t.poster, "local:") {
 			if img, err := c.Poster(ctx, hit.PosterPath); err == nil {
 				name := t.id + strings.ToLower(filepath.Ext(hit.PosterPath))
 				if os.WriteFile(filepath.Join(artworkDir, name), img, 0o600) == nil {
@@ -106,8 +110,16 @@ func Enrich(ctx context.Context, d *sql.DB, c *Client, artworkDir string) (Summa
 		if err != nil {
 			return sum, err
 		}
-		_, err = tx.Exec(`UPDATE items SET title = ?, sort_title = ?, year = ?, overview = ?, tmdb_id = ?, poster = ?, name_source = 'tmdb', lookup_state = 1, lookup_at = ? WHERE id = ?`,
-			hit.Title, sortTitle(hit.Title), year, hit.Overview, hit.ID, poster, now, t.id)
+		if t.source == "nfo" {
+			// The owner's own info file wins: keep its title, year and
+			// description, and take only what it lacks.
+			_, err = tx.Exec(`UPDATE items SET overview = CASE WHEN overview = '' THEN ? ELSE overview END, year = CASE WHEN year = 0 THEN ? ELSE year END,
+				tmdb_id = ?, poster = ?, lookup_state = 1, lookup_at = ? WHERE id = ?`, hit.Overview, year, hit.ID, poster, now, t.id)
+			hit.Title = t.title
+		} else {
+			_, err = tx.Exec(`UPDATE items SET title = ?, sort_title = ?, year = ?, overview = ?, tmdb_id = ?, poster = ?, name_source = 'tmdb', lookup_state = 1, lookup_at = ? WHERE id = ?`,
+				hit.Title, sortTitle(hit.Title), year, hit.Overview, hit.ID, poster, now, t.id)
+		}
 		if err == nil {
 			_, err = tx.Exec(`DELETE FROM item_fts WHERE item_id = ?`, t.id)
 		}
@@ -183,7 +195,7 @@ func episodes(ctx context.Context, d *sql.DB, c *Client, showID string, tmdbID i
 				continue
 			}
 			if _, err := tx.Exec(`UPDATE items SET title = ?, overview = ?, name_source = 'tmdb', lookup_state = 1, lookup_at = ?
-				WHERE kind = 'episode' AND episode_number = ? AND episode_end IS NULL AND parent_id IN (SELECT id FROM items WHERE parent_id = ? AND season_number = ?)`,
+				WHERE kind = 'episode' AND name_source <> 'nfo' AND episode_number = ? AND episode_end IS NULL AND parent_id IN (SELECT id FROM items WHERE parent_id = ? AND season_number = ?)`,
 				e.Name, e.Overview, now, e.Number, showID, n); err != nil {
 				tx.Rollback()
 				return err

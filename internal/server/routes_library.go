@@ -108,8 +108,7 @@ func (s *Server) loadItems(u *User, where, order string, args ...any) ([]itemVie
 		COALESCE(sh.id,''), COALESCE(sh.title,''), f.id, f.rel_path, f.probed, f.container, f.duration_ms,
 		COALESCE(p.position_ms,0), COALESCE(p.duration_ms,0), COALESCE(p.played,0), COALESCE(p.updated_at,0), i.overview, i.poster <> ''
 		FROM items i
-		LEFT JOIN items se ON se.id = i.parent_id AND i.kind = 'episode'
-		LEFT JOIN items sh ON sh.id = se.parent_id
+		LEFT JOIN items sh ON sh.id = i.show_id
 		JOIN versions v ON v.item_id = i.id
 		JOIN files f ON f.version_id = v.id AND f.missing = 0 AND f.part_index = 0
 		LEFT JOIN progress p ON p.item_id = i.id AND p.user_id = ?
@@ -212,31 +211,55 @@ type showView struct {
 	Poster   bool   `json:"poster"`
 }
 
-const showQuery = `SELECT sh.id, sh.title, sh.year, count(DISTINCT e.id), count(DISTINCT CASE WHEN p.played = 1 THEN e.id END), sh.overview, sh.poster <> ''
-	FROM items sh
-	JOIN items se ON se.parent_id = sh.id
-	JOIN items e ON e.parent_id = se.id AND e.kind = 'episode'
-	JOIN versions v ON v.item_id = e.id
-	JOIN files f ON f.version_id = v.id AND f.missing = 0
-	LEFT JOIN progress p ON p.item_id = e.id AND p.user_id = ?
-	WHERE sh.kind = 'show' AND (%s)
-	GROUP BY sh.id ORDER BY sh.sort_title`
-
+// loadShows lists shows with how many episodes each has and how many of
+// them this user has watched. The counts come from two grouped queries over
+// indexes, so the list stays quick with tens of thousands of episodes.
 func (s *Server) loadShows(u *User, where string, args ...any) ([]showView, error) {
-	rows, err := s.db.Query(fmt.Sprintf(showQuery, where), append([]any{u.ID}, args...)...)
+	rows, err := s.db.Query(`SELECT sh.id, sh.title, sh.year, sh.overview, sh.poster <> '' FROM items sh WHERE sh.kind = 'show' AND (`+where+`) ORDER BY sh.sort_title`, args...)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	out := []showView{}
+	index := map[string]int{}
 	for rows.Next() {
 		var v showView
-		if err := rows.Scan(&v.ID, &v.Title, &v.Year, &v.Episodes, &v.Watched, &v.Overview, &v.Poster); err != nil {
+		if err := rows.Scan(&v.ID, &v.Title, &v.Year, &v.Overview, &v.Poster); err != nil {
+			rows.Close()
 			return nil, err
 		}
+		index[v.ID] = len(out)
 		out = append(out, v)
 	}
-	return out, rows.Err()
+	rows.Close()
+	if len(out) == 0 {
+		return out, nil
+	}
+	fill := func(q string, set func(v *showView, n int), qargs ...any) error {
+		rows, err := s.db.Query(q, qargs...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id string
+			var n int
+			rows.Scan(&id, &n)
+			if i, ok := index[id]; ok {
+				set(&out[i], n)
+			}
+		}
+		return rows.Err()
+	}
+	if len(out) == 1 {
+		if err := fill(`SELECT show_id, count(*) FROM items WHERE show_id = ? AND kind = 'episode'`, func(v *showView, n int) { v.Episodes = n }, out[0].ID); err != nil {
+			return nil, err
+		}
+	} else if err := fill(`SELECT show_id, count(*) FROM items WHERE show_id IS NOT NULL AND kind = 'episode' GROUP BY show_id`, func(v *showView, n int) { v.Episodes = n }); err != nil {
+		return nil, err
+	}
+	err = fill(`SELECT e.show_id, count(*) FROM progress p JOIN items e ON e.id = p.item_id WHERE p.user_id = ? AND p.played = 1 AND e.show_id IS NOT NULL GROUP BY e.show_id`,
+		func(v *showView, n int) { v.Watched = n }, u.ID)
+	return out, err
 }
 
 func orEmpty(v []itemView) []itemView {
@@ -267,7 +290,7 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 	s.db.QueryRow(`SELECT count(*) FROM items WHERE kind IN ('movie','show') AND lookup_state=0`).Scan(&lookupsPending)
 	s.db.QueryRow(`SELECT count(*) FROM items i WHERE i.kind IN ('movie','video') AND EXISTS (SELECT 1 FROM versions v JOIN files f ON f.version_id=v.id WHERE v.item_id=i.id AND f.missing=0)`).Scan(&movies)
 	s.db.QueryRow(`SELECT count(*) FROM items WHERE kind='show'`).Scan(&shows)
-	s.db.QueryRow(`SELECT count(*) FROM files WHERE missing=0 AND probed=0`).Scan(&pending)
+	s.db.QueryRow(`SELECT count(*) FROM files WHERE probed=0 AND missing=0`).Scan(&pending)
 	s.db.QueryRow(`SELECT count(*) FROM files WHERE missing=0 AND probed=2`).Scan(&unreadable)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"continue": orEmpty(cont), "nextUp": orEmpty(next),
@@ -280,16 +303,29 @@ func (s *Server) handleHome(w http.ResponseWriter, r *http.Request) {
 // nextUp finds, for every show the user is part-way through, the episode
 // that follows the one they watched most recently.
 func (s *Server) nextUp(u *User) ([]itemView, error) {
-	rows, err := s.db.Query(`SELECT sh.id, e.id, e.season_number, e.episode_number, COALESCE(p.played,0), COALESCE(p.position_ms,0), COALESCE(p.updated_at,0)
-		FROM items sh
-		JOIN items se ON se.parent_id = sh.id
-		JOIN items e ON e.parent_id = se.id AND e.kind = 'episode'
-		LEFT JOIN progress p ON p.item_id = e.id AND p.user_id = ?
-		WHERE sh.kind = 'show' AND sh.id IN (
-			SELECT sh2.id FROM progress p2 JOIN items e2 ON e2.id = p2.item_id JOIN items se2 ON se2.id = e2.parent_id JOIN items sh2 ON sh2.id = se2.parent_id
-			WHERE p2.user_id = ? AND e2.kind = 'episode')
-		AND EXISTS (SELECT 1 FROM versions v JOIN files f ON f.version_id = v.id WHERE v.item_id = e.id AND f.missing = 0)
-		ORDER BY sh.id, e.season_number, e.episode_number`, u.ID, u.ID)
+	// Step one: the shows this user has watched anything of (a short list).
+	srows, err := s.db.Query(`SELECT DISTINCT e.show_id FROM progress p JOIN items e ON e.id = p.item_id WHERE p.user_id = ? AND e.show_id IS NOT NULL`, u.ID)
+	if err != nil {
+		return nil, err
+	}
+	var showIDs []any
+	for srows.Next() {
+		var id string
+		srows.Scan(&id)
+		showIDs = append(showIDs, id)
+	}
+	srows.Close()
+	if len(showIDs) == 0 {
+		return nil, nil
+	}
+	if len(showIDs) > 300 {
+		showIDs = showIDs[:300]
+	}
+	// Step two: those shows' episodes in order, through the show index.
+	rows, err := s.db.Query(`SELECT e.show_id, e.id, e.season_number, e.episode_number, COALESCE(p.played,0), COALESCE(p.position_ms,0), COALESCE(p.updated_at,0)
+		FROM items e LEFT JOIN progress p ON p.item_id = e.id AND p.user_id = ?
+		WHERE e.kind = 'episode' AND e.show_id IN (?`+strings.Repeat(",?", len(showIDs)-1)+`)
+		ORDER BY e.show_id, e.season_number, e.episode_number`, append([]any{u.ID}, showIDs...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -389,7 +425,7 @@ func (s *Server) handleShow(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "That show is not in the library.")
 		return
 	}
-	eps, err := s.loadItems(u, `sh.id = ?`, `i.season_number, i.episode_number`, id)
+	eps, err := s.loadItems(u, `i.show_id = ?`, `i.season_number, i.episode_number`, id)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not read the library.")
 		return
@@ -478,7 +514,16 @@ func (s *Server) handlePoster(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "No poster.")
 		return
 	}
-	f, st, err := openMedia(s.artworkDir(), name)
+	dir := s.artworkDir()
+	if rel, ok := strings.CutPrefix(name, "local:"); ok {
+		// A picture the owner keeps beside the film, read from the library.
+		if s.db.QueryRow(`SELECT l.path FROM libraries l JOIN items i ON i.library_id=l.id WHERE i.id=?`, id).Scan(&dir) != nil {
+			writeErr(w, http.StatusNotFound, "No poster.")
+			return
+		}
+		name = rel
+	}
+	f, st, err := openMedia(dir, name)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "No poster.")
 		return

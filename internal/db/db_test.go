@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestOpenCreatesSchemaWithWALAndFTS5(t *testing.T) {
@@ -126,5 +127,60 @@ func TestNewerDatabaseIsRefused(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, FileName)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// While a long write is in progress (a scan of a big library), pages must
+// still load, and a second writer (someone's watch progress) must wait its
+// turn rather than fail.
+func TestReadsAndASecondWriterAreNotBlockedOut(t *testing.T) {
+	d, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	d.Exec(`INSERT INTO settings(key,value) VALUES('seen','before')`)
+
+	tx, err := d.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.Exec(`INSERT INTO settings(key,value) VALUES('scan','in progress')`)
+
+	read := make(chan string, 1)
+	go func() {
+		var v string
+		d.QueryRow(`SELECT value FROM settings WHERE key='seen'`).Scan(&v)
+		read <- v
+	}()
+	select {
+	case v := <-read:
+		if v != "before" {
+			t.Fatalf("read %q", v)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a read waited for the writer")
+	}
+
+	wrote := make(chan error, 1)
+	go func() {
+		_, err := d.Exec(`INSERT INTO settings(key,value) VALUES('progress','saved')`)
+		wrote <- err
+	}()
+	select {
+	case err := <-wrote:
+		t.Fatalf("the second writer did not wait: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-wrote:
+		if err != nil {
+			t.Fatalf("the second writer failed after waiting: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the second writer never finished")
 	}
 }

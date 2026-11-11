@@ -89,6 +89,7 @@ func Scan(d *sql.DB, libraryID string) (ScanResult, error) {
 	}
 	onDisk := map[string]diskFile{}
 	subs := map[string][]string{} // folder -> subtitle file names
+	aux := map[string][]string{}  // folder -> info files and pictures
 	err := filepath.WalkDir(root, func(p string, e fs.DirEntry, err error) error {
 		if err != nil {
 			if e != nil && e.IsDir() {
@@ -116,6 +117,10 @@ func Scan(d *sql.DB, libraryID string) (ScanResult, error) {
 		ext := strings.ToLower(filepath.Ext(name))
 		if subtitleExt[ext] != "" {
 			subs[path.Dir(rel)] = append(subs[path.Dir(rel)], name)
+			return nil
+		}
+		if ext == ".nfo" || ext == ".jpg" || ext == ".jpeg" || ext == ".png" {
+			aux[path.Dir(rel)] = append(aux[path.Dir(rel)], name)
 			return nil
 		}
 		if !videoExt[ext] || isExtra(rel) {
@@ -252,11 +257,22 @@ func Scan(d *sql.DB, libraryID string) (ScanResult, error) {
 	if err := t.sidecars(onDisk, known, subs); err != nil {
 		return res, err
 	}
+	if err := t.local(root, onDisk, known, aux); err != nil {
+		return res, err
+	}
 	if err := t.prune(); err != nil {
 		return res, err
 	}
 	res.Total = len(onDisk)
-	return res, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return res, err
+	}
+	if res.Added+res.Moved > 0 {
+		// Let SQLite re-measure the tables it now holds, so that queries
+		// keep choosing their indexes as the library grows.
+		d.Exec(`ANALYZE`)
+	}
+	return res, nil
 }
 
 // isExtra skips trailers, samples and bonus material, which are not items
@@ -445,13 +461,13 @@ func (t *tree) place(itemID, rel string) (string, error) {
 				return existing, nil
 			}
 			itemID = ids.New()
-			_, err = t.tx.Exec(`INSERT INTO items(id,library_id,parent_id,kind,title,sort_title,season_number,episode_number,episode_end,name_source,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-				itemID, t.lib, seasonID, "episode", title, sortKey, info.Season, info.Episode, end, "file", now)
+			_, err = t.tx.Exec(`INSERT INTO items(id,library_id,parent_id,show_id,kind,title,sort_title,season_number,episode_number,episode_end,name_source,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+				itemID, t.lib, seasonID, showID, "episode", title, sortKey, info.Season, info.Episode, end, "file", now)
 			return itemID, err
 		}
-		_, err = t.tx.Exec(`UPDATE items SET parent_id=?, kind='episode', title=?, sort_title=?, year=0, season_number=?, episode_number=?, episode_end=?,
+		_, err = t.tx.Exec(`UPDATE items SET parent_id=?, show_id=?, kind='episode', title=?, sort_title=?, year=0, season_number=?, episode_number=?, episode_end=?,
 			name_source='file', match_key='', tmdb_id=0, lookup_state=0, overview='', poster='' WHERE id=?`,
-			seasonID, title, sortKey, info.Season, info.Episode, end, itemID)
+			seasonID, showID, title, sortKey, info.Season, info.Episode, end, itemID)
 		if err == nil {
 			_, err = t.tx.Exec(`DELETE FROM item_fts WHERE item_id=?`, itemID)
 		}
@@ -467,7 +483,7 @@ func (t *tree) place(itemID, rel string) (string, error) {
 			itemID, t.lib, "movie", info.Title, sortTitle(info.Title), info.Year, "file", key, now); err != nil {
 			return "", err
 		}
-	} else if _, err := t.tx.Exec(`UPDATE items SET parent_id=NULL, kind='movie', title=?, sort_title=?, year=?, season_number=NULL, episode_number=NULL, episode_end=NULL,
+	} else if _, err := t.tx.Exec(`UPDATE items SET parent_id=NULL, show_id=NULL, kind='movie', title=?, sort_title=?, year=?, season_number=NULL, episode_number=NULL, episode_end=NULL,
 		name_source='file', match_key=?, tmdb_id=0, lookup_state=0, overview='', poster='' WHERE id=? AND match_key<>?`,
 		info.Title, sortTitle(info.Title), info.Year, key, itemID, key); err != nil {
 		return "", err

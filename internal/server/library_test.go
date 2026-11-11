@@ -248,3 +248,40 @@ func TestPlayableMarksFollowTheDeviceReport(t *testing.T) {
 		t.Fatalf("a file with no sound track reports sound: %+v", p.Plan)
 	}
 }
+
+// Whatever is put where an ID belongs, the answer is a refusal: never a
+// file, never a crash.
+func TestNastyIDsAreRefusedEverywhere(t *testing.T) {
+	e := newEnv(t)
+	c := e.setup()
+	secret := filepath.Join(filepath.Dir(e.media), "secret.txt")
+	os.WriteFile(secret, []byte("private"), 0o644)
+	defer os.Remove(secret)
+	nasty := []string{
+		"..", "../secret.txt", "..%2Fsecret.txt", "%2e%2e%2fsecret.txt", "....//secret.txt", "..%5Csecret.txt",
+		"%00", "a%00b", strings.Repeat("a", 5000), "0123456789abcdef0123456789abcdeg", "0123456789ABCDEF0123456789ABCDEF",
+		"'%20OR%201=1--", "%22%3E%3Cscript%3E", "local:..%2Fsecret.txt", "C:%5CWindows%5Cwin.ini", "/etc/passwd", "%2Fetc%2Fpasswd",
+	}
+	for _, rt := range e.s.Routes() {
+		if !strings.Contains(rt.Pattern, "{") {
+			continue
+		}
+		for _, bad := range nasty {
+			target := strings.NewReplacer("{id}", bad, "{fileID}", bad).Replace(rt.Pattern)
+			if rt.Policy == SignedLink {
+				target += "?e=99999999999&s=0123456789abcdef0123456789abcdef&g=x"
+			}
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Errorf("%s %s crashed: %v", rt.Method, target, r)
+					}
+				}()
+				w := e.do(rt.Method, target, remote, c, map[string]int64{"positionMs": 1, "durationMs": 2})
+				if w.Code < 400 || w.Code >= 500 || strings.Contains(w.Body.String(), "private") {
+					t.Errorf("%s %s answered %d %.80q", rt.Method, target, w.Code, w.Body)
+				}
+			}()
+		}
+	}
+}
