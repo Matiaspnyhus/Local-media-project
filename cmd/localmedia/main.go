@@ -59,6 +59,7 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	defer srv.Close()
 
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
 	if err != nil {

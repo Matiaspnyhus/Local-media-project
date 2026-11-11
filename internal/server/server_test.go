@@ -49,6 +49,7 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { s.Close() })
 	return &env{t: t, s: s, media: media}
 }
 
@@ -447,7 +448,7 @@ func TestAppShellIsServedAndUnknownAPIIsNot(t *testing.T) {
 		}
 	}
 	if w := e.do("GET", "/assets/app.js", remote, nil, nil); w.Code != 200 || w.Body.String() != "js" {
-		t.Errorf("asset: %d", w.Code)
+		t.Errorf("asset: %d %q", w.Code, w.Body)
 	}
 	for _, target := range []string{"/api/nope", "/stream/", "/api/items/../../etc"} {
 		if w := e.do("GET", target, remote, nil, nil); w.Code == 200 {

@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -147,6 +148,9 @@ func checkRoutes(routes []Route) error {
 	}
 	return nil
 }
+
+// Close releases the log file. The database belongs to the caller.
+func (s *Server) Close() error { return s.log.file.Close() }
 
 // Routes returns the route table (used by tests to prove nothing is open).
 func (s *Server) Routes() []Route { return s.routes }
@@ -363,7 +367,7 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
 	}
-	name := strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+r.URL.Path)), "/")
+	name := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
 	if name == "" {
 		name = "index.html"
 	}

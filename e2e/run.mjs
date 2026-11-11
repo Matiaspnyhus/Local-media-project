@@ -21,6 +21,8 @@ const exe = process.platform === 'win32' ? 'localmedia.exe' : 'localmedia'
 const bin = resolve(process.env.LOCALMEDIA_BIN || join(here, '..', exe))
 const browserName = process.env.E2E_BROWSER || 'chromium'
 const port = 18177
+// Safari's engine on a Mac moves focus to buttons with Option+Tab, not Tab.
+const TAB = browserName === 'webkit' ? 'Alt+Tab' : 'Tab'
 
 function lanAddress() {
   for (const list of Object.values(networkInterfaces()))
@@ -36,7 +38,7 @@ async function step(name, fn) {
   console.log(`  ok  ${name} (${Date.now() - t} ms)`)
 }
 
-async function pressUntilFocused(page, selector, key = 'Tab', max = 80) {
+async function pressUntilFocused(page, selector, key = TAB, max = 80) {
   for (let i = 0; i < max; i++) {
     if (await page.evaluate((s) => document.activeElement === document.querySelector(s), selector)) return
     await page.keyboard.press(key)
@@ -51,7 +53,7 @@ async function focusByText(page, text, max = 80) {
       return el && (el.tagName === 'BUTTON' || el.tagName === 'A') ? el.textContent || '' : ''
     })
     if (t.includes(text)) return
-    await page.keyboard.press('Tab')
+    await page.keyboard.press(TAB)
   }
   throw new Error(`keyboard could not reach "${text}"`)
 }
