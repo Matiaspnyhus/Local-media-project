@@ -109,10 +109,17 @@ func TestBigLibrary(t *testing.T) {
 	if rescan > limit(time.Minute) {
 		t.Errorf("rescan took %v, over the target of %v for this size", rescan, limit(time.Minute))
 	}
-	if home > 100*time.Millisecond {
-		t.Errorf("the first screen took %v at the 95th percentile, over 100 ms", home)
+	// The plan's 100 ms is measured on the four-core build machine at full
+	// size (LM_BIG). On the shared machines that run every change the same
+	// check only guards against something going badly wrong.
+	pageLimit := 100 * time.Millisecond
+	if os.Getenv("LM_BIG") == "" {
+		pageLimit = 600 * time.Millisecond
 	}
-	if show > 100*time.Millisecond || search > 150*time.Millisecond {
+	if home > pageLimit {
+		t.Errorf("the first screen took %v at the 95th percentile, over %v", home, pageLimit)
+	}
+	if show > pageLimit || search > pageLimit*3/2 {
 		t.Errorf("a show page took %v and a search %v", show, search)
 	}
 	var next homeOut

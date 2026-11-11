@@ -325,7 +325,7 @@ func Swap(installDir, staged string) error {
 	for _, e := range entries {
 		name := e.Name()
 		cur := filepath.Join(installDir, name)
-		os.Remove(cur + previousSuffix)
+		clearAside(cur + previousSuffix)
 		if _, err := os.Stat(cur); err == nil {
 			if err := os.Rename(cur, cur+previousSuffix); err != nil {
 				undo()
@@ -341,6 +341,17 @@ func Swap(installDir, staged string) error {
 	}
 	os.Remove(staged)
 	return nil
+}
+
+// clearAside gets a kept file out of the way. Usually it can simply be
+// deleted. If it is a program that is still shutting down, Windows will not
+// delete it but will let it be renamed, so it is renamed and removed by a
+// later Tidy.
+func clearAside(p string) {
+	if err := os.Remove(p); err == nil || os.IsNotExist(err) {
+		return
+	}
+	os.Rename(p, fmt.Sprintf("%s.stale-%d", strings.TrimSuffix(p, previousSuffix), time.Now().UnixNano()))
 }
 
 // HasPrevious reports whether installDir holds a version to go back to.
@@ -361,7 +372,9 @@ func Rollback(installDir string) error {
 	}
 	for _, p := range prev {
 		cur := strings.TrimSuffix(p, previousSuffix)
-		os.Remove(cur + ".failed")
+		if err := os.Remove(cur + ".failed"); err != nil && !os.IsNotExist(err) {
+			os.Rename(cur+".failed", fmt.Sprintf("%s.stale-%d", cur, time.Now().UnixNano()))
+		}
 		if _, err := os.Stat(cur); err == nil {
 			if err := os.Rename(cur, cur+".failed"); err != nil {
 				return err
@@ -377,7 +390,7 @@ func Rollback(installDir string) error {
 // Tidy removes what earlier updates left behind: old downloads, unpacked
 // folders and files set aside by a rollback.
 func Tidy(installDir string) {
-	for _, pattern := range []string{"download-*.zip", "*.failed"} {
+	for _, pattern := range []string{"download-*.zip", "*.failed", "*.stale-*"} {
 		m, _ := filepath.Glob(filepath.Join(installDir, pattern))
 		for _, p := range m {
 			os.Remove(p)

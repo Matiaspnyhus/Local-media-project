@@ -60,6 +60,7 @@ Filename: "{app}\localmedia.exe"; Description: "Start Local Media now"; Flags: n
 ; for going back. The data folder is somewhere else and is not listed here.
 Type: files; Name: "{app}\*.previous"
 Type: files; Name: "{app}\*.failed"
+Type: files; Name: "{app}\*.stale-*"
 Type: files; Name: "{app}\download-*.zip"
 Type: dirifempty; Name: "{app}"
 
