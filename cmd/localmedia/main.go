@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Matiaspnyhus/Local-media-project/internal/db"
+	"github.com/Matiaspnyhus/Local-media-project/internal/probe"
 	"github.com/Matiaspnyhus/Local-media-project/internal/server"
 	"github.com/Matiaspnyhus/Local-media-project/web"
 )
@@ -55,7 +56,8 @@ func run() error {
 	}
 	defer d.Close()
 
-	srv, err := server.New(server.Config{DB: d, DataDir: *dataDir, Version: version, Port: *port, Assets: web.Assets(), LogOut: os.Stdout})
+	ffprobe := probe.Find()
+	srv, err := server.New(server.Config{DB: d, DataDir: *dataDir, Version: version, Port: *port, Assets: web.Assets(), LogOut: os.Stdout, FFprobe: ffprobe})
 	if err != nil {
 		return err
 	}
@@ -71,6 +73,9 @@ func run() error {
 	fmt.Printf("\nLocal Media %s is running.\n\n  On this PC:        %s\n", version, localURL)
 	for _, u := range srv.LANURLs() {
 		fmt.Printf("  On other devices:  %s\n", u)
+	}
+	if ffprobe == "" {
+		fmt.Println("\nNote: ffprobe was not found, so files cannot be inspected. The app will not\nknow in advance which files your browser can play.")
 	}
 	fmt.Printf("\nData folder: %s\nKeep this window open. Close it to stop Local Media.\n\n", *dataDir)
 

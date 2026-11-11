@@ -2,7 +2,7 @@
 
 The project plan is in `PLAN.md`. Read it before doing any work. It defines the milestones (M0 to M9), the technical design, the acceptance tests for each milestone, and the rules that hold throughout.
 
-Status: M0 (first playable build) is written and its checks pass; it is waiting for the owner's checklist (`docs/checklists/M0.md`). Next: M1, the library.
+Status: M0 passed the owner's check on a Windows PC (2026-11-11). M1 (the library) is in progress: name recognition and the library itself are done (slices 1 and 2 in `docs/decisions.md`); what remains is listed at the end of slice 2 there.
 
 Owner's answers so far (2026-11-11):
 - The phone is an iPhone. Safari's engine is checked on a macOS runner from M0, Safari on iOS is a first-class target from M3, and Streamyfin and Infuse are the first store apps in M5.

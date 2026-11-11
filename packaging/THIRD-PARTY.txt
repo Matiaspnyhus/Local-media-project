@@ -1,0 +1,15 @@
+Local Media ships with one separate program that it runs but does not contain:
+
+ffprobe.exe
+  What it is:  the file inspector from FFmpeg, in the build published by the
+               Jellyfin project (jellyfin-ffmpeg 8.1.3-2, Windows 64-bit, GPL build).
+  Used for:    reading what is inside each video file (length, picture and sound formats).
+  Licence:     GNU General Public License, version 3 or later. The full text is in
+               LICENSE.txt in this folder.
+  Source code: https://github.com/jellyfin/jellyfin-ffmpeg/tree/v8.1.3-2
+  Downloaded from:
+               https://github.com/jellyfin/jellyfin-ffmpeg/releases/tag/v8.1.3-2
+               and checked against a fixed checksum when this package was built.
+
+Local Media itself is licensed under the GNU General Public License, version 3 or
+later. Its source code is at https://github.com/Matiaspnyhus/Local-media-project

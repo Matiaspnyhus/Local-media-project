@@ -27,6 +27,8 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Matiaspnyhus/Local-media-project/internal/auth"
+	"github.com/Matiaspnyhus/Local-media-project/internal/library"
+	"github.com/Matiaspnyhus/Local-media-project/internal/playback"
 )
 
 // Policy says who may call a route.
@@ -70,23 +72,31 @@ type Config struct {
 	Port    int
 	Assets  fs.FS // the built web app
 	LogOut  io.Writer
+	FFprobe string // path to ffprobe; "" means files are not inspected
 }
 
 // Server holds the state behind the routes.
 type Server struct {
-	db        *sql.DB
-	dataDir   string
-	version   string
-	port      int
-	assets    fs.FS
-	linkKey   []byte
-	setupDone atomic.Bool
-	limiter   *loginLimiter
-	log       *logger
-	events    *eventLog
-	scanMu    sync.Mutex
-	handler   http.Handler
-	routes    []Route
+	db         *sql.DB
+	dataDir    string
+	version    string
+	port       int
+	assets     fs.FS
+	linkKey    []byte
+	setupDone  atomic.Bool
+	limiter    *loginLimiter
+	log        *logger
+	events     *eventLog
+	scanMu     sync.Mutex
+	ffprobe    string
+	inspectMu  sync.Mutex
+	inspecting atomic.Bool
+	capsMu     sync.Mutex
+	caps       map[string]*playback.Caps // by session
+	ctx        context.Context
+	stop       context.CancelFunc
+	handler    http.Handler
+	routes     []Route
 }
 
 type ctxKey int
@@ -111,8 +121,9 @@ const (
 func New(cfg Config) (*Server, error) {
 	s := &Server{
 		db: cfg.DB, dataDir: cfg.DataDir, version: cfg.Version, port: cfg.Port, assets: cfg.Assets,
-		limiter: newLoginLimiter(), events: &eventLog{},
+		limiter: newLoginLimiter(), events: &eventLog{}, ffprobe: cfg.FFprobe, caps: map[string]*playback.Caps{},
 	}
+	s.ctx, s.stop = context.WithCancel(context.Background())
 	var err error
 	if s.log, err = newLogger(cfg.DataDir, cfg.LogOut); err != nil {
 		return nil, err
@@ -150,7 +161,39 @@ func checkRoutes(routes []Route) error {
 }
 
 // Close releases the log file. The database belongs to the caller.
-func (s *Server) Close() error { return s.log.file.Close() }
+func (s *Server) Close() error {
+	s.stop()
+	s.inspectMu.Lock() // wait for a running inspection to notice
+	s.inspectMu.Unlock()
+	return s.log.file.Close()
+}
+
+// inspectSoon starts inspecting new files in the background, unless that
+// is already happening.
+func (s *Server) inspectSoon() {
+	if s.ffprobe == "" || !s.inspecting.CompareAndSwap(false, true) {
+		return
+	}
+	s.inspectMu.Lock()
+	go func() {
+		defer s.inspectMu.Unlock()
+		defer s.inspecting.Store(false)
+		res, err := library.ProbePending(s.ctx, s.db, s.ffprobe)
+		if err != nil && s.ctx.Err() == nil {
+			s.log.Printf("inspecting files failed: %v", err)
+		}
+		if res.Inspected+res.Failed > 0 {
+			s.log.Printf("inspected %d files, %d could not be read", res.Inspected, res.Failed)
+		}
+	}()
+}
+
+// InspectNow inspects pending files and waits; tests use it.
+func (s *Server) InspectNow() {
+	if s.ffprobe != "" {
+		library.ProbePending(s.ctx, s.db, s.ffprobe)
+	}
+}
 
 // Routes returns the route table (used by tests to prove nothing is open).
 func (s *Server) Routes() []Route { return s.routes }

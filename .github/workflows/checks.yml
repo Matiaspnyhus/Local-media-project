@@ -55,11 +55,27 @@ jobs:
           cp release/localmedia-linux-amd64 localmedia
           cd e2e && npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
           node run.mjs
+      - name: Package for Windows with the pinned file inspector
+        run: |
+          set -euo pipefail
+          . packaging/ffmpeg.env
+          curl -sSL --retry 3 -o ffmpeg-win64.zip "$FFMPEG_WIN64_URL"
+          echo "$FFMPEG_WIN64_SHA256  ffmpeg-win64.zip" | sha256sum -c -
+          mkdir -p package/LocalMedia
+          unzip -q -j ffmpeg-win64.zip ffprobe.exe -d package/LocalMedia
+          cp release/localmedia-windows-amd64.exe package/LocalMedia/localmedia.exe
+          cp LICENSE package/LocalMedia/LICENSE.txt
+          cp packaging/THIRD-PARTY.txt package/LocalMedia/THIRD-PARTY.txt
       - uses: actions/upload-artifact@v4
         with:
           name: localmedia-builds
           path: release/
           retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalMedia-Windows
+          path: package/
+          retention-days: 30
 
   windows:
     needs: [plan, linux]
@@ -74,13 +90,22 @@ jobs:
         run: go test ./...
       - uses: actions/download-artifact@v4
         with:
-          name: localmedia-builds
-          path: release
-      - name: The Windows program starts and answers
+          name: LocalMedia-Windows
+          path: package
+      - name: The Windows package starts, answers and has a working file inspector
         shell: pwsh
         run: |
+          $dir = "package\LocalMedia"
+          foreach ($f in "localmedia.exe", "ffprobe.exe", "LICENSE.txt", "THIRD-PARTY.txt") {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "the package lacks $f" }
+          }
+          & "$dir\ffprobe.exe" -version | Select-Object -First 1
+          if ($LASTEXITCODE -ne 0) { throw "the bundled ffprobe does not run" }
+          $json = & "$dir\ffprobe.exe" -v error -print_format json -show_streams "e2e\fixtures\Dolby.Sound.Test.mkv" | Out-String
+          if ($json -notmatch '"codec_name": "ac3"') { throw "the bundled ffprobe did not read the test file" }
           $data = Join-Path $env:RUNNER_TEMP "lm-data"
-          $p = Start-Process -FilePath "release\localmedia-windows-amd64.exe" -ArgumentList "--data", $data, "--port", "18177", "--no-browser" -PassThru
+          $out = Join-Path $env:RUNNER_TEMP "lm-out.txt"
+          $p = Start-Process -FilePath "$dir\localmedia.exe" -ArgumentList "--data", $data, "--port", "18177", "--no-browser" -PassThru -RedirectStandardOutput $out
           $ok = $false
           foreach ($i in 1..50) {
             try {
@@ -94,6 +119,7 @@ jobs:
           $state = Invoke-RestMethod -Uri "http://localhost:18177/api/state"
           if ($state.setupDone) { throw "a fresh install claims to be set up" }
           Stop-Process -Id $p.Id -Force
+          if ((Get-Content $out -Raw) -match "ffprobe was not found") { throw "the program did not find the ffprobe beside it" }
           Write-Host "Windows program started, served the web app and answered. Version: $($r.version)"
 
   macos:
@@ -145,6 +171,10 @@ jobs:
         with:
           name: localmedia-builds
           path: release
+      - uses: actions/download-artifact@v4
+        with:
+          name: LocalMedia-Windows
+          path: package
       - name: Package and publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -158,6 +188,8 @@ jobs:
             cp ../LICENSE "pkg/$base/LICENSE.txt"
             (cd pkg && zip -q -r "../$base.zip" "$base")
           done
+          rm -f localmedia-windows-amd64.zip
+          (cd ../package && zip -q -r ../release/LocalMedia-Windows.zip LocalMedia)
           sha256sum *.zip > SHA256SUMS.txt
           gh release create "$GITHUB_REF_NAME" *.zip SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" --title "Local Media $GITHUB_REF_NAME" \

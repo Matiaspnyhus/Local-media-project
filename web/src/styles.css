@@ -42,3 +42,9 @@ video { width: 100%; max-height: 75vh; background: #000; border-radius: 8px; }
 .qr { background: #fff; padding: 8px; border-radius: 8px; width: 176px; height: 176px; display: block; }
 .addr { font-family: ui-monospace, Consolas, monospace; font-size: 1.1rem; overflow-wrap: anywhere; }
 .split { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-start; }
+.tabs { display: flex; gap: .5rem; margin: 1.5rem 0 .75rem; }
+.tabs button[aria-selected=true] { background: var(--accent); color: #06121c; border-color: var(--accent); font-weight: 600; }
+.needs { color: var(--warn); font-size: .85rem; margin-top: .25rem; }
+#search { margin: .25rem 0 0; }
+.visually-hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.card ul { margin: .5rem 0; padding-left: 1.25rem; }

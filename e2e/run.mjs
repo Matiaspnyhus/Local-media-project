@@ -7,7 +7,7 @@
 //
 // Needs the program built at ./localmedia (or LOCALMEDIA_BIN).
 import { spawn } from 'node:child_process'
-import { mkdtempSync, cpSync, rmSync, existsSync } from 'node:fs'
+import { mkdtempSync, cpSync, rmSync, existsSync, mkdirSync, copyFileSync } from 'node:fs'
 import { tmpdir, networkInterfaces } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -77,6 +77,10 @@ assert.ok(existsSync(bin), `program not found at ${bin}; build it first`)
 const data = mkdtempSync(join(tmpdir(), 'lm-data-'))
 const media = mkdtempSync(join(tmpdir(), 'lm-media-'))
 cpSync(join(here, 'fixtures'), media, { recursive: true })
+// A small show, made from the same clip, laid out the way shows usually are.
+const season = join(media, 'TV', 'Good Show', 'Season 01')
+mkdirSync(season, { recursive: true })
+for (const n of [1, 2]) copyFileSync(join(here, 'fixtures', 'Test Clip.mp4'), join(season, `Good Show - S01E0${n}.mp4`))
 
 const server = spawn(bin, ['--data', data, '--port', String(port), '--no-browser'], { stdio: ['ignore', 'pipe', 'pipe'] })
 let serverLog = ''
@@ -104,7 +108,7 @@ try {
       const res = await fetch(remote + '/')
       assert.equal(res.status, 403)
       assert.match(await res.text(), /Setup is not finished/)
-      assert.equal((await fetch(remote + '/api/items')).status, 403)
+      assert.equal((await fetch(remote + '/api/movies')).status, 403)
     })
   }
 
@@ -121,7 +125,7 @@ try {
     await setupPage.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
     await setupPage.keyboard.type(media)
     await setupPage.keyboard.press('Enter')
-    await setupPage.waitForSelector('text=All videos (2)')
+    await setupPage.waitForSelector('text=Films (2)')
   })
 
   await step('the PC shows the address and a QR code for other devices', async () => {
@@ -145,7 +149,7 @@ try {
   page.on('console', (m) => m.type() === 'error' && consoleErrors.push(m.text()))
 
   await step('another device must sign in; a wrong password is refused', async () => {
-    assert.equal((await page.request.get(base + '/api/items')).status(), 401)
+    assert.equal((await page.request.get(base + '/api/movies')).status(), 401)
     await page.goto(base)
     await page.waitForSelector('text=Sign in to Local Media')
     await pressUntilFocused(page, '#name')
@@ -158,7 +162,7 @@ try {
     await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
     await page.keyboard.type('a good password')
     await page.keyboard.press('Enter')
-    await page.waitForSelector('text=All videos (2)')
+    await page.waitForSelector('text=Films (2)')
   })
 
   await step('play a file, keyboard only', async () => {
@@ -173,7 +177,7 @@ try {
     await page.evaluate(() => (document.querySelector('video').currentTime = 12))
     await page.waitForFunction(() => document.querySelector('video').currentTime > 12.5, null, { timeout: 20000 })
     await page.evaluate(() => document.querySelector('video').pause())
-    await focusByText(page, 'Back to the library')
+    await focusByText(page, '← Back')
     await page.keyboard.press('Enter')
     await page.waitForSelector('text=Continue watching')
     await page.waitForSelector('text=Stopped at 0:1')
@@ -186,26 +190,56 @@ try {
     const t = await page.evaluate(() => document.querySelector('video').currentTime)
     assert.ok(t >= 11 && t < 19, `resumed at ${t}`)
     await page.goBack()
-    await page.waitForSelector('text=All videos (2)')
+    await page.waitForSelector('text=Films (2)')
   })
 
   if (browserName === 'chromium') {
     await step('a file with Dolby sound says why it is silent', async () => {
-      await focusByText(page, 'Dolby Sound Sample')
+      // With the file inspector present the list already marks it; without
+      // one, the player notices while playing. Either way the page says why.
+      await focusByText(page, 'Dolby Sound Test')
       await page.keyboard.press('Enter')
-      await page.waitForSelector('video')
-      await page.evaluate(() => {
-        const v = document.querySelector('video')
-        v.play().catch(() => {})
-      })
+      await page.waitForSelector('video, [data-testid=play-problem]')
+      await page.evaluate(() => document.querySelector('video')?.play().catch(() => {}))
       await page.waitForSelector('[data-testid=play-problem]', { timeout: 20000 })
       await page.goBack()
+      await page.waitForSelector('text=Films (2)')
     })
   }
 
+  await step('a show: open it, finish episode 1, and episode 2 is next up', async () => {
+    await focusByText(page, 'Shows (1)')
+    await page.keyboard.press('Enter')
+    await focusByText(page, 'Good Show')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('text=Season 1')
+    await focusByText(page, 'Episode 1')
+    await page.keyboard.press('Enter')
+    await waitPlaying(page, 0.5)
+    await page.evaluate(() => {
+      const v = document.querySelector('video')
+      v.currentTime = v.duration - 0.5
+    })
+    await page.waitForFunction(() => document.querySelector('video').ended, null, { timeout: 20000 })
+    await page.waitForTimeout(300)
+    await page.goto(base)
+    await page.waitForSelector('text=Next up')
+    await page.waitForSelector('text=Good Show · Season 1 · Episode 2')
+  })
+
+  await step('search finds the show without typing its whole name', async () => {
+    await pressUntilFocused(page, '#search')
+    await page.keyboard.type('goo')
+    await page.waitForSelector('text=Search results')
+    await page.waitForSelector('text=2 episodes · 1 watched')
+    await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
+    await page.keyboard.press('Backspace')
+    await page.waitForSelector('text=Films (2)')
+  })
+
   await step('the stream link stops working after signing out', async () => {
     const link = await page.evaluate(async () => {
-      const items = (await (await fetch('/api/items')).json()).items
+      const items = (await (await fetch('/api/movies')).json()).items
       const r = await fetch(`/api/items/${items[0].id}/play`, { method: 'POST', headers: { 'X-Requested-With': 'localmedia', 'Content-Type': 'application/json' }, body: '{}' })
       return (await r.json()).url
     })

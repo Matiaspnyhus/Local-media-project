@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
-import { api, ApiError, type Folders, type Item, type PlayInfo, type State } from './api'
+import { api, ApiError, type Folders, type Home, type Item, type PlayInfo, type Season, type Show, type State } from './api'
+import { measureCaps } from './caps'
 
-type Screen = { name: 'library' } | { name: 'watch'; id: string }
+type Screen = { name: 'library' } | { name: 'watch'; id: string } | { name: 'show'; id: string }
 
 function screenFromLocation(): Screen {
-  const m = window.location.pathname.match(/^\/watch\/([0-9a-f]{32})$/)
-  return m ? { name: 'watch', id: m[1] } : { name: 'library' }
+  const m = window.location.pathname.match(/^\/(watch|show)\/([0-9a-f]{32})$/)
+  return m ? { name: m[1] as 'watch' | 'show', id: m[2] } : { name: 'library' }
 }
 
 export function App() {
@@ -31,9 +32,22 @@ export function App() {
   }, [])
 
   const go = (s: Screen) => {
-    window.history.pushState(null, '', s.name === 'watch' ? `/watch/${s.id}` : '/')
+    window.history.pushState(null, '', s.name === 'library' ? '/' : `/${s.name}/${s.id}`)
     setScreen(s)
   }
+  const back = () => (window.history.length > 1 ? window.history.back() : go({ name: 'library' }))
+
+  // Tell the server what this browser can play, once per visit, so it can
+  // mark the files that will not play here.
+  const signedIn = !!state?.user
+  const [capsSent, setCapsSent] = useState(false)
+  useEffect(() => {
+    if (!signedIn) return setCapsSent(false)
+    api
+      .capabilities(measureCaps())
+      .catch(() => undefined)
+      .then(() => setCapsSent(true))
+  }, [signedIn])
 
   if (error)
     return (
@@ -53,9 +67,16 @@ export function App() {
     )
   if (!state.setupDone) return <Setup onDone={refresh} />
   if (!state.user) return <Login onDone={refresh} />
-  if (screen.name === 'watch')
-    return <Watch id={screen.id} onBack={() => go({ name: 'library' })} onSignedOut={refresh} />
-  return <Library state={state} onPlay={(id) => go({ name: 'watch', id })} onSignedOut={refresh} />
+  if (!capsSent)
+    return (
+      <main>
+        <p className="dim">Loading…</p>
+      </main>
+    )
+  const play = (id: string) => go({ name: 'watch', id })
+  if (screen.name === 'watch') return <Watch id={screen.id} onBack={back} onSignedOut={refresh} />
+  if (screen.name === 'show') return <ShowPage id={screen.id} onBack={back} onPlay={play} onSignedOut={refresh} />
+  return <Library state={state} onPlay={play} onShow={(id) => go({ name: 'show', id })} onSignedOut={refresh} />
 }
 
 function Setup({ onDone }: { onDone: () => void }) {
@@ -191,8 +212,31 @@ function formatTime(ms: number): string {
   return (h ? h + ':' + String(m).padStart(2, '0') : String(m)) + ':' + String(sec).padStart(2, '0')
 }
 
-function Library({ state, onPlay, onSignedOut }: { state: State; onPlay: (id: string) => void; onSignedOut: () => void }) {
-  const [items, setItems] = useState<Item[] | null>(null)
+const NEEDS = 'Needs converting, which arrives in a later version'
+
+function itemLabel(it: Item, withShow: boolean): string {
+  if (it.kind !== 'episode') return it.title + (it.year ? ` (${it.year})` : '')
+  const ep = it.episodeEnd ? `Episodes ${it.episode}–${it.episodeEnd}` : `Episode ${it.episode}`
+  return withShow ? `${it.showTitle} · Season ${it.season} · ${ep}` : ep
+}
+
+function Library({
+  state,
+  onPlay,
+  onShow,
+  onSignedOut,
+}: {
+  state: State
+  onPlay: (id: string) => void
+  onShow: (id: string) => void
+  onSignedOut: () => void
+}) {
+  const [home, setHome] = useState<Home | null>(null)
+  const [movies, setMovies] = useState<Item[] | null>(null)
+  const [shows, setShows] = useState<Show[] | null>(null)
+  const [tab, setTab] = useState<'films' | 'shows'>(() => (sessionStorageGet('tab') === 'shows' ? 'shows' : 'films'))
+  const [query, setQuery] = useState('')
+  const [found, setFound] = useState<{ items: Item[]; shows: Show[] } | null>(null)
   const [error, setError] = useState('')
   const [note, setNote] = useState('')
   const [urls, setUrls] = useState<string[]>([])
@@ -200,29 +244,49 @@ function Library({ state, onPlay, onSignedOut }: { state: State; onPlay: (id: st
   const isOwner = state.user?.role === 'owner'
 
   const load = useCallback(() => {
-    api
-      .items()
-      .then((r) => setItems(r.items))
-      .catch((e: ApiError) => (e.status === 401 ? onSignedOut() : setError(e.message)))
+    const fail = (e: ApiError) => (e.status === 401 ? onSignedOut() : setError(e.message))
+    api.home().then(setHome).catch(fail)
+    api.movies().then((r) => setMovies(r.items)).catch(fail)
+    api.shows().then((r) => setShows(r.shows)).catch(fail)
   }, [onSignedOut])
   useEffect(load, [load])
   useEffect(() => {
     api.connect().then((r) => setUrls(r.urls)).catch(() => undefined)
   }, [])
+  // While files are still being inspected, look again every few seconds.
+  const pending = home?.inspection.available ? home.inspection.pending : 0
+  useEffect(() => {
+    if (!pending) return
+    const t = window.setTimeout(load, 4000)
+    return () => window.clearTimeout(t)
+  }, [pending, home, load])
+
+  useEffect(() => {
+    const q = query.trim()
+    if (!q) return setFound(null)
+    const t = window.setTimeout(() => {
+      api.search(q).then(setFound).catch(() => undefined)
+    }, 200)
+    return () => window.clearTimeout(t)
+  }, [query])
 
   const rescan = () => {
     setNote('Looking for new files…')
     api
       .scan()
       .then((r) => {
-        setNote(`Found ${r.scan.total} video files (${r.scan.added} new).`)
+        const moved = r.scan.moved ? `, ${r.scan.moved} moved or renamed` : ''
+        setNote(`Found ${r.scan.total} video files (${r.scan.added} new${moved}).`)
         load()
       })
       .catch((e: ApiError) => setNote(e.message))
   }
   const signOut = () => api.logout().then(onSignedOut, onSignedOut)
-
-  const continuing = (items || []).filter((i) => i.positionMs > 0 && !i.played)
+  const pickTab = (t: 'films' | 'shows') => {
+    setTab(t)
+    sessionStorageSet('tab', t)
+  }
+  const empty = movies && shows && movies.length === 0 && shows.length === 0
 
   return (
     <main>
@@ -267,46 +331,133 @@ function Library({ state, onPlay, onSignedOut }: { state: State; onPlay: (id: st
 
       {note && <p className="note" role="status">{note}</p>}
       {error && <p className="error" role="alert">{error}</p>}
-      {items === null && !error && <p className="dim">Loading…</p>}
-      {items && items.length === 0 && (
-        <div className="card">
-          <p>No video files were found in your folder yet.</p>
-          <p className="dim">Copy a video into the folder and press "Look for new files".</p>
-        </div>
+      {home && home.inspection.available && home.inspection.pending > 0 && (
+        <p className="dim" role="status">
+          Inspecting your files: {home.inspection.pending} to go. Until a file has been inspected, the app cannot say
+          whether this browser can play it.
+        </p>
+      )}
+      {home && !home.inspection.available && (
+        <p className="dim">
+          This copy of Local Media has no file inspector beside it, so it cannot tell in advance which files this
+          browser can play.
+        </p>
       )}
 
-      {continuing.length > 0 && (
+      <label htmlFor="search" className="visually-hidden">
+        Search
+      </label>
+      <input
+        id="search"
+        type="text"
+        placeholder="Search films and shows"
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        autoComplete="off"
+      />
+
+      {found ? (
+        <section aria-label="Search results">
+          <h2>
+            {found.items.length + found.shows.length === 0 ? `Nothing found for "${query.trim()}"` : 'Search results'}
+          </h2>
+          <ShowList shows={found.shows} onShow={onShow} />
+          <ItemList items={found.items} onPlay={onPlay} withShow />
+        </section>
+      ) : (
         <>
-          <h2>Continue watching</h2>
-          <ItemList items={continuing} onPlay={onPlay} />
-        </>
-      )}
-      {items && items.length > 0 && (
-        <>
-          <h2>All videos ({items.length})</h2>
-          <ItemList items={items} onPlay={onPlay} />
+          {home && home.continue.length > 0 && (
+            <section>
+              <h2>Continue watching</h2>
+              <ItemList items={home.continue} onPlay={onPlay} withShow />
+            </section>
+          )}
+          {home && home.nextUp.length > 0 && (
+            <section>
+              <h2>Next up</h2>
+              <ItemList items={home.nextUp} onPlay={onPlay} withShow />
+            </section>
+          )}
+          {empty && (
+            <div className="card">
+              <p>No video files were found in your folder yet.</p>
+              <p className="dim">Copy a video into the folder and press "Look for new files".</p>
+            </div>
+          )}
+          {movies && shows && !empty && (
+            <section>
+              <div className="tabs" role="tablist">
+                <button role="tab" aria-selected={tab === 'films'} onClick={() => pickTab('films')}>
+                  Films ({movies.length})
+                </button>
+                <button role="tab" aria-selected={tab === 'shows'} onClick={() => pickTab('shows')}>
+                  Shows ({shows.length})
+                </button>
+              </div>
+              {tab === 'films' ? <ItemList items={movies} onPlay={onPlay} withShow /> : <ShowList shows={shows} onShow={onShow} />}
+              {tab === 'films' && movies.length === 0 && <p className="dim">No films found.</p>}
+              {tab === 'shows' && shows.length === 0 && <p className="dim">No shows found.</p>}
+            </section>
+          )}
         </>
       )}
       <p className="dim" style={{ marginTop: '2rem' }}>
-        Local Media {state.version}. This early version plays only files your browser can play by itself. Others will
-        say so when you try them; that is expected until a later version.
+        Local Media {state.version}. This early version plays only files your browser can play by itself. The others
+        are marked; converting them arrives in a later version.
       </p>
     </main>
   )
 }
 
-function ItemList({ items, onPlay }: { items: Item[]; onPlay: (id: string) => void }) {
+function sessionStorageGet(key: string): string | null {
+  try {
+    return window.sessionStorage.getItem('lm.' + key)
+  } catch {
+    return null
+  }
+}
+function sessionStorageSet(key: string, value: string) {
+  try {
+    window.sessionStorage.setItem('lm.' + key, value)
+  } catch {
+    /* private mode: the tab is simply not remembered */
+  }
+}
+
+function ShowList({ shows, onShow }: { shows: Show[]; onShow: (id: string) => void }) {
+  return (
+    <ul className="list">
+      {shows.map((sh) => (
+        <li key={sh.id}>
+          <button className="row" onClick={() => onShow(sh.id)}>
+            <div className="title">
+              {sh.title}
+              {sh.year ? ` (${sh.year})` : ''}
+            </div>
+            <div className="meta">
+              {sh.episodes} {sh.episodes === 1 ? 'episode' : 'episodes'}
+              {sh.watched > 0 ? ` · ${sh.watched} watched` : ''}
+            </div>
+          </button>
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+function ItemList({ items, onPlay, withShow }: { items: Item[]; onPlay: (id: string) => void; withShow?: boolean }) {
   return (
     <ul className="list">
       {items.map((it) => (
         <li key={it.id}>
           <button className="row" onClick={() => onPlay(it.id)}>
-            <div className="title">{it.title}</div>
+            <div className="title">{itemLabel(it, !!withShow)}</div>
             <div className="meta">
+              {it.durationMs > 0 ? formatTime(it.durationMs) + ' · ' : ''}
               {it.container.toUpperCase()}
-              {it.folder ? ' · ' + it.folder : ''}
               {it.played ? ' · Watched' : it.positionMs > 0 ? ` · Stopped at ${formatTime(it.positionMs)}` : ''}
             </div>
+            {it.playable === 'no' && <div className="needs">{NEEDS}</div>}
             {it.positionMs > 0 && it.durationMs > 0 && !it.played && (
               <div className="progress">
                 <div style={{ width: Math.min(100, (it.positionMs / it.durationMs) * 100) + '%' }} />
@@ -316,6 +467,45 @@ function ItemList({ items, onPlay }: { items: Item[]; onPlay: (id: string) => vo
         </li>
       ))}
     </ul>
+  )
+}
+
+function ShowPage({
+  id,
+  onBack,
+  onPlay,
+  onSignedOut,
+}: {
+  id: string
+  onBack: () => void
+  onPlay: (id: string) => void
+  onSignedOut: () => void
+}) {
+  const [data, setData] = useState<{ show: Show; seasons: Season[] } | null>(null)
+  const [error, setError] = useState('')
+  useEffect(() => {
+    api
+      .show(id)
+      .then(setData)
+      .catch((e: ApiError) => (e.status === 401 ? onSignedOut() : setError(e.message)))
+  }, [id, onSignedOut])
+  return (
+    <main>
+      <div className="bar">
+        <button onClick={onBack}>← Back</button>
+        <h1>
+          {data?.show.title}
+          {data?.show.year ? ` (${data.show.year})` : ''}
+        </h1>
+      </div>
+      {error && <p className="error" role="alert">{error}</p>}
+      {data?.seasons.map((se) => (
+        <section key={se.number}>
+          <h2>{se.title}</h2>
+          <ItemList items={se.episodes} onPlay={onPlay} />
+        </section>
+      ))}
+    </main>
   )
 }
 
@@ -330,6 +520,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
   const [info, setInfo] = useState<PlayInfo | null>(null)
   const [error, setError] = useState('')
   const [problem, setProblem] = useState('')
+  const [tryAnyway, setTryAnyway] = useState(false)
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const lastSent = useRef(0)
   const reported = useRef<Record<string, boolean>>({})
@@ -390,7 +581,9 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     const v = videoRef.current as (HTMLVideoElement & { webkitAudioDecodedByteCount?: number }) | null
     // Chrome can tell us that no sound has been decoded: the usual sign of
     // Dolby or DTS sound, which Chrome cannot play.
-    if (v && v.currentTime > 3 && v.webkitAudioDecodedByteCount === 0 && !v.muted) {
+    // Only when the server could not tell us: if it inspected the file it
+    // already knows whether there is sound, and said so before playing.
+    if (v && info?.plan.hasAudio === null && v.currentTime > 3 && v.webkitAudioDecodedByteCount === 0 && !v.muted) {
       setProblem(
         "If you hear no sound: this file's sound format (probably Dolby or DTS) is one this browser cannot play. Converting it arrives in a later version (M3).",
       )
@@ -410,12 +603,27 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
   return (
     <main>
       <div className="bar">
-        <button onClick={onBack}>← Back to the library</button>
+        <button onClick={onBack}>← Back</button>
         <h1 style={{ fontSize: '1.2rem' }}>{info?.title || ''}</h1>
       </div>
       {error && <p className="error" role="alert">{error}</p>}
       {problem && <p className="note" role="alert" data-testid="play-problem">{problem}</p>}
-      {info && (
+      {info && info.plan.direct === 'no' && !tryAnyway && (
+        <div className="card" role="alert" data-testid="play-problem">
+          <p>This browser cannot play this file as it is.</p>
+          <ul>
+            {info.plan.reasons.map((r) => (
+              <li key={r}>{r}</li>
+            ))}
+          </ul>
+          <p className="dim">
+            Converting files like this one while you watch arrives in a later version (M3). Another browser or device
+            may be able to play it today.
+          </p>
+          <button onClick={() => setTryAnyway(true)}>Try anyway</button>
+        </div>
+      )}
+      {info && (info.plan.direct !== 'no' || tryAnyway) && (
         <video
           ref={videoRef}
           src={info.url}

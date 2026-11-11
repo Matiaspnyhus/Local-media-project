@@ -163,7 +163,7 @@ func TestNothingButSignInAnswersWithoutASession(t *testing.T) {
 
 func TestBeforeSetupOnlyThePCIsAnswered(t *testing.T) {
 	e := newEnv(t)
-	for _, target := range []string{"/", "/api/state", "/api/setup/folders", "/api/items", "/assets/app.js"} {
+	for _, target := range []string{"/", "/api/state", "/api/setup/folders", "/api/movies", "/assets/app.js"} {
 		if w := e.do("GET", target, remote, nil, nil); w.Code != 403 {
 			t.Errorf("before setup, %s answered a remote device with %d", target, w.Code)
 		}
@@ -206,8 +206,8 @@ type playOut struct {
 
 func (e *env) firstItem(c *http.Cookie, title string) string {
 	e.t.Helper()
-	var out struct{ Items []itemOut }
-	decode(e.t, e.do("GET", "/api/items", remote, c, nil), &out)
+	var out struct{ Items []itemView }
+	decode(e.t, e.do("GET", "/api/movies", remote, c, nil), &out)
 	for _, it := range out.Items {
 		if it.Title == title {
 			return it.ID
@@ -298,7 +298,7 @@ func TestPlayStreamResumeAndSignOut(t *testing.T) {
 	if w := e.do("POST", "/api/logout", remote, c, nil); w.Code != 200 {
 		t.Fatalf("logout: %d", w.Code)
 	}
-	if w := e.do("GET", "/api/items", remote, c, nil); w.Code != 401 {
+	if w := e.do("GET", "/api/movies", remote, c, nil); w.Code != 401 {
 		t.Errorf("cookie still works after sign-out: %d", w.Code)
 	}
 	if w := e.do("GET", p.URL, remote, nil, nil); w.Code != 403 {
@@ -369,7 +369,7 @@ func TestOnlyTheOwnerReachesOwnerRoutes(t *testing.T) {
 			t.Errorf("member reached owner route %s %s: %d", rt.Method, rt.Pattern, w.Code)
 		}
 	}
-	if w := e.do("GET", "/api/items", remote, c, nil); w.Code != 200 {
+	if w := e.do("GET", "/api/movies", remote, c, nil); w.Code != 200 {
 		t.Errorf("member cannot list items: %d", w.Code)
 	}
 }
@@ -395,7 +395,7 @@ func TestWritesFromAnotherWebsiteAreRefused(t *testing.T) {
 	if w.Code != 403 {
 		t.Errorf("write from another origin: %d", w.Code)
 	}
-	if w := e.do("GET", "/api/items", remote, c, nil); w.Code != 200 {
+	if w := e.do("GET", "/api/movies", remote, c, nil); w.Code != 200 {
 		t.Errorf("session was signed out by a refused request: %d", w.Code)
 	}
 }

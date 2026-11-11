@@ -48,3 +48,22 @@ What was decided, when, and why. Newest at the bottom. `PLAN.md` holds the plan;
 - *Independent torture set:* 744 names with answers written by the authors of two other parsers (guessit, LGPL-3.0, and PTT, MIT; see `internal/naming/testdata/README.md`). Result: 605 of 744 (81.3%). The test fails if this number drops.
 
 **Where this departs from the plan.** The plan asked for about 1,500 independently labelled names at 97%. The independent sets that exist are built to break parsers: reversed text, scrambled file names, mixed languages, and conventions where those parsers and we reasonably disagree (they drop "Part III" from "The Godfather Part III" and "US" from "The Office US"; we keep both, because the lookup in M1 needs them). Reaching 97% there would mean re-implementing guessit. The target is therefore held on conventional names, the independent set is kept as a ratchet, and the real test is the owner's own library: the list of files M1 could not identify.
+
+## 2026-11-11: M1, slice 2 — the library
+
+**What exists now.** The scan turns paths into films, shows, seasons and episodes. ffprobe inspects each file once and what it reports is stored (length, every picture, sound and subtitle track, with the profile, level and HDR fields later milestones need). The home screen has Continue Watching and Next Up; there is search, a page per show, and a mark on files this browser cannot play.
+
+**Choices.**
+- *Moved and renamed files* are recognised by size plus a hash of the first and last 64 KB, read once when a file is first seen (at most 128 KB per file). A file found under a new path whose old path is gone keeps its item, so it stays watched. A different file under an old name is a new item.
+- *Shows are matched by title*, ignoring case and punctuation, so `Good Show`, `good.show` and `Good Show (2015)` in three folders are one show. Two different shows with the same title would be merged; online lookups (slice 3) are what can tell them apart.
+- *Two copies of one film* (same title and year) are two versions of one item. The largest plays; choosing between them comes with M3.
+- *Trailers, samples and extras* (by folder name or file-name suffix, following the Plex and Jellyfin conventions) are not listed.
+- *Next Up*: for each show, take the episode watched most recently. If it is unfinished it belongs to Continue Watching. If it is finished, the next unwatched episode after it is next, across season boundaries. Specials are never next.
+- *"Can this browser play it?"* is `internal/playback.Decide`, a pure function with table tests: what ffprobe stored and what the device reports go in, a yes/no/unknown with reasons in plain words comes out. This is the function M3 extends; M1 only asks about playing the original file. The browser reports what it can play by being asked (`canPlayType`), once per visit. One correction is applied on the server: Firefox claims MKV but reads the whole file before playing.
+- *The sound track that counts* is the default one unless it is a commentary; a film with a Dolby commentary and an AAC main track is playable.
+- *Without ffprobe* the answer is "unknown": nothing is marked, and the player falls back on noticing problems while playing. With ffprobe, the "no sound" note is never shown for a file that has no sound track (the false alarm from the owner's M0 check).
+- *Search* quotes every word typed and matches it as a prefix, so nothing typed can act as search syntax.
+- *Sidecar subtitles* (`Film.en.srt`, `Film.no.forced.srt`) are recorded with language and forced flag; they are used from M3.
+- *The pinned inspector*: jellyfin-ffmpeg 8.1.3-2. The Windows download now contains `ffprobe.exe` beside the program, fetched in the build and checked against a fixed SHA-256 (`packaging/ffmpeg.env`), with its licence text and a link to its source. `ffmpeg.exe` joins it in M3, when conversion needs it. On macOS and Linux the program uses an `ffprobe` it finds beside itself or on the PATH.
+
+**Still to do in M1.** Online posters and descriptions (needs the owner's TMDB key and that site allowed in the build environment), reading NFO info files, the 50,000-item speed targets, a separate pool of read connections, generated API description and database code, and the check against the oldest supported browser engine.

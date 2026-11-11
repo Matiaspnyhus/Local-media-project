@@ -94,6 +94,68 @@ CREATE TABLE progress (
 
 CREATE VIRTUAL TABLE item_fts USING fts5(item_id UNINDEXED, title, tokenize='unicode61 remove_diacritics 2');
 `,
+	// 2: M1 library. Items become films, shows, seasons and episodes; each
+	// file remembers what ffprobe said about it, so later versions never
+	// need to re-read the owner's whole library.
+	`
+ALTER TABLE items ADD COLUMN year INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE items ADD COLUMN season_number INTEGER;
+ALTER TABLE items ADD COLUMN episode_number INTEGER;
+ALTER TABLE items ADD COLUMN episode_end INTEGER;
+ALTER TABLE items ADD COLUMN overview TEXT NOT NULL DEFAULT '';
+ALTER TABLE items ADD COLUMN name_source TEXT NOT NULL DEFAULT '';
+CREATE INDEX items_kind ON items(kind, sort_title);
+
+-- 0 = not inspected yet, 1 = inspected, 2 = could not be read
+ALTER TABLE files ADD COLUMN probed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE files ADD COLUMN probed_size INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE files ADD COLUMN probed_mtime INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE files ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE files ADD COLUMN container TEXT NOT NULL DEFAULT '';
+ALTER TABLE files ADD COLUMN bit_rate INTEGER NOT NULL DEFAULT 0;
+-- size plus a hash of the first and last 64 KB: recognises a moved file
+ALTER TABLE files ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';
+CREATE INDEX files_fingerprint ON files(fingerprint);
+
+CREATE TABLE streams (
+  file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  idx INTEGER NOT NULL,
+  kind TEXT NOT NULL,              -- video, audio, subtitle
+  codec TEXT NOT NULL DEFAULT '',
+  profile TEXT NOT NULL DEFAULT '',
+  level INTEGER NOT NULL DEFAULT 0,
+  width INTEGER NOT NULL DEFAULT 0,
+  height INTEGER NOT NULL DEFAULT 0,
+  pix_fmt TEXT NOT NULL DEFAULT '',
+  bit_depth INTEGER NOT NULL DEFAULT 0,
+  color_transfer TEXT NOT NULL DEFAULT '',
+  color_primaries TEXT NOT NULL DEFAULT '',
+  frame_rate TEXT NOT NULL DEFAULT '',
+  channels INTEGER NOT NULL DEFAULT 0,
+  channel_layout TEXT NOT NULL DEFAULT '',
+  sample_rate INTEGER NOT NULL DEFAULT 0,
+  bit_rate INTEGER NOT NULL DEFAULT 0,
+  language TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  is_default INTEGER NOT NULL DEFAULT 0,
+  is_forced INTEGER NOT NULL DEFAULT 0,
+  is_commentary INTEGER NOT NULL DEFAULT 0,
+  is_hearing_impaired INTEGER NOT NULL DEFAULT 0,
+  side_data TEXT NOT NULL DEFAULT '',   -- e.g. "dovi:5" for Dolby Vision profile 5
+  PRIMARY KEY (file_id, idx)
+);
+
+-- subtitle files that sit next to a video ("Film.en.srt")
+CREATE TABLE sidecars (
+  id TEXT PRIMARY KEY,
+  file_id TEXT NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+  rel_path TEXT NOT NULL,
+  format TEXT NOT NULL,
+  language TEXT NOT NULL DEFAULT '',
+  is_forced INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (file_id, rel_path)
+);
+`,
 }
 
 // SchemaVersion is the version this build expects.

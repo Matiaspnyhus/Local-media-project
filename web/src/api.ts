@@ -42,12 +42,38 @@ export interface State {
 }
 export interface Item {
   id: string
+  kind: string
   title: string
+  year?: number
+  showId?: string
+  showTitle?: string
+  season: number
+  episode: number
+  episodeEnd?: number
   container: string
-  folder: string
-  positionMs: number
   durationMs: number
+  positionMs: number
   played: boolean
+  playable: 'yes' | 'no' | 'unknown'
+  reasons: string[]
+}
+export interface Show {
+  id: string
+  title: string
+  year?: number
+  episodes: number
+  watched: number
+}
+export interface Season {
+  number: number
+  title: string
+  episodes: Item[]
+}
+export interface Home {
+  continue: Item[]
+  nextUp: Item[]
+  counts: { movies: number; shows: number }
+  inspection: { available: boolean; pending: number; unreadable: number; running: boolean }
 }
 export interface Folders {
   path: string
@@ -60,11 +86,18 @@ export interface PlayInfo {
   mimeType: string
   container: string
   positionMs: number
+  plan: { direct: 'yes' | 'no' | 'unknown'; reasons: string[]; hasAudio: boolean | null }
 }
 export interface Scan {
   added: number
+  moved: number
   missing: number
   total: number
+}
+export interface Caps {
+  containers: Record<string, boolean>
+  video: Record<string, boolean>
+  audio: Record<string, boolean>
 }
 
 export const api = {
@@ -74,7 +107,12 @@ export const api = {
     call<{ scan: Scan }>('POST', '/api/setup', { name, password, folder }),
   login: (name: string, password: string) => call<{ ok: boolean }>('POST', '/api/login', { name, password }),
   logout: () => call<{ ok: boolean }>('POST', '/api/logout'),
-  items: () => call<{ items: Item[] }>('GET', '/api/items'),
+  home: () => call<Home>('GET', '/api/home'),
+  movies: () => call<{ items: Item[] }>('GET', '/api/movies'),
+  shows: () => call<{ shows: Show[] }>('GET', '/api/shows'),
+  show: (id: string) => call<{ show: Show; seasons: Season[] }>('GET', `/api/shows/${id}`),
+  search: (q: string) => call<{ items: Item[]; shows: Show[] }>('GET', '/api/search?q=' + encodeURIComponent(q)),
+  capabilities: (c: Caps) => call<{ ok: boolean }>('POST', '/api/capabilities', c),
   play: (id: string) => call<PlayInfo>('POST', `/api/items/${id}/play`),
   progress: (id: string, positionMs: number, durationMs: number) =>
     call<{ ok: boolean }>('PUT', `/api/items/${id}/progress`, { positionMs, durationMs }),

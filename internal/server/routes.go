@@ -33,7 +33,12 @@ func (s *Server) routeTable() []Route {
 		{"POST", "/api/setup", SetupLocal, s.handleSetup},
 
 		{"POST", "/api/logout", Session, s.handleLogout},
-		{"GET", "/api/items", Session, s.handleItems},
+		{"POST", "/api/capabilities", Session, s.handleCapabilities},
+		{"GET", "/api/home", Session, s.handleHome},
+		{"GET", "/api/movies", Session, s.handleMovies},
+		{"GET", "/api/shows", Session, s.handleShows},
+		{"GET", "/api/shows/{id}", Session, s.handleShow},
+		{"GET", "/api/search", Session, s.handleSearch},
 		{"POST", "/api/items/{id}/play", Session, s.handlePlay},
 		{"PUT", "/api/items/{id}/progress", Session, s.handleProgress},
 		{"GET", "/api/connect", Session, s.handleConnect},
@@ -124,6 +129,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		s.log.Printf("first scan failed: %v", err)
 	}
 	s.log.Printf("setup finished; first scan found %d video files", res.Total)
+	s.inspectSoon()
 	if err := s.startSession(w, r, userID); err != nil {
 		writeErr(w, http.StatusInternalServerError, "Account created, but sign-in failed. Please sign in.")
 		return
@@ -173,49 +179,6 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
-type itemOut struct {
-	ID         string `json:"id"`
-	Title      string `json:"title"`
-	Container  string `json:"container"`
-	Folder     string `json:"folder"`
-	PositionMs int64  `json:"positionMs"`
-	DurationMs int64  `json:"durationMs"`
-	Played     bool   `json:"played"`
-}
-
-func (s *Server) handleItems(w http.ResponseWriter, r *http.Request) {
-	u := currentUser(r)
-	rows, err := s.db.Query(`
-		SELECT i.id, i.title, f.rel_path, COALESCE(p.position_ms,0), COALESCE(p.duration_ms,0), COALESCE(p.played,0)
-		FROM items i
-		JOIN versions v ON v.item_id = i.id
-		JOIN files f ON f.version_id = v.id AND f.part_index = 0 AND f.missing = 0
-		LEFT JOIN progress p ON p.item_id = i.id AND p.user_id = ?
-		GROUP BY i.id
-		ORDER BY i.sort_title`, u.ID)
-	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not read the library.")
-		return
-	}
-	defer rows.Close()
-	out := []itemOut{}
-	for rows.Next() {
-		var it itemOut
-		var rel string
-		var played int
-		if err := rows.Scan(&it.ID, &it.Title, &rel, &it.PositionMs, &it.DurationMs, &played); err != nil {
-			continue
-		}
-		it.Played = played != 0
-		it.Container = strings.TrimPrefix(strings.ToLower(filepath.Ext(rel)), ".")
-		if dir := filepath.ToSlash(filepath.Dir(filepath.FromSlash(rel))); dir != "." {
-			it.Folder = dir
-		}
-		out = append(out, it)
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": out})
-}
-
 // handlePlay hands the player a signed link to the file. The link works
 // without the session cookie, so players that fetch media themselves
 // (AirPlay, external players) can use it, and it stops working when the
@@ -243,7 +206,14 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	exp := time.Now().Add(linkLife).Unix()
 	sig := auth.SignLink(s.linkKey, fileID, exp, u.SessionID)
 	ext := strings.ToLower(filepath.Ext(rel))
+	views, _ := s.loadItems(u, `i.id = ?`, "", itemID)
+	plan := map[string]any{"direct": "unknown", "reasons": []string{}, "hasAudio": nil}
+	if len(views) == 1 {
+		title = views[0].Display()
+		plan = map[string]any{"direct": views[0].Playable, "reasons": views[0].Reasons, "hasAudio": views[0].hasAudio}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"plan":       plan,
 		"title":      title,
 		"url":        "/stream/" + fileID + "?e=" + strconv.FormatInt(exp, 10) + "&s=" + u.SessionID + "&g=" + sig,
 		"mimeType":   mediaTypes[ext],
@@ -370,6 +340,7 @@ func (s *Server) handleAddLibrary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	res, _ := library.Scan(s.db, id)
+	s.inspectSoon()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "scan": res})
 }
 
@@ -381,6 +352,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "The scan failed.")
 		return
 	}
+	s.inspectSoon()
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "scan": res})
 }
 
@@ -404,6 +376,7 @@ func (s *Server) scanAll() (library.ScanResult, error) {
 			continue
 		}
 		total.Added += res.Added
+		total.Moved += res.Moved
 		total.Missing += res.Missing
 		total.Total += res.Total
 	}
@@ -415,8 +388,9 @@ func (s *Server) ScanAll() {
 	s.scanMu.Lock()
 	defer s.scanMu.Unlock()
 	if res, err := s.scanAll(); err == nil {
-		s.log.Printf("scan: %d video files, %d new, %d missing", res.Total, res.Added, res.Missing)
+		s.log.Printf("scan: %d video files, %d new, %d moved, %d missing", res.Total, res.Added, res.Moved, res.Missing)
 	}
+	s.inspectSoon()
 }
 
 // handleStream serves the original file with range requests. Its policy is

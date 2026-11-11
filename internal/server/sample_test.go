@@ -1,9 +1,12 @@
 package server
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Matiaspnyhus/Local-media-project/internal/db"
 )
 
 // TestWriteSampleDatabase saves a small database, as this version writes it,
@@ -28,7 +31,7 @@ func TestWriteSampleDatabase(t *testing.T) {
 	e.s.db.Exec(`DELETE FROM sessions`)
 	e.s.db.Exec(`UPDATE users SET password_hash='sample'`)
 	e.s.db.Exec(`DELETE FROM settings`)
-	out, _ := filepath.Abs(filepath.Join("..", "db", "testdata", "schema-001.db"))
+	out, _ := filepath.Abs(filepath.Join("..", "db", "testdata", fmt.Sprintf("schema-%03d.db", db.SchemaVersion())))
 	os.MkdirAll(filepath.Dir(out), 0o755)
 	if _, err := os.Stat(out); err == nil {
 		t.Fatalf("%s already exists; a released sample is never rewritten. Move it aside by hand if this schema was never released.", out)
