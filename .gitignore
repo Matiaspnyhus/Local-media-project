@@ -1,0 +1,18 @@
+# built program
+/localmedia
+/localmedia.exe
+/release/
+
+# web app: dependencies and build output (the build is embedded at compile time)
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep
+e2e/node_modules/
+
+# never commit anything from a real home: data folders, bundles, logs
+*.db
+*.db-wal
+*.db-shm
+!internal/db/testdata/*.db
+localmedia-support-*.zip
+*.log

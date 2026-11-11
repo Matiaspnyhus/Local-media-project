@@ -1,0 +1,164 @@
+name: checks
+
+# Linux runs on every change. Windows and macOS run on release tags, on
+# request, when the commit message contains [all-os], and on every change
+# once the repository is public (where those machines are free).
+on:
+  push:
+    branches: [main, 'claude/**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ALL_OS: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[all-os]') || github.event.repository.visibility == 'public' }}
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      all_os: ${{ steps.v.outputs.all_os }}
+      public: ${{ steps.v.outputs.public }}
+    steps:
+      - id: v
+        run: |
+          echo "all_os=${ALL_OS}" >> "$GITHUB_OUTPUT"
+          echo "public=${{ github.event.repository.visibility == 'public' }}" >> "$GITHUB_OUTPUT"
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build the web app
+        run: cd web && npm ci --no-audit --no-fund && npm run build
+      - name: Go checks
+        run: |
+          go vet ./...
+          go test ./...
+      - name: Build every platform with cgo off
+        run: make cross VERSION=${GITHUB_REF_NAME}
+      - name: End-to-end test in Chromium (keyboard only, plain HTTP)
+        run: |
+          cp release/localmedia-linux-amd64 localmedia
+          cd e2e && npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
+          node run.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: localmedia-builds
+          path: release/
+          retention-days: 14
+
+  windows:
+    needs: [plan, linux]
+    if: needs.plan.outputs.all_os == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Go tests on Windows (database crash-safe mode, text search, file access)
+        run: go test ./...
+      - uses: actions/download-artifact@v4
+        with:
+          name: localmedia-builds
+          path: release
+      - name: The Windows program starts and answers
+        shell: pwsh
+        run: |
+          $data = Join-Path $env:RUNNER_TEMP "lm-data"
+          $p = Start-Process -FilePath "release\localmedia-windows-amd64.exe" -ArgumentList "--data", $data, "--port", "18177", "--no-browser" -PassThru
+          $ok = $false
+          foreach ($i in 1..50) {
+            try {
+              $r = Invoke-RestMethod -Uri "http://localhost:18177/health" -TimeoutSec 2
+              if ($r.status -eq "ok") { $ok = $true; break }
+            } catch { Start-Sleep -Milliseconds 200 }
+          }
+          if (-not $ok) { Stop-Process -Id $p.Id -Force; throw "the program did not answer" }
+          $page = Invoke-WebRequest -Uri "http://localhost:18177/" -UseBasicParsing
+          if ($page.Content -notmatch "Local Media") { throw "the web app is not inside the program" }
+          $state = Invoke-RestMethod -Uri "http://localhost:18177/api/state"
+          if ($state.setupDone) { throw "a fresh install claims to be set up" }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "Windows program started, served the web app and answered. Version: $($r.version)"
+
+  macos:
+    needs: [plan, linux]
+    if: needs.plan.outputs.all_os == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Go tests on macOS
+        run: go test ./...
+      - uses: actions/download-artifact@v4
+        with:
+          name: localmedia-builds
+          path: release
+      - name: End-to-end test in Safari's engine (the owner's phone is an iPhone)
+        run: |
+          cp release/localmedia-darwin-arm64 localmedia && chmod +x localmedia
+          cd e2e && npm ci --no-audit --no-fund && npx playwright install webkit
+          E2E_BROWSER=webkit node run.mjs
+
+  linux-arm:
+    needs: [plan, linux]
+    # ARM machines are only offered free to public repositories.
+    if: needs.plan.outputs.public == 'true'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Go tests on ARM Linux
+        run: go test ./...
+
+  release:
+    needs: [linux, windows, macos]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: localmedia-builds
+          path: release
+      - name: Package and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release
+          for f in localmedia-*; do
+            case "$f" in
+              *.exe) base="${f%.exe}"; mkdir -p "pkg/$base"; cp "$f" "pkg/$base/localmedia.exe" ;;
+              *)     base="$f";        mkdir -p "pkg/$base"; cp "$f" "pkg/$base/localmedia"; chmod +x "pkg/$base/localmedia" ;;
+            esac
+            cp ../LICENSE "pkg/$base/LICENSE.txt"
+            (cd pkg && zip -q -r "../$base.zip" "$base")
+          done
+          sha256sum *.zip > SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" *.zip SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --title "Local Media $GITHUB_REF_NAME" \
+            --notes-file ../docs/release-notes/"$GITHUB_REF_NAME".md --prerelease
