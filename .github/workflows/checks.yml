@@ -63,7 +63,9 @@ jobs:
           echo "$FFMPEG_WIN64_SHA256  ffmpeg-win64.zip" | sha256sum -c -
           mkdir -p package/LocalMedia
           unzip -q -j ffmpeg-win64.zip ffprobe.exe -d package/LocalMedia
-          cp release/localmedia-windows-amd64.exe package/LocalMedia/localmedia.exe
+          # The packaged program has no console window: its sign of life is
+          # the icon beside the clock.
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=${GITHUB_REF_NAME}" -o package/LocalMedia/localmedia.exe ./cmd/localmedia
           cp LICENSE package/LocalMedia/LICENSE.txt
           cp packaging/THIRD-PARTY.txt package/LocalMedia/THIRD-PARTY.txt
       - uses: actions/upload-artifact@v4
@@ -106,7 +108,7 @@ jobs:
           if ($json -notmatch '"codec_name": "ac3"') { throw "the bundled ffprobe did not read the test file" }
           $data = Join-Path $env:RUNNER_TEMP "lm-data"
           $out = Join-Path $env:RUNNER_TEMP "lm-out.txt"
-          $p = Start-Process -FilePath "$dir\localmedia.exe" -ArgumentList "--data", $data, "--port", "18177", "--no-browser" -PassThru -RedirectStandardOutput $out
+          $p = Start-Process -FilePath "$dir\localmedia.exe" -ArgumentList "--data", $data, "--port", "18177", "--no-browser", "--no-update" -PassThru -RedirectStandardOutput $out
           $ok = $false
           foreach ($i in 1..50) {
             try {
@@ -122,6 +124,66 @@ jobs:
           Stop-Process -Id $p.Id -Force
           if ((Get-Content $out -Raw) -match "ffprobe was not found") { throw "the program did not find the ffprobe beside it" }
           Write-Host "Windows program started, served the web app and answered. Version: $($r.version)"
+
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          $ver = "${{ github.ref_name }}" -replace '^v', ''
+          if ($ver -notmatch '^\d+\.\d+\.\d+$') { $ver = "0.0.0" }
+          & $iscc "/DAppVersion=$ver" "packaging\installer.iss"
+          if ($LASTEXITCODE -ne 0) { throw "the installer did not build" }
+          Get-Item installer\LocalMedia-Setup.exe | Format-List Name, Length
+      - name: Install, start, and uninstall on a real Windows machine
+        shell: pwsh
+        run: |
+          $app = Join-Path $env:LOCALAPPDATA "Programs\LocalMedia"
+          $data = Join-Path $env:LOCALAPPDATA "localmedia"
+          $run = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+          function Rule { (netsh advfirewall firewall show rule name="Local Media" | Out-String) -match "Local Media" }
+
+          # What an owner who used the loose program has: a data folder.
+          New-Item -ItemType Directory -Force $data | Out-Null
+          Set-Content (Join-Path $data "kept-from-before.txt") "watch history stands in here"
+
+          $i = Start-Process installer\LocalMedia-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/TASKS=autostart,firewall" -Wait -PassThru
+          if ($i.ExitCode -ne 0) { throw "the installer failed with $($i.ExitCode)" }
+          foreach ($f in "localmedia.exe", "ffprobe.exe", "LICENSE.txt", "THIRD-PARTY.txt", "unins000.exe") {
+            if (-not (Test-Path (Join-Path $app $f))) { throw "after installing, $f is missing" }
+          }
+          if (-not (Rule)) { throw "the firewall rule was not added" }
+          $auto = (Get-ItemProperty $run).LocalMedia
+          if ($auto -notmatch "localmedia.exe") { throw "start with Windows was not set: $auto" }
+          if (-not (Test-Path (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Local Media.lnk"))) { throw "no Start menu entry" }
+
+          # Start it the way Windows would at sign-in: with the icon beside the clock.
+          $p = Start-Process (Join-Path $app "localmedia.exe") -ArgumentList "--no-browser", "--no-update", "--port", "18178" -PassThru
+          $ok = $false
+          foreach ($n in 1..50) {
+            try { if ((Invoke-RestMethod "http://localhost:18178/health" -TimeoutSec 2).status -eq "ok") { $ok = $true; break } } catch { Start-Sleep -Milliseconds 200 }
+          }
+          if (-not $ok) { throw "the installed program did not answer" }
+          if ($p.HasExited) { throw "the installed program stopped by itself" }
+          if (-not (Test-Path (Join-Path $data "localmedia.db"))) { throw "the installed program did not use the existing data folder" }
+
+          # Installing again over a running copy (what a manual update is).
+          $i = Start-Process installer\LocalMedia-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/TASKS=autostart,firewall" -Wait -PassThru
+          if ($i.ExitCode -ne 0) { throw "installing over a running copy failed with $($i.ExitCode)" }
+          if (-not (Test-Path (Join-Path $data "kept-from-before.txt"))) { throw "installing again touched the data folder" }
+
+          $u = Start-Process (Join-Path $app "unins000.exe") -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+          Start-Sleep -Seconds 2
+          if (Test-Path (Join-Path $app "localmedia.exe")) { throw "uninstalling left the program behind" }
+          if (Rule) { throw "uninstalling left the firewall rule behind" }
+          if ((Get-ItemProperty $run -ErrorAction SilentlyContinue).LocalMedia) { throw "uninstalling left start-with-Windows behind" }
+          if (-not (Test-Path (Join-Path $data "kept-from-before.txt")) -or -not (Test-Path (Join-Path $data "localmedia.db"))) { throw "uninstalling removed the owner's data" }
+          Write-Host "Installed, started, installed again over a running copy, and uninstalled. The data folder was never touched."
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LocalMedia-Setup
+          path: installer/LocalMedia-Setup.exe
+          retention-days: 30
 
   macos:
     needs: [plan, linux]
@@ -176,6 +238,10 @@ jobs:
         with:
           name: LocalMedia-Windows
           path: package
+      - uses: actions/download-artifact@v4
+        with:
+          name: LocalMedia-Setup
+          path: release
       - name: Package and publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -191,7 +257,7 @@ jobs:
           done
           rm -f localmedia-windows-amd64.zip
           (cd ../package && zip -q -r ../release/LocalMedia-Windows.zip LocalMedia)
-          sha256sum *.zip > SHA256SUMS.txt
-          gh release create "$GITHUB_REF_NAME" *.zip SHA256SUMS.txt \
+          sha256sum *.zip LocalMedia-Setup.exe > SHA256SUMS.txt
+          gh release create "$GITHUB_REF_NAME" *.zip LocalMedia-Setup.exe SHA256SUMS.txt \
             --repo "$GITHUB_REPOSITORY" --title "Local Media $GITHUB_REF_NAME" \
-            --notes-file ../docs/release-notes/"$GITHUB_REF_NAME".md --prerelease
+            --notes-file ../docs/release-notes/"$GITHUB_REF_NAME".md

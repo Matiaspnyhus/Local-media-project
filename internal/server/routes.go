@@ -52,6 +52,11 @@ func (s *Server) routeTable() []Route {
 		{"POST", "/api/libraries/scan", Owner, s.handleScan},
 		{"GET", "/api/support-bundle", Owner, s.handleSupportBundle},
 		{"GET", "/api/settings", Owner, s.handleSettings},
+		{"GET", "/api/update", Owner, s.handleUpdateStatus},
+		{"POST", "/api/update/check", Owner, s.handleUpdateCheck},
+		{"POST", "/api/update/install", Owner, s.handleUpdateInstall},
+		{"POST", "/api/update/undo", Owner, s.handleUpdateUndo},
+		{"PUT", "/api/settings/auto-update", Owner, s.handleSetAutoUpdate},
 		{"PUT", "/api/settings/tmdb", Owner, s.handleSetTMDB},
 		{"PUT", "/api/settings/online", Owner, s.handleSetOnline},
 
@@ -431,6 +436,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
+	s.lastStream.Store(time.Now().Unix())
 	if ct := mediaTypes[strings.ToLower(filepath.Ext(rel))]; ct != "" {
 		w.Header().Set("Content-Type", ct)
 	} else {

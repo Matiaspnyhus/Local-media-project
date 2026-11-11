@@ -115,3 +115,36 @@ Getting there needed three things: each episode now stores its show directly (sc
 **Not done, and why.**
 - *The check in the oldest supported browser engine (Chromium 87).* The web app is built for that target, so its syntax is down-levelled, but loading it in a real Chromium 87 was blocked: downloading and running that old browser build was refused by a safety check in the build environment. It needs the owner's decision (allow it here, or run it at GitHub).
 - *Generated API description and generated database code (Huma, sqlc).* The plan listed these so that the web app cannot drift from the server and SQL is checked before it runs. Today that risk is covered differently: every query and every call the web app makes is exercised by tests against a real database and by the end-to-end browser test. Adopting the two tools now would mean rewriting working, tested code for no change the owner can see. They are deferred until the API has outside consumers to keep in step with, which is M5.
+
+## 2026-11-11/12: M2 — install and safe updates (built while the owner was away)
+
+**What exists now.** A Windows installer, an icon beside the clock, start with Windows, and updates that install themselves, back up first, and undo themselves if the new version does not start. The owner can also go back to the earlier version with one button.
+
+**The order of an update is fixed** (`internal/update`, orchestrated in `cmd/localmedia/updater.go`):
+
+1. Find a newer release; download its package.
+2. Check the package against the release's own SHA-256 list. A package that does not match is deleted.
+3. Unpack it beside the installed files without touching them. Anything but plain files in one folder is refused.
+4. Back up the database.
+5. Stop the server, then swap the files. Every replaced file is kept as `name.previous`. A running program can be renamed on Windows, which is what makes this work without a helper program.
+6. Start the new version and watch for it to answer with the new version number.
+7. If it stops straight away or does not answer within a minute: put the files back, restore the database backup, start the earlier version again, and record why in plain words.
+
+**Proved by a test that updates the real program** (`cmd/localmedia/update_e2e_test.go`): it builds three versions, serves them from a stand-in release page, and goes v1.0.0 → v1.1.0 (good) → back to v1.0.0 → v1.1.0 → v1.2.0 (a build that cannot start, undone by itself). After every step the same sign-in still works and the watch progress is still there. It runs on Linux, Windows and macOS.
+
+**Choices.**
+- *Only plain releases update.* A version that is not of the form `v1.2.3` (every build from a branch) never looks for or installs updates.
+- *Automatic by default, never while someone is watching.* A check 20 seconds after start and every 12 hours. An update installs by itself only if the owner has left that on, nothing has been streamed for 15 minutes, and that exact version has not already failed once.
+- *Going back restores the database backup only if the update changed the database's layout.* Otherwise the earlier version reads the database as it is, and nothing watched since the update is lost.
+- *Downloads may only come from GitHub's hosts*, over HTTPS, and a redirect to anywhere else is refused.
+- *No signature check yet; this departs from the plan.* The plan says updates are signature-checked. Today an update is trusted because it was downloaded over HTTPS from this project's release page and matches that release's checksum list. That protects against a damaged or swapped download, but not against someone who has taken over the GitHub account. A separate signing key would close that gap; it has to be created and stored as a repository secret by the owner, because the build environment cannot create or read repository secrets. Until that exists, automatic updates rest on the GitHub account's own security.
+- *Per-user install.* The installer needs no administrator rights and puts the program in the user's own Programs folder, so updates need none either. The single exception is the firewall rule: Windows asks once, during install. If the owner says no, the install still succeeds.
+- *The data folder is never the installer's business.* It is somewhere else, the installer does not list it, and uninstalling leaves it. The loose program from M0/M1 used the same folder, so the installed program simply carries on with the same library and watch history.
+- *The packaged Windows program has no console window.* Its sign of life is the icon beside the clock, with Open, Start with Windows, Check for updates and Quit. Problems that stop it from starting are shown in a message box.
+- *Start with Windows* is one value under the signed-in user's own Run key. No service: a service cannot see mapped network drives.
+- *No tray on macOS or Linux*: the library used needs C code on macOS, which would break building every system from one machine.
+
+**Blocked on the owner.**
+- Updates download from the project's release page, which only answers without a login once the repository is public.
+- Publishing a release means pushing a version tag, which is outside the one branch the build environment may push to.
+Until both are settled the updater has nothing to fetch; the settings screen says so in plain words.

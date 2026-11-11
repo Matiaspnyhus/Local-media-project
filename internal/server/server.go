@@ -73,7 +73,8 @@ type Config struct {
 	Port    int
 	Assets  fs.FS // the built web app
 	LogOut  io.Writer
-	FFprobe string // path to ffprobe; "" means files are not inspected
+	FFprobe string  // path to ffprobe; "" means files are not inspected
+	Update  Updater // nil when this copy cannot update itself
 }
 
 // Server holds the state behind the routes.
@@ -93,6 +94,8 @@ type Server struct {
 	inspectMu  sync.Mutex
 	inspecting atomic.Bool
 	background sync.WaitGroup
+	update     Updater
+	lastStream atomic.Int64
 	enriching  atomic.Bool
 	lookupErr  atomic.Value // string: why the last round of lookups stopped
 	// newTMDB builds the lookup client; tests replace it.
@@ -127,7 +130,7 @@ const (
 func New(cfg Config) (*Server, error) {
 	s := &Server{
 		db: cfg.DB, dataDir: cfg.DataDir, version: cfg.Version, port: cfg.Port, assets: cfg.Assets,
-		limiter: newLoginLimiter(), events: &eventLog{}, ffprobe: cfg.FFprobe, caps: map[string]*playback.Caps{},
+		limiter: newLoginLimiter(), events: &eventLog{}, update: cfg.Update, ffprobe: cfg.FFprobe, caps: map[string]*playback.Caps{},
 	}
 	s.ctx, s.stop = context.WithCancel(context.Background())
 	s.newTMDB = metadata.New

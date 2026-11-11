@@ -85,6 +85,21 @@ export interface Settings {
   online: boolean
   lookups: { pending: number; found: number; notFound: number; running: boolean; problem: string }
 }
+export interface UpdateStatus {
+  supported: boolean
+  whyNot?: string
+  current: string
+  available?: string
+  checking: boolean
+  installing: boolean
+  problem?: string
+  auto: boolean
+  canUndo: boolean
+  lastFrom?: string
+  lastTo?: string
+  lastResult?: string
+  lastProblem?: string
+}
 export interface Folders {
   path: string
   parent: string
@@ -125,6 +140,12 @@ export const api = {
   settings: () => call<Settings>('GET', '/api/settings'),
   setTmdbKey: (key: string) => call<{ ok: boolean }>('PUT', '/api/settings/tmdb', { key }),
   setOnline: (on: boolean) => call<{ ok: boolean }>('PUT', '/api/settings/online', { on }),
+  update: () => call<UpdateStatus>('GET', '/api/update'),
+  updateCheck: () => call<UpdateStatus>('POST', '/api/update/check'),
+  updateInstall: () => call<{ ok: boolean }>('POST', '/api/update/install'),
+  updateUndo: () => call<{ ok: boolean }>('POST', '/api/update/undo'),
+  setAutoUpdate: (on: boolean) => call<{ ok: boolean }>('PUT', '/api/settings/auto-update', { on }),
+  health: () => call<{ status: string; version: string }>('GET', '/health'),
   capabilities: (c: Caps) => call<{ ok: boolean }>('POST', '/api/capabilities', c),
   play: (id: string) => call<PlayInfo>('POST', `/api/items/${id}/play`),
   progress: (id: string, positionMs: number, durationMs: number) =>

@@ -16,3 +16,5 @@ e2e/node_modules/
 !internal/db/testdata/*.db
 localmedia-support-*.zip
 *.log
+/installer/
+/package/

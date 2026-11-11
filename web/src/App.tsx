@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
-import { api, ApiError, type Folders, type Home, type Item, type PlayInfo, type Season, type Settings, type Show, type State } from './api'
+import { api, ApiError, type Folders, type Home, type Item, type PlayInfo, type Season, type Settings, type Show, type State, type UpdateStatus } from './api'
 import { measureCaps } from './caps'
 
 type Screen = { name: 'library' } | { name: 'watch'; id: string } | { name: 'show'; id: string }
@@ -317,6 +317,7 @@ function Library({
       </div>
 
       {showSettings && isOwner && <SettingsCard onChanged={load} />}
+      {showSettings && isOwner && <UpdateCard />}
       {showConnect && (
         <div className="card" data-testid="connect">
           <h2 style={{ marginTop: 0 }}>Open on a phone, tablet or another PC</h2>
@@ -539,6 +540,113 @@ function SettingsCard({ onChanged }: { onChanged: () => void }) {
             </button>
           </p>
         </form>
+      )}
+      {msg && <p className="note" role="status">{msg}</p>}
+    </div>
+  )
+}
+
+function UpdateCard() {
+  const [st, setSt] = useState<UpdateStatus | null>(null)
+  const [msg, setMsg] = useState('')
+  const [waiting, setWaiting] = useState('') // the version we were on when a restart began
+  const load = useCallback(() => {
+    api.update().then(setSt).catch(() => undefined)
+  }, [])
+  useEffect(load, [load])
+  // While the program restarts into another version, ask now and then
+  // whether it is back, and reload the page when it is.
+  useEffect(() => {
+    if (!waiting) return
+    const t = window.setInterval(() => {
+      api
+        .update()
+        .then((now) => {
+          if (now.current !== waiting || now.lastResult === 'failed') {
+            if (now.current !== waiting) window.location.reload()
+            else {
+              setWaiting('')
+              setSt(now)
+              setMsg('')
+            }
+          }
+        })
+        .catch(() => undefined)
+    }, 1500)
+    return () => window.clearInterval(t)
+  }, [waiting])
+
+  if (!st) return null
+  const check = () => {
+    setMsg('Looking for a newer version…')
+    api
+      .updateCheck()
+      .then((now) => {
+        setSt(now)
+        setMsg(now.available ? '' : now.problem ? '' : 'You have the newest version.')
+      })
+      .catch((e: ApiError) => setMsg(e.message))
+  }
+  const install = () => {
+    setMsg('Installing. Local Media restarts by itself; this takes about a minute.')
+    setWaiting(st.current)
+    api.updateInstall().catch((e: ApiError) => {
+      setMsg(e.message)
+      setWaiting('')
+    })
+  }
+  const undo = () => {
+    setMsg('Going back. Local Media restarts by itself.')
+    setWaiting(st.current)
+    api.updateUndo().catch((e: ApiError) => {
+      setMsg(e.message)
+      setWaiting('')
+    })
+  }
+  return (
+    <div className="card" data-testid="updates">
+      <h2 style={{ marginTop: 0 }}>Updates</h2>
+      <p>You have version {st.current}.</p>
+      {!st.supported ? (
+        <p className="dim">{st.whyNot}</p>
+      ) : (
+        <>
+          {st.available && (
+            <p>
+              Version {st.available} is available.{' '}
+              <button className="primary" onClick={install} disabled={!!waiting}>
+                Install it now
+              </button>
+            </p>
+          )}
+          {st.problem && <p className="note">{st.problem}</p>}
+          {st.lastResult === 'failed' && <p className="error">{st.lastProblem} Nothing was lost.</p>}
+          {st.lastResult === 'ok' && st.lastTo === st.current && (
+            <p className="dim">
+              Updated from {st.lastFrom}. Your library and what you have watched were backed up first.
+            </p>
+          )}
+          <p>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={st.auto}
+                onChange={(e) => api.setAutoUpdate(e.target.checked).then(load, () => undefined)}
+              />{' '}
+              Install new versions by themselves, when nobody is watching
+            </label>
+          </p>
+          <div className="bar">
+            <button onClick={check} disabled={!!waiting || st.checking}>
+              Look for a newer version
+            </button>
+            {st.canUndo && (
+              <button onClick={undo} disabled={!!waiting}>
+                Go back to version {st.lastFrom}
+              </button>
+            )}
+          </div>
+        </>
       )}
       {msg && <p className="note" role="status">{msg}</p>}
     </div>
