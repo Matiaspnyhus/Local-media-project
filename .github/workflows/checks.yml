@@ -99,8 +99,9 @@ jobs:
           foreach ($f in "localmedia.exe", "ffprobe.exe", "LICENSE.txt", "THIRD-PARTY.txt") {
             if (-not (Test-Path (Join-Path $dir $f))) { throw "the package lacks $f" }
           }
-          & "$dir\ffprobe.exe" -version | Select-Object -First 1
-          if ($LASTEXITCODE -ne 0) { throw "the bundled ffprobe does not run" }
+          $ver = & "$dir\ffprobe.exe" -version | Out-String
+          if ($LASTEXITCODE -ne 0 -or $ver -notmatch "ffprobe version") { throw "the bundled ffprobe does not run" }
+          Write-Host ($ver -split "`n")[0]
           $json = & "$dir\ffprobe.exe" -v error -print_format json -show_streams "e2e\fixtures\Dolby.Sound.Test.mkv" | Out-String
           if ($json -notmatch '"codec_name": "ac3"') { throw "the bundled ffprobe did not read the test file" }
           $data = Join-Path $env:RUNNER_TEMP "lm-data"
