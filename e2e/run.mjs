@@ -210,6 +210,25 @@ try {
     assert.doesNotMatch(foot, /plays only files your browser can play by itself/)
   })
 
+  await step('the page tells the PC whether this device plays 10-bit H.264, and HEVC in which labelling', async () => {
+    const r = await page.evaluate(async () => {
+      const can = (...types) => types.some((t) => document.createElement('video').canPlayType(t) !== '')
+      return {
+        told: (await (await fetch('/api/diagnostics')).json()).device.video,
+        h264in10bit: can('video/mp4; codecs="avc1.6E0033"'),
+        hevc: can('video/mp4; codecs="hvc1.1.6.L120.90"', 'video/mp4; codecs="hev1.1.6.L120.90"'),
+        hev1: can('video/mp4; codecs="hev1.1.6.L120.90"', 'video/mp4; codecs="hev1.2.4.L120.90"'),
+      }
+    })
+    console.log(`      (told the PC: ${Object.keys(r.told).filter((k) => r.told[k]).join(', ')})`)
+    // The PC looks these up by name when it decides how to play a file. A
+    // name the page never sends counts as "cannot play".
+    assert.equal(r.told['h264-10'], r.h264in10bit, '10-bit H.264: what the page told the PC against what the browser says')
+    assert.equal(r.told['hevc-hev1'], r.hev1, 'HEVC labelled hev1: what the page told the PC against what the browser says')
+    assert.equal(r.told.hevc, r.hevc, 'HEVC is still reported when either labelling plays')
+    if (browserName === 'chromium') assert.equal(r.told['h264-10'], true, 'Chromium plays 10-bit H.264, and must not be told it cannot')
+  })
+
   await step('play a file, keyboard only', async () => {
     await focusByText(page, 'Test Clip')
     await page.keyboard.press('Enter')

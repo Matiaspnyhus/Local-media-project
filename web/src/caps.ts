@@ -17,8 +17,18 @@ export function measureCaps(): Caps {
     },
     video: {
       h264: can('video/mp4; codecs="avc1.640028"'),
+      // H.264 with 10-bit colour is asked about separately: a browser that
+      // plays ordinary H.264 may or may not play it (Chrome does).
+      'h264-10': can('video/mp4; codecs="avc1.6E0033"'),
+      // HEVC is labelled in a file in one of two ways, "hvc1" or "hev1".
+      // "hevc" and "hevc10" (10-bit colour) say the browser plays HEVC in
+      // at least one of them. "hevc-hev1" says it plays the hev1 labelling
+      // as it is, which Apple devices, insisting on hvc1, may not. With
+      // that known, the PC can repackage such a file for them, which
+      // relabels it.
       hevc: can('video/mp4; codecs="hvc1.1.6.L120.90"', 'video/mp4; codecs="hev1.1.6.L120.90"'),
       hevc10: can('video/mp4; codecs="hvc1.2.4.L120.90"', 'video/mp4; codecs="hev1.2.4.L120.90"'),
+      'hevc-hev1': can('video/mp4; codecs="hev1.1.6.L120.90"', 'video/mp4; codecs="hev1.2.4.L120.90"'),
       av1: can('video/mp4; codecs="av01.0.08M.08"'),
       vp9: can('video/webm; codecs="vp9"', 'video/mp4; codecs="vp09.00.40.08"'),
       vp8: can('video/webm; codecs="vp8"'),
