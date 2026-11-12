@@ -39,6 +39,8 @@ import (
 //	        (small, and two frames a second, so it is quick to make).
 //	apart:  68 seconds with key frames at the start and at 62 seconds: over
 //	        a minute apart, as in recordings of a screen where little moves.
+//	untimed: 70 seconds of H.264 in an AVI file, a form that does not say
+//	        when its frames are shown.
 //	long:   two minutes, a key frame every second: twenty chunks to jump
 //	        about in.
 //	hush:   60 seconds of picture whose sound stops after 50.
@@ -77,6 +79,8 @@ func source(t *testing.T, ffmpeg, name string) string {
 	}
 	p := filepath.Join(filmDir, name+".mkv")
 	switch name {
+	case "untimed":
+		p = filepath.Join(filmDir, name+".avi")
 	case "recording", "capture":
 		p = filepath.Join(filmDir, name+".ts")
 	case "sparse", "trimmed", "wide", "open-mp4", "uneven-mp4":
@@ -132,6 +136,9 @@ func source(t *testing.T, ffmpeg, name string) string {
 		recipes = [][]string{{"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12:duration=68", "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=68",
 			"-c:v", "libx264", "-preset", "ultrafast", "-g", "9999", "-sc_threshold", "0", "-force_key_frames", "62",
 			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "64k", p}}
+	case "untimed":
+		recipes = [][]string{{"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12:duration=70", "-f", "lavfi", "-i", "sine=frequency=440:duration=70",
+			"-c:v", "libx264", "-preset", "ultrafast", "-g", "24", "-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "64k", p}}
 	case "sparse":
 		recipes = [][]string{append(picture("60"),
 			"-c:v", "libx264", "-preset", "ultrafast", "-g", "288", "-keyint_min", "288", "-sc_threshold", "0",
@@ -491,12 +498,24 @@ func TestCutsAreFoundInATVRecording(t *testing.T) {
 // chunks. That must be said, and not answered with a list of one chunk as
 // long as the film, which no player could ever be given in time.
 func TestAFilmThatCannotBeCutIsNotGivenAListAsIfItCould(t *testing.T) {
-	if (Grid{EndMs: 270000, Cuts: []int64{0}}).Valid() || (Grid{EndMs: 600000, Cuts: []int64{0, 6000, 250000, 500000}}).Valid() ||
-		(Grid{StartMs: 5000, EndMs: 1205000, Cuts: []int64{5000}}).Valid() {
+	if (Grid{EndMs: 270000, Cuts: []int64{0}, From: "read"}).Valid() || (Grid{EndMs: 600000, Cuts: []int64{0, 6000, 250000, 500000}, From: "read"}).Valid() ||
+		(Grid{StartMs: 5000, EndMs: 1205000, Cuts: []int64{5000}, From: "read"}).Valid() {
 		t.Error("a grid with a chunk of over four minutes was accepted")
 	}
-	if !(Grid{EndMs: 240000, Cuts: []int64{0}}).Valid() || !(Grid{EndMs: 600000, Cuts: []int64{0, 240000, 480000}}).Valid() {
-		t.Error("a grid with chunks of four minutes was refused")
+	if !(Grid{EndMs: 240000, Cuts: []int64{0}, From: "read"}).Valid() || !(Grid{EndMs: 600000, Cuts: []int64{0, 240000, 480000}, From: "read"}).Valid() {
+		t.Error("a grid with chunks of four minutes, found by reading the film through, was refused")
+	}
+	// A chunk of over a minute is believed only of a film that was read
+	// through. In a list found any other way it means that key frames were
+	// missed, as they were for whole kinds of file by an earlier version,
+	// whose lists may still be in storage.
+	for _, from := range []string{"", "probe", "index", "uniform"} {
+		if (Grid{EndMs: 90000, Cuts: []int64{0}, From: from}).Valid() || (Grid{EndMs: 200000, Cuts: []int64{0, 6000, 70000, 140000}, From: from}).Valid() {
+			t.Errorf("a grid with a chunk of over a minute, found by %q, was accepted", from)
+		}
+		if !(Grid{EndMs: 60000, Cuts: []int64{0}, From: from}).Valid() || !(Grid{EndMs: 200000, Cuts: []int64{0, 60000, 120000, 180000}, From: from}).Valid() {
+			t.Errorf("a grid with chunks of a minute, found by %q, was refused", from)
+		}
 	}
 	// What a film keeps from before its start is never more than a minute.
 	if kept := (Grid{EndMs: 40000, Cuts: []int64{0}, LeadMs: 60000}); !kept.Valid() {
@@ -528,13 +547,24 @@ func TestAFilmThatCannotBeCutIsNotGivenAListAsIfItCould(t *testing.T) {
 	// A list like that kept from an earlier version is not played from
 	// either: the film is cut evenly instead, on the same clock.
 	m := manager(t, ffmpeg)
-	token := m.Open(Spec{Path: src, Grid: Grid{StartMs: 36000000, EndMs: 36270000, Cuts: []int64{36000000}, From: "probe", LeadMs: 3000}, VideoCodec: "h264", AudioTrack: -1})
+	token := m.Open(Spec{Path: src, Grid: Grid{StartMs: 36000000, EndMs: 36090000, Cuts: []int64{36000000}, From: "probe", LeadMs: 3000}, VideoCodec: "h264", AudioTrack: -1})
 	list, _ := m.Playlist(token)
 	m.mu.Lock()
 	used := m.sessions[token].spec.Grid
 	m.mu.Unlock()
-	if strings.Count(string(list), "#EXTINF") != 45 || used.StartMs != 36000000 || used.LeadMs != 3000 || !used.Valid() {
-		t.Errorf("a one-chunk list for four and a half minutes was used as it came: %+v\n%s", used, list)
+	if strings.Count(string(list), "#EXTINF") != 15 || used.StartMs != 36000000 || used.LeadMs != 3000 || !used.Valid() {
+		t.Errorf("a one-chunk list for 90 seconds was used as it came: %+v\n%s", used, list)
+	}
+	// Some files do not say when their frames are shown (H.264 in AVI), and
+	// ffprobe then cannot say when any key frame is. Reading such a film
+	// through and finding "no key frames" is a search that failed, not a
+	// film with a single chunk.
+	g, err = FindCuts(context.Background(), ffprobe, source(t, ffmpeg, "untimed"), 70000)
+	switch {
+	case err == nil && len(g.Cuts) > 1:
+		t.Logf("this ffprobe can say when the frames of H.264 in AVI are shown: %d chunks by %q", len(g.Cuts), g.From)
+	case err == nil || !g.Valid() || g.From != "uniform" || len(g.Cuts) != 12:
+		t.Errorf("a film whose key frames ffprobe cannot place: %v %+v", err, g)
 	}
 }
 
@@ -547,8 +577,8 @@ func TestAFilmThatCannotBeCutIsNotGivenAListAsIfItCould(t *testing.T) {
 // list would promise chunks that ffmpeg never makes: it can only begin a
 // chunk at a key frame.
 func TestAFilmWithKeyFramesOverAMinuteApartIsCutAtThem(t *testing.T) {
-	if !(Grid{EndMs: 200000, Cuts: []int64{0, 6000, 70000, 140000}}).Valid() {
-		t.Error("a grid with chunks of 70 seconds was refused")
+	if !(Grid{EndMs: 200000, Cuts: []int64{0, 6000, 70000, 140000}, From: "read"}).Valid() {
+		t.Error("a grid with chunks of 70 seconds, found by reading the film through, was refused")
 	}
 	ffmpeg, ffprobe := tools(t)
 	src := source(t, ffmpeg, "apart")

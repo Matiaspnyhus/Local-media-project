@@ -49,12 +49,13 @@ type Grid struct {
 // the piece that follows it; it is there for a player that asks again.
 const maxChunkMs = 4 * 60 * 1000
 
-// doubtMs is how long a chunk in a list found by jumping may be before the
-// list is doubted. Nearly every film has a key frame every few seconds, so
-// a chunk of over a minute usually means that key frames were not found.
-// But not always: where little moves (a recording of a screen, of slides)
-// they can truly be that far apart. So such a list is neither used as it is
-// nor thrown away: the film is read through, which settles it. See FindCuts.
+// doubtMs is how long a chunk may be before the list it is in is doubted.
+// Nearly every film has a key frame every few seconds, so a chunk of over a
+// minute usually means that key frames were not found. But not always:
+// where little moves (a recording of a screen, of slides) they can truly be
+// that far apart. So a chunk that long is believed only in a list made by
+// reading the film through, which looks at every frame. Found any other
+// way, the list is not used; FindCuts then reads the film through.
 const doubtMs = 60 * 1000
 
 // maxLeadMs is the most a film may keep from before its start (see
@@ -79,7 +80,8 @@ func uniform(startMs, durationMs int64) Grid {
 
 // Valid reports whether a grid, read back from storage or just worked out,
 // can be used: its cuts are in order and inside the film, and no chunk is
-// longer than a chunk can be.
+// longer than a chunk can be, or longer than is believed of a list found
+// the way this one was (see doubtMs).
 func (g Grid) Valid() bool {
 	if len(g.Cuts) == 0 || g.Cuts[0] != g.StartMs || g.EndMs <= g.StartMs || g.LeadMs < 0 || g.LeadMs > maxLeadMs {
 		return false
@@ -89,7 +91,10 @@ func (g Grid) Valid() bool {
 			return false
 		}
 	}
-	return g.longest() <= maxChunkMs
+	if g.From == "read" {
+		return g.longest() <= maxChunkMs
+	}
+	return g.longest() <= doubtMs
 }
 
 // longest is the length of the longest chunk, in milliseconds.
@@ -216,11 +221,11 @@ func FindCuts(ctx context.Context, ffprobe, path string, durationMs int64) (Grid
 		// Skip repeats (two places that share a key frame) and cuts that would
 		// make a chunk too short to be worth a request.
 		g.addCuts(keys, 2000)
-		// Good enough if no chunk is long enough to be doubted, and if
-		// either every jump landed on a key frame (then the long stretches
-		// there are have no key frame in them) or there are no long
-		// stretches.
-		if g.Valid() && g.longest() <= doubtMs && (missed == 0 || denseEnough(g.Cuts, g.StartMs, g.EndMs)) {
+		// Good enough if no chunk is long enough to be doubted (Valid sees
+		// to that), and if either every jump landed on a key frame (then
+		// the long stretches there are have no key frame in them) or there
+		// are no long stretches.
+		if g.Valid() && (missed == 0 || denseEnough(g.Cuts, g.StartMs, g.EndMs)) {
 			return g, nil
 		}
 		// Otherwise jumps in this file do not land on key frames, or its
@@ -230,6 +235,12 @@ func FindCuts(ctx context.Context, ffprobe, path string, durationMs int64) (Grid
 	keys, _, err := keyFrames(ctx, ffprobe, path, "")
 	if err != nil {
 		return even(), fmt.Errorf("ffprobe could not read the film through for its key frames: %w", err)
+	}
+	if len(keys) == 0 {
+		// Every film begins with a key frame. Not one means that ffprobe
+		// could not tell when this film's frames are shown (H.264 in an AVI
+		// file is like that), not that the film is one long chunk.
+		return even(), errors.New("ffprobe read the film through and could not say when any key frame is shown")
 	}
 	g = Grid{StartMs: start, EndMs: start + durationMs, Cuts: []int64{start}, From: "read", LeadMs: lead}
 	g.addCuts(keys, SegmentSeconds*1000)

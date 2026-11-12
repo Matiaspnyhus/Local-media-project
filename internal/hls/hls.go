@@ -227,8 +227,9 @@ func (m *Manager) end(token string, s *session) {
 // the only way to reach the session's chunks.
 func (m *Manager) Open(spec Spec) string {
 	if !spec.Grid.Valid() {
-		// Nothing to cut by, or cuts so far apart that a chunk could never
-		// be made in time: cut evenly instead, on the same clock.
+		// Nothing to cut by, or cuts so far apart that the list is not to be
+		// believed or a chunk could never be made in time (see Grid.Valid):
+		// cut evenly instead, on the same clock.
 		lead := spec.Grid.LeadMs
 		spec.Grid = uniform(spec.Grid.StartMs, spec.Grid.EndMs-spec.Grid.StartMs)
 		if lead > 0 && lead <= maxLeadMs {
