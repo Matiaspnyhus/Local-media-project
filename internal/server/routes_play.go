@@ -49,10 +49,12 @@ type subtitleView struct {
 
 // fileTracks is everything a file offers a viewer.
 type fileTracks struct {
-	media    playback.Media
-	subs     []playback.Subtitle // text subtitles, inside the file and beside it
-	subKeys  []string            // "e2": the third subtitle track inside; "x...": a file beside it (see sidecarKey)
-	pictures int                 // picture subtitles, which cannot be shown yet
+	media playback.Media
+	// subs are the text subtitles, inside the file and beside it. Each has
+	// a Key: "e2" is the third subtitle track inside the file, "x..." a
+	// file beside it (see sidecarKey).
+	subs     []playback.Subtitle
+	pictures int // picture subtitles, which cannot be shown yet
 }
 
 func (s *Server) loadTracks(fileID string, probed bool, container string) (fileTracks, error) {
@@ -79,8 +81,8 @@ func (s *Server) loadTracks(fileID string, probed bool, container string) (fileT
 			ft.media.Audio = append(ft.media.Audio, t)
 		case "subtitle":
 			if textSubtitles[t.Codec] {
-				ft.subs = append(ft.subs, playback.Subtitle{Language: t.Language, Forced: t.Forced, HearingImpaired: t.HearingImpaired, Default: t.Default, Title: t.Title})
-				ft.subKeys = append(ft.subKeys, "e"+strconv.Itoa(nSub))
+				ft.subs = append(ft.subs, playback.Subtitle{Key: "e" + strconv.Itoa(nSub), Language: t.Language, Forced: t.Forced,
+					HearingImpaired: t.HearingImpaired, Default: t.Default, Title: t.Title})
 			} else {
 				ft.pictures++
 			}
@@ -103,8 +105,7 @@ func (s *Server) loadTracks(fileID string, probed bool, container string) (fileT
 			return ft, err
 		}
 		if textSubtitles[strings.ToLower(format)] {
-			ft.subs = append(ft.subs, playback.Subtitle{Language: lang, Forced: forced != 0})
-			ft.subKeys = append(ft.subKeys, sidecarKey(rel))
+			ft.subs = append(ft.subs, playback.Subtitle{Key: sidecarKey(rel), Language: lang, Forced: forced != 0})
 		}
 	}
 	return ft, rows.Err()
@@ -231,20 +232,35 @@ func (s *Server) scopeOf(itemID string) (string, error) {
 	return itemID, nil
 }
 
+// playedFile is the tail of the query that finds the file an item plays
+// from. Playing and remembering a pick both use it, so a pick is always
+// read against the file it was made on.
+const playedFile = ` FROM items i JOIN versions v ON v.item_id=i.id JOIN files f ON f.version_id=v.id JOIN libraries l ON l.id=f.library_id
+		WHERE i.id=? AND f.missing=0 ORDER BY f.part_index LIMIT 1`
+
 // handleChoice remembers the sound and subtitles a viewer picked, so the
-// next episode starts the same way.
+// same film, and the next episode of a show, start the same way.
+//
+// The page says which tracks were picked (audioIndex and subKey). What is
+// kept of them, their language and kind, is read from the server's own
+// record of the file. A page loaded before those two were added sends only
+// two languages and whether subtitles were on, which is kept as it comes.
 func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 	itemID := chi.URLParam(r, "id")
 	var in struct {
-		AudioLang string `json:"audioLang"`
-		SubLang   string `json:"subLang"`
-		SubsOn    bool   `json:"subsOn"`
+		AudioLang  string  `json:"audioLang"`
+		SubLang    string  `json:"subLang"`
+		SubsOn     bool    `json:"subsOn"`
+		AudioIndex *int    `json:"audioIndex"` // counted from 0, -1 for none
+		SubKey     *string `json:"subKey"`     // "" for off
 	}
 	if !readJSON(w, r, &in) {
 		return
 	}
-	in.AudioLang, in.SubLang = playback.Lang(in.AudioLang), playback.Lang(in.SubLang)
-	if !ids.Valid(itemID) || !langCode.MatchString(in.AudioLang) || !langCode.MatchString(in.SubLang) {
+	// A language is whatever the file, or a subtitle file's name, called
+	// it: usually a short code, sometimes a word ("english"). It is only
+	// ever compared, so only its length is checked.
+	if !ids.Valid(itemID) || len(in.AudioLang) > 40 || len(in.SubLang) > 40 {
 		writeErr(w, http.StatusBadRequest, "That choice could not be read.")
 		return
 	}
@@ -253,18 +269,56 @@ func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
 	}
-	on := 0
-	if in.SubsOn {
+	mem := playback.Memory{AudioLang: playback.Lang(in.AudioLang), SubLang: playback.Lang(in.SubLang), SubsOn: in.SubsOn}
+	if in.AudioIndex != nil && in.SubKey != nil {
+		var fileID, container string
+		var probed int
+		if s.db.QueryRow(`SELECT f.id, f.probed, f.container`+playedFile, itemID).Scan(&fileID, &probed, &container) == nil {
+			if ft, err := s.loadTracks(fileID, probed == 1, container); err == nil {
+				// A pick the file does not have (it changed meanwhile) is
+				// not kept as one; the languages sent with it still are.
+				if m, ok := playback.Remember(ft.media.Audio, ft.subs, *in.AudioIndex, *in.SubKey); ok {
+					mem = m
+				}
+			}
+		}
+	}
+	on, audioKind, audioIndex, subKey := 0, "", -1, ""
+	if mem.SubsOn {
 		on = 1
 	}
-	_, err = s.db.Exec(`INSERT INTO track_memory(user_id,scope_id,audio_lang,sub_lang,subs_on,updated_at) VALUES(?,?,?,?,?,?)
-		ON CONFLICT(user_id,scope_id) DO UPDATE SET audio_lang=excluded.audio_lang, sub_lang=excluded.sub_lang,
-		subs_on=excluded.subs_on, updated_at=excluded.updated_at`, currentUser(r).ID, scope, in.AudioLang, in.SubLang, on, time.Now().Unix())
+	if mem.Commentary {
+		audioKind = "commentary"
+	}
+	if mem.Pick != nil {
+		audioIndex, subKey = mem.Pick.Audio, mem.Pick.Subtitle
+	}
+	_, err = s.db.Exec(`INSERT INTO track_memory(user_id,scope_id,audio_lang,sub_lang,subs_on,audio_index,audio_kind,sub_key,sub_kind,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(user_id,scope_id) DO UPDATE SET audio_lang=excluded.audio_lang, sub_lang=excluded.sub_lang, subs_on=excluded.subs_on,
+		audio_index=excluded.audio_index, audio_kind=excluded.audio_kind, sub_key=excluded.sub_key, sub_kind=excluded.sub_kind, updated_at=excluded.updated_at`,
+		currentUser(r).ID, scope, mem.AudioLang, mem.SubLang, on, audioIndex, audioKind, subKey, mem.SubKind, time.Now().Unix())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save.")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// loadMemory reads what a viewer last picked for a show or a film, or nil
+// if nothing was.
+func (s *Server) loadMemory(userID, scope string) *playback.Memory {
+	var m playback.Memory
+	var on, audioIndex int
+	var audioKind, subKey string
+	if s.db.QueryRow(`SELECT audio_lang, sub_lang, subs_on, audio_index, audio_kind, sub_key, sub_kind FROM track_memory WHERE user_id=? AND scope_id=?`,
+		userID, scope).Scan(&m.AudioLang, &m.SubLang, &on, &audioIndex, &audioKind, &subKey, &m.SubKind) != nil {
+		return nil
+	}
+	m.SubsOn, m.Commentary = on != 0, audioKind == "commentary"
+	if m.SubKind != "" {
+		m.Pick = &playback.Pick{Audio: audioIndex, Subtitle: subKey}
+	}
+	return &m
 }
 
 // playCaps is what this device can do here and now: what it reported, less
@@ -327,9 +381,8 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	var fileID, rel, libPath, title, container string
 	var size, mtime, durationMs int64
 	var probed int
-	err := s.db.QueryRow(`SELECT f.id, f.rel_path, l.path, i.title, f.size, f.mtime, f.probed, f.container, f.duration_ms
-		FROM items i JOIN versions v ON v.item_id=i.id JOIN files f ON f.version_id=v.id JOIN libraries l ON l.id=f.library_id
-		WHERE i.id=? AND f.missing=0 ORDER BY f.part_index LIMIT 1`, itemID).Scan(&fileID, &rel, &libPath, &title, &size, &mtime, &probed, &container, &durationMs)
+	err := s.db.QueryRow(`SELECT f.id, f.rel_path, l.path, i.title, f.size, f.mtime, f.probed, f.container, f.duration_ms`+playedFile,
+		itemID).Scan(&fileID, &rel, &libPath, &title, &size, &mtime, &probed, &container, &durationMs)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "That file is not available right now.")
 		return
@@ -352,12 +405,7 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	// Which sound and subtitles to start with.
 	var mem *playback.Memory
 	if scope, err := s.scopeOf(itemID); err == nil {
-		var m playback.Memory
-		var on int
-		if s.db.QueryRow(`SELECT audio_lang, sub_lang, subs_on FROM track_memory WHERE user_id=? AND scope_id=?`, u.ID, scope).Scan(&m.AudioLang, &m.SubLang, &on) == nil {
-			m.SubsOn = on != 0
-			mem = &m
-		}
+		mem = s.loadMemory(u.ID, scope)
 	}
 	choice := playback.Choose(ft.media.Audio, ft.subs, s.loadPrefs(u.ID), mem)
 	if in.Audio != nil && *in.Audio >= 0 && *in.Audio < len(ft.media.Audio) {
@@ -416,8 +464,8 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	}
 	subs := []subtitleView{}
 	for i, t := range ft.subs {
-		subs = append(subs, subtitleView{Key: ft.subKeys[i], Label: subtitleLabel(t, strings.HasPrefix(ft.subKeys[i], "x")), Language: playback.Lang(t.Language),
-			Forced: t.Forced, Selected: i == choice.Subtitle, URL: "/api/files/" + fileID + "/subtitles/" + ft.subKeys[i]})
+		subs = append(subs, subtitleView{Key: t.Key, Label: subtitleLabel(t, strings.HasPrefix(t.Key, "x")), Language: playback.Lang(t.Language),
+			Forced: t.Forced, Selected: i == choice.Subtitle, URL: "/api/files/" + fileID + "/subtitles/" + t.Key})
 	}
 	out["audio"], out["subtitles"], out["pictureSubtitles"] = audio, subs, ft.pictures
 	writeJSON(w, http.StatusOK, out)

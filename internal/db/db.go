@@ -215,6 +215,15 @@ CREATE TABLE device_reports (
   user_agent TEXT NOT NULL DEFAULT '',  -- how the browser describes itself
   updated_at INTEGER NOT NULL
 );
+
+-- What a viewer picked is kept as the pick itself and its kind, not only
+-- as two languages: a language does not say which of two English sound
+-- tracks it was, or whether the subtitles were the full or the forced ones.
+-- Rows from before this have sub_kind '' and are read as languages only.
+ALTER TABLE track_memory ADD COLUMN audio_index INTEGER NOT NULL DEFAULT -1;  -- the sound track, counted from 0
+ALTER TABLE track_memory ADD COLUMN audio_kind TEXT NOT NULL DEFAULT '';      -- '' ordinary sound, 'commentary'
+ALTER TABLE track_memory ADD COLUMN sub_key TEXT NOT NULL DEFAULT '';         -- the subtitle as the page names it, '' for none
+ALTER TABLE track_memory ADD COLUMN sub_kind TEXT NOT NULL DEFAULT '';        -- 'full', 'described', 'forced' or 'off'
 `,
 }
 
