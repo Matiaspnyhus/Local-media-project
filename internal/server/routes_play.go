@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
@@ -700,21 +699,25 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "That subtitle file is not available.")
 			return
 		}
+		format = strings.ToLower(format)
+		if format != "srt" && format != "subrip" && format != "vtt" && format != "webvtt" {
+			// Every other format goes through ffmpeg, which reads the file
+			// itself.
+			f.Close()
+			s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(subRel)), 0, keptName(fileID, key, st.Size(), st.ModTime().Unix()))
+			return
+		}
 		raw, err := io.ReadAll(f)
 		f.Close()
 		if err != nil {
 			writeErr(w, http.StatusNotFound, "That subtitle file is not available.")
 			return
 		}
-		switch strings.ToLower(format) {
-		case "srt", "subrip":
+		if format == "srt" || format == "subrip" {
 			w.Write(srtToVTT(raw))
-			return
-		case "vtt", "webvtt":
+		} else {
 			w.Write(decodeText(raw))
-			return
 		}
-		s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(subRel)), 0, fmt.Sprintf("%s-%s-%d", fileID, key, st.ModTime().Unix()))
 		return
 	}
 	f, _, err := openMedia(libPath, rel)
@@ -729,7 +732,7 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
 	}
-	s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(rel)), n, fmt.Sprintf("%s-%s-%d-%d", fileID, key, size, mtime))
+	s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(rel)), n, keptName(fileID, key, size, mtime))
 }
 
 // handleDiagnostics says what this device reported it can play and what the

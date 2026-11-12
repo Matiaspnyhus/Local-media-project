@@ -34,7 +34,12 @@ func decodeText(raw []byte) []byte {
 	if utf8.Valid(raw) {
 		return raw
 	}
-	// Windows-1252: every byte is one character.
+	return fromWindows1252(raw)
+}
+
+// fromWindows1252 reads bytes as the old Western European encoding
+// (Windows-1252), in which every byte is one character.
+func fromWindows1252(raw []byte) []byte {
 	var b strings.Builder
 	for _, c := range raw {
 		if c >= 0x80 && c <= 0x9F {
@@ -44,6 +49,32 @@ func decodeText(raw []byte) []byte {
 		}
 	}
 	return []byte(b.String())
+}
+
+// readable returns whole lines of text as UTF-8, each line judged by
+// itself: a line that is UTF-8 already stays as it is, and any other is
+// read as the old Western European encoding. It is for text that arrives
+// piece by piece (see runSubtitleJob), where the whole cannot be judged at
+// once as decodeText does. Judging by the line also saves a subtitle in
+// which only some lines are in the old encoding.
+func readable(lines []byte) []byte {
+	if utf8.Valid(lines) {
+		return lines
+	}
+	out := make([]byte, 0, len(lines)+len(lines)/8)
+	for len(lines) > 0 {
+		line := lines
+		if i := bytes.IndexByte(lines, '\n'); i >= 0 {
+			line = lines[:i+1]
+		}
+		lines = lines[len(line):]
+		if utf8.Valid(line) {
+			out = append(out, line...)
+		} else {
+			out = append(out, fromWindows1252(line)...)
+		}
+	}
+	return out
 }
 
 var cp1252 = [32]rune{0x20AC, 0xFFFD, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0xFFFD, 0x017D, 0xFFFD,
