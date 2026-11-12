@@ -172,6 +172,45 @@ async function record(page) {
   }
 }
 
+// Whether the keyboard is on the element a selector names.
+const hasFocus = (p, selector) => p.evaluate((s) => document.activeElement === document.querySelector(s), selector)
+
+// What the PC has learned about the device a page runs on, and making it
+// forget all of it: for steps that provoke trouble, so that what one step
+// teaches the PC does not change how the next step's films are sent.
+const learned = (p) => p.evaluate(async () => (await (await fetch('/api/device')).json()).lessons)
+const forgetAll = (p) => p.evaluate(async () => {
+  for (const l of (await (await fetch('/api/device')).json()).lessons)
+    await fetch(`/api/device/lessons/${l.id}`, { method: 'DELETE', headers: { 'X-Requested-With': 'localmedia', 'Content-Type': 'application/json' }, body: '{}' })
+})
+// Puts a film back to its beginning, whatever an earlier step left it at.
+const fromTheStart = (p, title) => p.evaluate(async (t) => {
+  const it = (await (await fetch('/api/movies')).json()).items.find((x) => x.title === t)
+  await fetch(`/api/items/${it.id}/progress`, { method: 'PUT', headers: { 'X-Requested-With': 'localmedia', 'Content-Type': 'application/json' }, body: JSON.stringify({ positionMs: 0, durationMs: it.durationMs }) })
+}, title)
+// The settings open with the "Settings" button and close with it again;
+// this opens them if they are not open, with the keyboard.
+async function openSettings(p) {
+  if (await p.locator('[data-testid=learned]').count()) return
+  await focusByText(p, 'Settings')
+  await p.keyboard.press('Enter')
+  await p.waitForSelector('[data-testid=learned]')
+}
+// Waits for the film in the player to be the one sent a given way (how it
+// is sent is written on the player), nudging it to play as playsBeyond does.
+const sentAs = (p, attribute, value, why) => p.waitForFunction(([a, want]) => {
+  const v = document.querySelector('video')
+  if (!v) return false
+  if (v.paused && v.readyState >= 1) {
+    v.muted = true
+    v.play().catch(() => {})
+  }
+  return v.dataset[a] === want && !v.paused && v.readyState >= 2
+}, [attribute, value], { timeout: 40000, polling: 200 }).catch(async () => {
+  const got = await p.evaluate(() => ({ ...document.querySelector('video')?.dataset }))
+  assert.fail(`${why}: after 40 seconds the player says ${JSON.stringify(got)}, not ${attribute} ${value} and playing`)
+})
+
 assert.ok(existsSync(bin), `program not found at ${bin}; build it first`)
 const data = mkdtempSync(join(tmpdir(), 'lm-data-'))
 const media = mkdtempSync(join(tmpdir(), 'lm-media-'))
@@ -228,6 +267,7 @@ const lan = lanAddress()
 const remote = lan ? `http://${lan}:${port}` : null
 let browser
 let failed = false
+let whenFailed = () => {}
 try {
   for (let i = 0; ; i++) {
     try {
@@ -237,6 +277,15 @@ try {
     await new Promise((r) => setTimeout(r, 100))
   }
   console.log(`browser: ${browserName}; PC address ${local}; other-device address ${remote || '(none found, using localhost)'}`)
+
+  // The rules by which the page decides that a film is in trouble need no
+  // browser, and have tests of their own. They are run here so that they
+  // run wherever this test does.
+  await step('the page\'s rules for noticing a film in trouble hold (web/src/stall.test.mjs)', async () => {
+    const run = spawnSync(process.execPath, ['--test', join(here, '..', 'web', 'src', 'stall.test.mjs')], { encoding: 'utf8' })
+    assert.equal(run.status, 0, `the tests of the rules failed:\n${run.stdout}\n${run.stderr}${run.error || ''}`)
+  })
+
   browser = await playwright[browserName].launch()
 
   if (remote) {
@@ -283,6 +332,16 @@ try {
   const page = await phone.newPage()
   const consoleErrors = []
   page.on('console', (m) => m.type() === 'error' && consoleErrors.push(m.text()))
+  // Every report of trouble the page sends to the PC is noted, with the
+  // step it was sent in. Only some steps provoke one. On a machine that is
+  // too slow to play the test films a film may stall by itself, and what
+  // the PC then learns changes how later films are sent; when a step
+  // fails, this record says whether that happened.
+  const troubleReports = []
+  page.on('request', (r) => {
+    if (r.method() === 'POST' && /\/api\/hls\/[0-9a-f]+\/trouble$/.test(r.url())) troubleReports.push(`after "${steps[steps.length - 1]}": ${r.postData()}`)
+  })
+  whenFailed = () => console.error(`\n--- trouble the page reported to the PC in this run (${troubleReports.length}) ---\n${troubleReports.join('\n') || '(none)'}`)
 
   await step('another device must sign in; a wrong password is refused', async () => {
     assert.equal((await page.request.get(base + '/api/movies')).status(), 401)
@@ -482,6 +541,326 @@ try {
     }
   })
 
+  // Leaves the player with the keyboard and waits for the PC to have
+  // closed the film.
+  const leavePlayer = async () => {
+    await focusByText(page, '← Back')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('text=Continue watching')
+    for (let i = 0; (await converters()) > 0; i++) {
+      assert.ok(i < 50, 'the film is still held open for conversion 5 seconds after leaving')
+      await new Promise((r) => setTimeout(r, 100))
+    }
+  }
+  // The app's own chunk player fetches the film's parts through the page,
+  // where this test can hold them back. Safari's engine plays chunks with
+  // a player of its own, whose requests a test does not get to see.
+  const ownChunkPlayer = browserName !== 'webkit'
+  const tokenOf = (url) => (/\/hls\/([0-9a-f]+)\//.exec(url) || [])[1]
+
+  await step('a film that is slow to start: the viewer is told after three seconds and offered ways out after twelve, keyboard only', async () => {
+    await fromTheStart(page, 'Old Format Test')
+    // The film's start is held back until the test lets go. With the app's
+    // own player, the first part of the first film asked for is held: the
+    // PC has answered by then, so the page knows a lighter picture can be
+    // had. With the browser's own player, the PC's answer itself is held.
+    let release
+    const letGo = new Promise((r) => (release = r))
+    let firstFilm
+    const held = ownChunkPlayer ? /\/hls\/[0-9a-f]+\/init\.mp4$/ : /\/api\/items\/[0-9a-f]+\/play$/
+    const hold = async (route) => {
+      const film = tokenOf(route.request().url()) || 'the answer'
+      firstFilm = firstFilm || film
+      if (film === firstFilm) await letGo
+      await route.continue().catch(() => {}) // the player may have dropped the request meanwhile
+    }
+    await page.route(held, hold)
+    try {
+      const since = Date.now()
+      await focusByText(page, 'Old Format Test')
+      await page.keyboard.press('Enter')
+      await page.waitForSelector('[data-testid=wait-words] p', { timeout: 30000 }).catch(() => assert.fail('nothing was said about a film that had not started after many seconds'))
+      assert.equal(await page.textContent('[data-testid=wait-words]'), 'Still getting the film ready…')
+      assert.ok(Date.now() - since >= 2500, `the words came after ${Date.now() - since} ms: a film is given three seconds before anything is said`)
+      await page.waitForSelector('[data-testid=wait-card]', { timeout: 40000 }).catch(() => assert.fail('no ways out were offered for a film that had not started after twelve seconds and more'))
+      assert.ok(Date.now() - since >= 11500, `the ways out came after ${Date.now() - since} ms: a film is given twelve seconds first`)
+      // Every way out can be reached with the keyboard, and is in the card.
+      const inCard = () => page.evaluate(() => !!document.activeElement.closest('[data-testid=wait-card]'))
+      await focusByText(page, 'Go back')
+      assert.ok(await inCard(), '"Go back" is one of the ways out')
+      await focusByText(page, 'Open in another player')
+      assert.ok(await inCard(), '"Open in another player" is one of the ways out')
+      // Waiting for a film to start is not reported to the PC as trouble:
+      // nothing has been learned from it.
+      assert.deepEqual(await learned(page), [], 'a slow start alone teaches the PC nothing about this device')
+      const cardGone = () => page.waitForSelector('[data-testid=wait-card]', { state: 'detached', timeout: 10000 }).catch(() => assert.fail('the ways out stayed on the page after the film had started'))
+      if (!ownChunkPlayer) {
+        console.log('      (in this browser the PC\'s answer was held back, so no lighter picture was on offer yet)')
+        release()
+        await waitPlaying(page, 0.5)
+        await cardGone()
+      } else {
+        // A lighter picture is on offer, because the PC said one can be had.
+        await focusByText(page, 'Play with a lighter picture')
+        assert.ok(await inCard(), '"Play with a lighter picture" is one of the ways out')
+        await page.keyboard.press('Enter')
+        await sentAs(page, 'rung', '2', 'asked for a lighter picture')
+        await cardGone()
+        assert.equal(await page.textContent('[data-testid=wait-words]'), '', 'nothing is said about waiting once the film plays')
+        assert.match(await page.textContent('[data-testid=step-said]'), /^The film now plays with a lighter picture/)
+        // The button that was pressed is gone with the card; the keyboard's
+        // place is on what the page says happened, and Undo is the next stop.
+        assert.ok(await hasFocus(page, '[data-testid=step-notice]'), 'after the press the keyboard is on the notice about what happened')
+        await page.keyboard.press(TAB)
+        assert.ok(await hasFocus(page, '[data-testid=step-undo]'), 'the keyboard goes on from the notice to Undo')
+        await page.keyboard.press('Enter')
+        await sentAs(page, 'rung', '1', 'after Undo')
+        assert.match(await page.textContent('[data-testid=step-said]'), /^Undone: the film plays the way it did before\./)
+        assert.equal(await page.locator('[data-testid=step-undo]').count(), 0, 'there is nothing left to undo')
+        assert.ok(await hasFocus(page, '[data-testid=step-notice]'), 'after Undo the keyboard is on the notice')
+      }
+    } finally {
+      release()
+      await page.unroute(held, hold)
+    }
+    await page.evaluate(() => document.querySelector('video').pause())
+    await leavePlayer()
+  })
+
+  await step('a film that runs dry while it plays is started again lighter; what was learned is listed, the next play starts lower, and Forget puts it back', async () => {
+    assert.deepEqual(await learned(page), [], 'before this step nothing may have been learned about this device (a film stalled by itself earlier in this run: is the machine too slow to play the test films?)')
+    await fromTheStart(page, 'Old Format Test')
+    // The film plays its first nine seconds and then runs dry. With the
+    // app's own player the film's parts are really held back on their way
+    // to it, all but the first three. Safari's engine fetches them out of
+    // this test's reach, so there the player is made to look as a player
+    // that has run dry looks: its clock stands still and it holds nothing
+    // to show next.
+    let holding = true
+    const parts = new Map() // how many parts of each film have been asked for
+    const waiting = []
+    const chunk = /\/hls\/[0-9a-f]+\/seg-\d+\.m4s$/
+    const hold = async (route) => {
+      const film = tokenOf(route.request().url())
+      const n = (parts.get(film) || 0) + 1
+      parts.set(film, n)
+      if (holding && n > 3) await new Promise((r) => waiting.push(r))
+      await route.continue().catch(() => {}) // the player may have dropped the request meanwhile
+    }
+    const letGo = async () => {
+      holding = false
+      waiting.splice(0).forEach((r) => r())
+      if (ownChunkPlayer) await page.unroute(chunk, hold)
+      else await page.evaluate(() => window.playerMovesAgain && window.playerMovesAgain())
+    }
+    if (ownChunkPlayer) await page.route(chunk, hold)
+    // (Listened for from before the film opens, so that it cannot be missed.)
+    const reported = page.waitForRequest((r) => r.method() === 'POST' && /\/api\/hls\/[0-9a-f]+\/trouble$/.test(r.url()), { timeout: 90000 })
+    reported.catch(() => {}) // looked at below
+    let said
+    let stoodAt
+    try {
+      await focusByText(page, 'Old Format Test')
+      await page.keyboard.press('Enter')
+      await waitPlaying(page, 1)
+      assert.equal(await page.evaluate(() => document.querySelector('video').dataset.rung), '1', 'the film starts at the best setting')
+      if (!ownChunkPlayer) {
+        await page.evaluate(() => {
+          const proto = HTMLMediaElement.prototype
+          const time = Object.getOwnPropertyDescriptor(proto, 'currentTime')
+          const ready = Object.getOwnPropertyDescriptor(proto, 'readyState')
+          const at = time.get.call(document.querySelector('video'))
+          Object.defineProperty(proto, 'currentTime', { configurable: true, get: () => at, set: time.set })
+          Object.defineProperty(proto, 'readyState', { configurable: true, get: () => 2 })
+          window.playerMovesAgain = () => {
+            Object.defineProperty(proto, 'currentTime', time)
+            Object.defineProperty(proto, 'readyState', ready)
+          }
+        })
+        console.log('      (in this browser the film\'s parts cannot be held back; its player was made to look run dry instead)')
+      }
+      // The viewer is told while the film stands still.
+      await page.waitForSelector('[data-testid=wait-words] p', { timeout: 60000 }).catch(() => assert.fail('nothing was said while the film stood still'))
+      stoodAt = await page.evaluate(() => document.querySelector('video').currentTime)
+      // The page tells the PC, once the film has stood still for eight
+      // seconds beyond the ten in which a wait after a start is normal.
+      said = (await reported.catch(() => assert.fail('a film that stood still for a long time was not reported to the PC'))).postDataJSON()
+      assert.equal(said.evidence, 'starved', `the page reported: ${JSON.stringify(said)}`)
+      if (ownChunkPlayer) assert.ok(waiting.length > 0, 'parts of the film were being held back when the page reported trouble')
+      // The PC kept up with converting; it was the way to this device that
+      // was slow. So the film is started again where it was, at a setting
+      // that takes fewer bits, and the viewer is told why. (Its first parts
+      // come through like the first film's did.)
+      await sentAs(page, 'rung', '3', `after the stall (the page reported ${JSON.stringify(said)})`)
+    } finally {
+      await letGo()
+    }
+    assert.equal(await page.textContent('[data-testid=step-said]'), 'The film was reaching this device too slowly, so the PC now makes the picture at a lighter setting.')
+    const at = await page.evaluate(() => document.querySelector('video').currentTime)
+    assert.ok(at > stoodAt - 1 && at < stoodAt + 15, `the film carries on where it stood still (${stoodAt} s), not at ${at} s`)
+    if (ownChunkPlayer) assert.ok(stoodAt > 5 && stoodAt < 12.5, `with all but its first three parts held back the film stands still about 9 seconds in, not at ${stoodAt} s`)
+    assert.equal(await page.locator('[data-testid=play-problem]').count(), 0, `nothing else is wrong, yet the page says: ${await page.locator('[data-testid=play-problem]').allTextContents()}`)
+    // Undo can be reached with the keyboard. (It is pressed in a later
+    // step; here the lesson is wanted.)
+    await focusByText(page, 'Undo')
+    assert.ok(await hasFocus(page, '[data-testid=step-undo]'))
+    await page.evaluate(() => document.querySelector('video').pause())
+    await leavePlayer()
+
+    // What was learned is listed in the settings, in a sentence.
+    await openSettings(page)
+    await page.waitForSelector('[data-testid=learned-list] li')
+    const listed = await page.locator('[data-testid=learned-list] li').allTextContents()
+    assert.equal(listed.length, 1, `one thing was learned: ${JSON.stringify(listed)}`)
+    assert.match(listed[0], /^Films were reaching this device too slowly, so for a day films that need more than 5 megabits a second are converted to a lighter picture for it\. Remembered until .+\.Forget$/)
+    // The next play starts lower by itself, with nothing said: nothing
+    // went wrong this time.
+    await fromTheStart(page, 'Old Format Test')
+    await focusByText(page, 'Old Format Test')
+    await page.keyboard.press('Enter')
+    await waitPlaying(page, 1)
+    assert.equal(await page.evaluate(() => document.querySelector('video').dataset.rung), '3', 'the next play starts at the lighter setting')
+    assert.equal(await page.textContent('[data-testid=step-notice]'), '', 'nothing is said when a film simply starts the way the PC has learned to send it')
+    await page.evaluate(() => document.querySelector('video').pause())
+    await leavePlayer()
+
+    // Forget, with the keyboard, puts it back.
+    await openSettings(page)
+    await focusByText(page, 'Forget')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('[data-testid=learned-none]').catch(() => assert.fail('the lesson was still listed after Forget'))
+    assert.match(await page.textContent('[data-testid=learned-said]'), /^Forgotten\./)
+    // The button that was pressed is gone; the keyboard's place is on the
+    // line that says what happened.
+    assert.ok(await hasFocus(page, '[data-testid=learned-said]'), 'after Forget the keyboard is on the line that says it was forgotten')
+    assert.deepEqual(await learned(page), [])
+    await fromTheStart(page, 'Old Format Test')
+    await focusByText(page, 'Old Format Test')
+    await page.keyboard.press('Enter')
+    await waitPlaying(page, 1)
+    assert.equal(await page.evaluate(() => document.querySelector('video').dataset.rung), '1', 'after Forget the film starts at the best setting again')
+    await page.evaluate(() => document.querySelector('video').pause())
+    await leavePlayer()
+  })
+
+  await step('the page asks the PC about a film it has open: one the PC has closed is started again quietly, and a conversion the PC says is too slow is stepped down before it stalls', async () => {
+    assert.deepEqual(await learned(page), [], 'before this step nothing may have been learned about this device')
+    await fromTheStart(page, 'Old Format Test')
+    // The PC closes a film behind the page's back when it is restarted. It
+    // is not restarted here; the film is closed on it the way the page
+    // itself closes one, without the page hearing of it.
+    const tokens = [] // the name of each play the PC opened, newest last
+    const notePlay = async (res) => {
+      if (res.request().method() === 'POST' && /\/api\/items\/[0-9a-f]+\/play$/.test(res.url())) tokens.push((await res.json().catch(() => ({}))).play)
+    }
+    page.on('response', notePlay)
+    const closedOnThePC = async () => {
+      const closed = await page.evaluate(async (t) => {
+        await fetch(`/api/hls/${t}/stop`, { method: 'POST', headers: { 'X-Requested-With': 'localmedia', 'Content-Type': 'application/json' }, body: '{}' })
+        return (await (await fetch(`/api/hls/${t}/state`)).json()).alive === false
+      }, tokens[tokens.length - 1])
+      assert.ok(closed, 'the PC says the film is no longer open')
+    }
+    // Nor is this PC too slow for the small test film. For that part, what
+    // it says about the film is changed on its way to the page, one answer.
+    // What the page then does, and the PC with it, is real.
+    let say = null
+    let asks = 0
+    const state = /\/api\/hls\/[0-9a-f]+\/state$/
+    const changed = async (route) => {
+      asks++
+      const res = await route.fetch()
+      const told = { ...(await res.json()), ...(say || {}) }
+      say = null
+      await route.fulfill({ response: res, json: told })
+    }
+    const opened = () => {
+      const r = page.waitForRequest((q) => q.method() === 'POST' && /\/api\/items\/[0-9a-f]+\/play$/.test(q.url()), { timeout: 30000 })
+      r.catch(() => {})
+      return r
+    }
+    // The film in the player is another one than src, and has loaded.
+    const replaced = (src, why) => page.waitForFunction((was) => {
+      const v = document.querySelector('video')
+      return !!v && !!v.currentSrc && v.currentSrc !== was && v.readyState >= 1
+    }, src, { timeout: 30000 }).catch(() => assert.fail(why))
+    const player = () => page.evaluate(() => {
+      const v = document.querySelector('video')
+      return { src: v.currentSrc, at: v.currentTime, paused: v.paused, rung: v.dataset.rung }
+    })
+    await page.route(state, changed)
+    try {
+      await focusByText(page, 'Old Format Test')
+      await page.keyboard.press('Enter')
+      await waitPlaying(page, 1)
+      // The viewer comes back to the page (a phone is unlocked, a tab is
+      // brought to the front): the page asks whether the film is still
+      // open on the PC. Told that it is not, it starts the film again where
+      // it is, and says nothing: there is nothing for the viewer to do.
+      // (If the player is still fetching the film when the PC closes it,
+      // the next part is refused and the page finds out by that, sooner.
+      // So the page's request is listened for from before the closing.)
+      let before = await player()
+      let again = opened()
+      await closedOnThePC()
+      await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+      let asked = (await again.catch(() => assert.fail('told that the PC had closed the film, the page did not ask for it again'))).postDataJSON()
+      assert.match(asked.from || '', /^[0-9a-f]{32}$/, `the page names the play that is replaced: ${JSON.stringify(asked)}`)
+      await replaced(before.src, 'the film the PC had closed was not handed to the player again')
+      await playsBeyond(page, before.at + 0.5, 'a film started again after the PC had closed it')
+      let now = await player()
+      assert.ok(now.at < before.at + 15, `the film was at ${before.at} s and carries on at ${now.at} s`)
+      assert.equal(await page.textContent('[data-testid=step-notice]'), '', 'nothing is said about it')
+      assert.equal(await page.locator('[data-testid=play-problem]').count(), 0, `nothing is wrong, yet the page says: ${await page.locator('[data-testid=play-problem]').allTextContents()}`)
+      // A film the viewer had paused (a phone pauses a film when it is
+      // locked) is started again the same way, and stays paused.
+      await page.evaluate(() => document.querySelector('video').pause())
+      before = await player()
+      again = opened()
+      await closedOnThePC()
+      await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')))
+      await again.catch(() => assert.fail('told that the PC had closed a paused film, the page did not ask for it again'))
+      await replaced(before.src, 'the paused film the PC had closed was not handed to the player again')
+      // (With the app's own player the look is taken once the player holds
+      // enough of the film to have started it by itself, had it meant to.)
+      await page.waitForFunction(([was, enough]) => {
+        const v = document.querySelector('video')
+        return v.readyState >= enough && Math.abs(v.currentTime - was) < 3.5
+      }, [before.at, ownChunkPlayer ? 3 : 1], { timeout: 30000 }).catch(async () => assert.fail(`the paused film was at ${before.at} s and is now at ${(await player()).at} s`))
+      now = await player()
+      assert.ok(now.paused, 'a film that was paused is still paused after being started again')
+
+      // Twelve seconds into a film whose picture is being converted, the
+      // page asks how the conversion is going. Told that the PC converts
+      // slower than the film plays, it reports that as trouble at once,
+      // without waiting for the film to stall.
+      const asksBefore = asks
+      say = { advice: 'lower', pace: 0.5, chunks: 3 }
+      const reported = page.waitForRequest((q) => q.method() === 'POST' && /\/api\/hls\/[0-9a-f]+\/trouble$/.test(q.url()), { timeout: 90000 })
+      reported.catch(() => {})
+      await page.evaluate(() => document.querySelector('video').play().catch(() => {}))
+      const said = (await reported.catch(() => assert.fail(`the page did not report a conversion the PC called too slow (it asked the PC ${asks - asksBefore} times)`))).postDataJSON()
+      assert.equal(said.evidence, 'starved', `the page reported: ${JSON.stringify(said)}`)
+      assert.equal(said.detail, 'the PC said it converts 0.5 seconds of film a second')
+      const when = (await player()).at
+      assert.ok(when - now.at > 11 && when - now.at < 25, `the PC was asked after ${(when - now.at).toFixed(1)} s of playing; twelve is the rule`)
+      // What comes of the report is for the PC to say. (This PC kept up in
+      // truth, so it takes the way to the device for the slow part and
+      // sends a lighter picture.) The page does as it is told, says so, and
+      // offers Undo, which is taken here so that nothing learned is left.
+      await page.waitForSelector('[data-testid=step-undo]', { timeout: 30000 }).catch(() => assert.fail('after the report nothing was said, or nothing could be undone'))
+      await focusByText(page, 'Undo')
+      await page.keyboard.press('Enter')
+      await sentAs(page, 'rung', '1', 'after Undo')
+      assert.deepEqual(await learned(page), [], 'Undo has the PC forget what it learned')
+    } finally {
+      page.off('response', notePlay)
+      await page.unroute(state, changed)
+    }
+    await page.evaluate(() => document.querySelector('video').pause())
+    await leavePlayer()
+  })
+
   // "Show subtitles" in the settings, set with the keyboard.
   const showSubtitles = async (when) => {
     await focusByText(page, 'Settings')
@@ -652,7 +1031,7 @@ try {
     await showSubtitles('auto')
   })
 
-  await step('a picture whose size is only known once the film plays raises no false alarm', async () => {
+  await step('a picture whose size is only known once the film plays raises no false alarm; a film with no picture at all is converted for this device', async () => {
     // Safari's own chunk player does not know the size of the picture when
     // it first describes the film; the size follows a moment later. The
     // other engines know it at once, so the wait is imitated in all of
@@ -665,8 +1044,14 @@ try {
         document.querySelector('video').dispatchEvent(new Event('resize'))
       }
     })
-    const alarm = () => page.evaluate(() => document.querySelector('[data-testid=play-problem]')?.textContent || '')
+    const troubleReport = () => {
+      const r = page.waitForRequest((q) => q.method() === 'POST' && /\/api\/hls\/[0-9a-f]+\/trouble$/.test(q.url()), { timeout: 60000 })
+      r.catch(() => {}) // looked at where it is awaited
+      return r
+    }
+    assert.deepEqual(await learned(page), [], 'before this step nothing may have been learned about this device')
     await sizeUnknown()
+    let reported = troubleReport()
     await focusByText(page, 'Three Sounds Test')
     await page.keyboard.press('Enter')
     await waitPlaying(page, 0.1)
@@ -676,34 +1061,115 @@ try {
       const v = document.querySelector('video')
       let played = 0
       for (let i = 0; i < v.played.length; i++) played += v.played.end(i) - v.played.start(i)
-      return { played, alarm: document.querySelector('[data-testid=play-problem]')?.textContent || '' }
+      return { played, method: v.dataset.method, alarm: document.querySelector('[data-testid=play-problem]')?.textContent || '', notice: document.querySelector('[data-testid=step-notice]')?.textContent || '' }
     })
     // (On a machine so slow that seconds of film went by before this look,
-    // the alarm may rightly be there already.)
-    if (early.played < 2.5) assert.equal(early.alarm, '', 'no alarm while the film has only just begun to play')
+    // the alarm may rightly have been raised already.)
+    if (early.played < 2.5) assert.equal(early.alarm + early.notice, '', 'no alarm while the film has only just begun to play')
     else console.log(`      (looked ${early.played.toFixed(1)} s into playing: too late to tell whether the alarm came too early)`)
     // If the size never comes, there really is no picture this browser can
-    // show, and the viewer is told after a few seconds of playing.
-    await page.waitForSelector('[data-testid=play-problem]', { timeout: 15000 }).catch(() => assert.fail('a film that plays on with no picture must be reported'))
-    assert.match(await alarm(), /sound but not its picture/)
+    // show. After a few seconds of playing the page tells the PC, which
+    // converts the picture for this device from then on, and the film is
+    // started again converted.
+    const told = (await reported.catch(() => assert.fail('a film that plays on with no picture must be reported to the PC'))).postDataJSON()
+    assert.equal(told.evidence, 'decode', `the page reported: ${JSON.stringify(told)}`)
+    await sentAs(page, 'method', 'convert', 'after the film was reported to play without a picture')
+    assert.equal(await page.textContent('[data-testid=step-said]'), 'This device had trouble showing the picture, so the PC now converts the picture to a kind every device plays.')
+    // The converted picture has no size either, and there is nothing easier
+    // to show. The viewer is told, in words that stay.
+    await page.waitForFunction(() => {
+      const v = document.querySelector('video')
+      if (v && v.paused && v.readyState >= 1) {
+        v.muted = true
+        v.play().catch(() => {})
+      }
+      return /no other way/.test(document.querySelector('[data-testid=play-problem]')?.textContent || '')
+    }, null, { timeout: 40000, polling: 200 }).catch(async () => assert.fail(`a converted film that still shows no picture must be said to; the page says: ${await page.locator('[data-testid=play-problem]').allTextContents()}`))
+    assert.match(await page.textContent('[data-testid=play-problem]'), /^This device plays this film's sound but no picture\. The PC has no other way of sending this film that would help\./)
     await page.evaluate(() => window.sizeBecomesKnown())
     await page.waitForSelector('[data-testid=play-problem]', { state: 'detached', timeout: 5000 }).catch(() => assert.fail('the alarm must go once the size of the picture is known'))
+    // The change can be taken back, with the keyboard: Undo plays the film
+    // the way it was and has the PC forget what it learned.
+    const kept = await learned(page)
+    assert.equal(kept.length, 1, `one thing was learned: ${JSON.stringify(kept)}`)
+    assert.match(kept[0].text, /^This device had trouble showing one .*film, so that film is converted for it\.$/)
+    await focusByText(page, 'Undo')
+    await page.keyboard.press('Enter')
+    await sentAs(page, 'method', early.method, 'after Undo')
+    assert.match(await page.textContent('[data-testid=step-said]'), /^Undone: the film plays the way it did before, and what the app had just learned is forgotten\./)
+    assert.ok(await hasFocus(page, '[data-testid=step-notice]'), 'after Undo the keyboard is on the notice')
+    assert.deepEqual(await learned(page), [], 'Undo has the PC forget what it learned')
     await page.evaluate(() => document.querySelector('video').pause())
     await focusByText(page, '← Back')
     await page.keyboard.press('Enter')
     await page.waitForSelector('text=Continue watching')
     // An ordinary file knows the size of its picture from the start. For
-    // those, no size still means no picture, and is said at once.
+    // those, no size still means no picture, and the PC is told at once.
     await sizeUnknown()
+    reported = troubleReport()
     await focusByText(page, 'Test Clip')
     await page.keyboard.press('Enter')
-    await page.waitForSelector('[data-testid=play-problem]', { timeout: 15000 }).catch(() => assert.fail('an ordinary file with no picture must be reported as soon as it opens'))
-    assert.match(await alarm(), /sound but not its picture/)
+    const told2 = (await reported.catch(() => assert.fail('an ordinary file with no picture must be reported as soon as it opens'))).postDataJSON()
+    assert.equal(told2.evidence, 'decode', `the page reported: ${JSON.stringify(told2)}`)
+    await sentAs(page, 'method', 'convert', 'after an ordinary file was reported to play without a picture')
     await page.evaluate(() => window.sizeBecomesKnown())
     await page.evaluate(() => document.querySelector('video').pause())
     await focusByText(page, '← Back')
     await page.keyboard.press('Enter')
     await page.waitForSelector('text=Continue watching')
+    // What this step taught the PC is not to change how the next steps'
+    // films are sent.
+    await forgetAll(page)
+    assert.deepEqual(await learned(page), [])
+  })
+
+  await step('a viewer can say that HDR colours look wrong on this device, keyboard only; it is listed and can be forgotten', async () => {
+    // No film in this library is HDR, and none could be made that every
+    // browser this test runs in plays as it is. So the PC's answer for the
+    // film is changed on its way to the page: it is said to be HDR.
+    // Everything else, on the page and on the PC, is the real thing.
+    const answer = /\/api\/items\/[0-9a-f]+\/play$/
+    const callItHDR = async (route) => {
+      const res = await route.fetch()
+      await route.fulfill({ response: res, json: { ...(await res.json()), hdr: true } })
+    }
+    await page.route(answer, callItHDR)
+    try {
+      await focusByText(page, 'Test Clip')
+      await page.keyboard.press('Enter')
+      await waitPlaying(page, 0.2)
+      const before = await page.evaluate(() => ({ src: document.querySelector('video').currentSrc, method: document.querySelector('video').dataset.method }))
+      // The panel under the player is opened and the button in it pressed.
+      await pressUntilFocused(page, '[data-testid=how-playing] summary')
+      await page.keyboard.press('Enter')
+      await pressUntilFocused(page, '[data-testid=hdr-wrong]')
+      assert.equal(await page.evaluate(() => document.activeElement.textContent), 'Colours look wrong on this device')
+      await page.keyboard.press('Enter')
+      // This PC cannot turn HDR into normal colour, and the film is not HDR
+      // in truth: either way nothing changes for it, and the page says so
+      // rather than starting the film again for nothing.
+      await page.waitForFunction(() => /^Noted\./.test(document.querySelector('[data-testid=hdr-said]')?.textContent || ''), null, { timeout: 20000 })
+        .catch(async () => assert.fail(`the page did not say the word was noted; it says: ${await page.textContent('[data-testid=hdr]')}`))
+      assert.ok(await hasFocus(page, '[data-testid=hdr-wrong]'), 'the keyboard is still on the button that was pressed')
+      const after = await page.evaluate(() => ({ src: document.querySelector('video').currentSrc, method: document.querySelector('video').dataset.method }))
+      assert.deepEqual(after, before, 'the film that was playing is left as it is')
+      const kept = await page.evaluate(async () => await (await fetch('/api/device')).json())
+      assert.ok(kept.hdrWrong && kept.lessons.length === 1 && kept.lessons[0].kind === 'hdr', `the PC keeps the viewer's word: ${JSON.stringify(kept)}`)
+    } finally {
+      await page.unroute(answer, callItHDR)
+    }
+    await page.evaluate(() => document.querySelector('video').pause())
+    await focusByText(page, '← Back')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('text=Continue watching')
+    // It is listed with the other things learned, and forgotten the same way.
+    await openSettings(page)
+    await page.waitForSelector('[data-testid=learned-list] li')
+    assert.match((await page.locator('[data-testid=learned-list] li').allTextContents()).join(' | '), /^HDR colours were reported to look wrong on this device/)
+    await focusByText(page, 'Forget')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('[data-testid=learned-none]').catch(() => assert.fail('the viewer\'s word was still listed after Forget'))
+    assert.equal(await page.evaluate(async () => (await (await fetch('/api/device')).json()).hdrWrong), false)
   })
 
   await step('a repackaged film resumes where it stopped, with its subtitles', async () => {
@@ -776,7 +1242,6 @@ try {
 
   // The way out for a film the browser cannot play well: a real video
   // player. Which way depends on where the browser is.
-  const hasFocus = (p, selector) => p.evaluate((s) => document.activeElement === document.querySelector(s), selector)
   let handedLink
   // (Without a network address this whole run is on the PC's own address,
   // where there is no "other device" to be.)
@@ -935,6 +1400,7 @@ try {
   failed = true
   console.error('\nFAILED after: ' + (steps[steps.length - 1] || '(start)'))
   console.error(err)
+  whenFailed()
   console.error('\n--- server log ---\n' + serverLog.replace(/\d+\.\d+\.\d+\.\d+/g, '[address]'))
 } finally {
   if (browser) await browser.close()
