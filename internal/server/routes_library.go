@@ -326,15 +326,42 @@ func (s *Server) copiesOf(itemID string) ([]*version, error) {
 // or nil if no copy is there. Playing a film and remembering a pick of
 // sound and subtitles both ask here, so a pick is always read against the
 // file it was made on.
+//
+// Unlike the lists, it looks at the disk when there are several copies (see
+// onDisk). So until the library is next looked over, a list may still speak
+// of a copy that has just been deleted while Play opens another.
 func (s *Server) playedVersion(u *User, itemID string) (*version, error) {
 	copies, err := s.copiesOf(itemID)
 	if err != nil || len(copies) == 0 {
 		return nil, err
 	}
+	if len(copies) > 1 {
+		copies = onDisk(copies)
+	}
 	if err := s.judge(u, copies); err != nil {
 		return nil, err
 	}
 	return preferred(copies), nil
+}
+
+// onDisk leaves out the copies whose file cannot be opened at this moment:
+// deleted or moved since the library was last looked over, which is done
+// every quarter of an hour. Such a copy is still listed, and handed out it
+// could not be fetched, while another copy of the film is there to play.
+// When none can be opened (a drive that is switched off) all are kept, and
+// the answer is what it is for any film whose file is away.
+func onDisk(copies []*version) []*version {
+	var there []*version
+	for _, v := range copies {
+		if f, _, err := openMedia(v.libPath, v.rel); err == nil {
+			f.Close()
+			there = append(there, v)
+		}
+	}
+	if len(there) == 0 {
+		return copies
+	}
+	return there
 }
 
 // loadItems reads films and episodes matching where, with this user's

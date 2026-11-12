@@ -400,3 +400,49 @@ func TestACopyThatCannotBeRepackagedIsNotPreferredToOneThatPlays(t *testing.T) {
 		t.Errorf("Play answers %s/%s (%s) because %q; want the file as it is, with its main sound", play.Plan.Playable, play.Plan.Method, play.URL, reasons(v))
 	}
 }
+
+// The library is looked over every quarter of an hour. A copy deleted from
+// the disk since then is still in the lists, and Play used to hand it out,
+// though it could not be fetched, while the film's other copy was there.
+func TestACopyThatIsGoneFromTheDiskIsNotHandedOut(t *testing.T) {
+	v := twoVersions(t)
+	v.do("POST", "/api/capabilities", remote, v.c, phoneLike)
+	v.inspected(t, "1080p", "matroska", picture("h264", 8, 1920, 1080), sound("aac", "eng", "", true, false), sound("aac", "nor", "", false, false))
+	v.inspected(t, "2160p", "matroska", picture("h264", 8, 3840, 2160), sound("aac", "eng", "", true, false))
+	fetched := func(p versionAnswer) int { return v.do("GET", p.URL, remote, nil, nil).Code }
+	dir := filepath.Join(v.media, "Films", "Two Sizes (2019)")
+
+	_, play := v.answers(t, v.c)
+	if which(play.DurationMs) != "2160p" || fetched(play) != 200 {
+		t.Fatalf("with both copies there Play hands out the %s copy, and fetching it answers %d; want the 2160p copy and 200", which(play.DurationMs), fetched(play))
+	}
+	if err := os.Remove(filepath.Join(dir, "Two Sizes (2019) - 2160p.mkv")); err != nil {
+		t.Fatal(err)
+	}
+	_, play = v.answers(t, v.c)
+	if which(play.DurationMs) != "1080p" || fetched(play) != 200 {
+		t.Errorf("with the 2160p copy gone from the disk Play hands out the %s copy, and fetching it answers %d; want the 1080p copy, which is there", which(play.DurationMs), fetched(play))
+	}
+	// A pick of sound is read against the copy that plays now: the second
+	// sound track is one only the 1080p copy has.
+	if w := v.do("PUT", "/api/items/"+v.film+"/choice", remote, v.c, map[string]any{"audioLang": "no", "subLang": "", "subsOn": false, "audioIndex": 1, "subKey": ""}); w.Code != 200 {
+		t.Fatalf("choice: %d %s", w.Code, w.Body)
+	}
+	var lang, kind string
+	var index int
+	v.s.db.QueryRow(`SELECT audio_lang, audio_index, audio_kind FROM track_memory`).Scan(&lang, &index, &kind)
+	if lang != "no" || index != 1 {
+		t.Errorf("the pick of the 1080p copy's second sound track was remembered as language %q, track %d", lang, index)
+	}
+
+	// With every copy gone nothing is left to choose from, and the answer is
+	// what it always was for a film whose file is gone: an address that
+	// answers "not available".
+	if err := os.Remove(filepath.Join(dir, "Two Sizes (2019) - 1080p.mkv")); err != nil {
+		t.Fatal(err)
+	}
+	_, play = v.answers(t, v.c)
+	if code := fetched(play); which(play.DurationMs) != "2160p" || code != 404 {
+		t.Errorf("with both copies gone Play hands out the %s copy, and fetching it answers %d; want the 2160p copy as before, and 404", which(play.DurationMs), code)
+	}
+}
