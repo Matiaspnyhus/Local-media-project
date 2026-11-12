@@ -198,29 +198,63 @@ func (s *Server) loadPrefs(userID string) playback.Prefs {
 	return p
 }
 
+// prefsView is a viewer's preferences as the page gets and sends them.
+type prefsView struct {
+	playback.Prefs
+	// Styled says what to do with subtitles that have their own design
+	// where the page cannot draw them: "designed" has the PC put them into
+	// the picture, "plain" shows their words as plain text (see
+	// playback.Want.Styled). It is kept here for the page; Play does not
+	// read it yet.
+	Styled playback.Styling `json:"styled"`
+}
+
+// styledPref is a viewer's choice for subtitles with their own design:
+// "designed" unless they chose otherwise.
+func (s *Server) styledPref(userID string) playback.Styling {
+	styled := playback.Designed
+	s.db.QueryRow(`SELECT styled FROM prefs WHERE user_id=?`, userID).Scan(&styled)
+	if styled != playback.Plain {
+		styled = playback.Designed
+	}
+	return styled
+}
+
 func (s *Server) handleGetPrefs(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, s.loadPrefs(currentUser(r).ID))
+	u := currentUser(r).ID
+	writeJSON(w, http.StatusOK, prefsView{Prefs: s.loadPrefs(u), Styled: s.styledPref(u)})
 }
 
 var langCode = regexp.MustCompile(`^[a-z]{0,3}$`)
 
 func (s *Server) handleSetPrefs(w http.ResponseWriter, r *http.Request) {
-	var in playback.Prefs
+	var in struct {
+		playback.Prefs
+		// A page from before this choice existed does not send it, and
+		// what is stored then stays.
+		Styled *playback.Styling `json:"styled"`
+	}
 	if !readJSON(w, r, &in) {
 		return
 	}
-	if !langCode.MatchString(in.AudioLang) || !langCode.MatchString(in.SubLang) || (in.Subs != "auto" && in.Subs != "always" && in.Subs != "off") {
+	if !langCode.MatchString(in.AudioLang) || !langCode.MatchString(in.SubLang) || (in.Subs != "auto" && in.Subs != "always" && in.Subs != "off") ||
+		(in.Styled != nil && *in.Styled != playback.Designed && *in.Styled != playback.Plain) {
 		writeErr(w, http.StatusBadRequest, "Those preferences could not be read.")
 		return
 	}
-	_, err := s.db.Exec(`INSERT INTO prefs(user_id,audio_lang,sub_lang,subs) VALUES(?,?,?,?)
-		ON CONFLICT(user_id) DO UPDATE SET audio_lang=excluded.audio_lang, sub_lang=excluded.sub_lang, subs=excluded.subs`,
-		currentUser(r).ID, in.AudioLang, in.SubLang, in.Subs)
+	u := currentUser(r).ID
+	styled := s.styledPref(u)
+	if in.Styled != nil {
+		styled = *in.Styled
+	}
+	_, err := s.db.Exec(`INSERT INTO prefs(user_id,audio_lang,sub_lang,subs,styled) VALUES(?,?,?,?,?)
+		ON CONFLICT(user_id) DO UPDATE SET audio_lang=excluded.audio_lang, sub_lang=excluded.sub_lang, subs=excluded.subs, styled=excluded.styled`,
+		u, in.AudioLang, in.SubLang, in.Subs, styled)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save.")
 		return
 	}
-	writeJSON(w, http.StatusOK, in)
+	writeJSON(w, http.StatusOK, prefsView{Prefs: in.Prefs, Styled: styled})
 }
 
 // scopeOf is what a track choice is remembered for: the show an episode
@@ -395,10 +429,26 @@ func (s *Server) clockAhead(sessionID, itemID string) int64 {
 	return c.ahead[sessionID+" "+itemID]
 }
 
-// playCaps is what this device says it can play. What this PC can do for
-// it (repackage, convert) is a separate matter: see limits.
-func (s *Server) playCaps(u *User) *playback.Caps {
-	return s.capsFor(u)
+// takenOver is what a play inherits from the play it replaces: the steps
+// that one took after trouble, which hold for the rest of this viewing
+// whatever else is remembered.
+type takenOver struct {
+	steps  []playback.Step
+	noSubs bool
+}
+
+// takeOver finds what a new play of an item inherits from the play named
+// by from. Only a film of the same sign-in and the same item is taken over
+// from; anything else is the same as no "from" at all.
+func (s *Server) takeOver(from, sessionID, itemID string) takenOver {
+	if !ids.Valid(from) {
+		return takenOver{}
+	}
+	f, known, _ := s.filmOf(from, sessionID)
+	if !known || f.item != itemID {
+		return takenOver{}
+	}
+	return takenOver{steps: f.taken, noSubs: f.noSubs}
 }
 
 func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
@@ -413,6 +463,10 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		// Lower asks for a lighter picture: the number of the best setting
 		// that may be used (see playback.Want.Lower).
 		Lower int `json:"lower"`
+		// From is the token of the play this one replaces: the same film,
+		// started again after trouble or with another sound track. The new
+		// play takes over the steps the old one took (see trouble.go).
+		From string `json:"from"`
 	}
 	if r.Body != nil {
 		json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&in) // the body is optional
@@ -455,10 +509,22 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	if in.Audio != nil && *in.Audio >= 0 && *in.Audio < len(ft.media.Audio) {
 		choice.Audio = *in.Audio
 	}
-	caps, limits := s.playCaps(u), s.limits(u)
+	// What the device plays, what this PC can do, and what was learned
+	// about the device, for this file.
+	caps, limits := s.planFor(u, false).file(fileID)
 	// The viewer picked the sound for this play only if the request names
 	// it; otherwise it comes from their settings or an earlier pick.
 	want := playback.Want{Audio: choice.Audio, AudioAuto: in.Audio == nil, Subtitle: -1, Lower: in.Lower}
+	// A play that replaces one that ran into trouble carries that one's
+	// steps on: the lighter setting asked for, and whatever else the step
+	// taught, also where it could not be kept (see keepStep).
+	before := s.takeOver(in.From, u.SessionID, itemID)
+	for _, st := range before.steps {
+		caps, want, limits = st.Apply(caps, want, limits)
+	}
+	if before.noSubs {
+		want.Subtitle = -1
+	}
 	plan := playback.DecideFor(ft.media, caps, want, limits)
 	if plan.Playable == playback.No {
 		// The preferred sound track may be what stands in the way (it takes
@@ -467,7 +533,9 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		main := want
 		main.Audio, main.AudioAuto = -1, false
 		if alt := playback.DecideFor(ft.media, caps, main, limits); alt.Playable != playback.No {
-			plan = alt
+			// What the film is planned with is remembered for as long as
+			// it is open (see noteOpen), so it has to be what gave this plan.
+			plan, want = alt, main
 		}
 	}
 
@@ -498,6 +566,8 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var subtitleShift int64
+	var playToken string
+	inChunks := false
 	ext := strings.ToLower(filepath.Ext(rel))
 	out := map[string]any{
 		"title":      title,
@@ -532,12 +602,30 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		out["url"] = "/hls/" + token + "/index.m3u8"
 		out["mimeType"] = "application/vnd.apple.mpegurl"
 		out["hls"] = token
+		playToken, inChunks = token, true
 	} else {
 		exp := time.Now().Add(linkLife).Unix()
 		sig := auth.SignLink(s.linkKey, fileID, exp, u.SessionID)
 		out["url"] = "/stream/" + fileID + "?e=" + strconv.FormatInt(exp, 10) + "&s=" + u.SessionID + "&g=" + sig
 		out["mimeType"] = mediaType(rel, container)
+		if plan.Playable != playback.No {
+			// The original file is sent, so no conversion has a token. One
+			// is made for the page to report trouble under.
+			playToken = newID()
+		}
 	}
+	// "play" is the token to report trouble under, to ask how the film is
+	// doing, to close it, and to name as "from" when the film is started
+	// again: the same as "hls" for a film sent in chunks. It is "" for a
+	// film that cannot be played.
+	out["play"] = playToken
+	if playToken != "" {
+		s.noteOpen(playToken, &openFilm{session: u.SessionID, item: itemID, file: fileID, chunks: inChunks,
+			media: ft.media, caps: caps, want: want, limits: limits, plan: plan, taken: before.steps, noSubs: before.noSubs})
+	}
+	// "lighter" is the setting to ask for ("lower") when the viewer wants
+	// a lighter picture than this one; 0 when none is made.
+	out["lighter"] = playback.Lighter(ft.media, plan)
 	// The place to carry on from is kept in the film's own time. The player
 	// this answer is for gets it on its own clock, and what it reports from
 	// now on is read on that clock (see playerClocks). A film that starts
@@ -755,6 +843,10 @@ func (s *Server) handleHLSStop(w http.ResponseWriter, r *http.Request) {
 	if s.hls != nil && s.hls.Owner(token) == currentUser(r).SessionID {
 		s.hls.Stop(token)
 	}
+	// The film is closed, whichever way it reached its player. What its
+	// play had come to is remembered a little longer, for the play that
+	// may be replacing it (see handover).
+	s.closeFilm(token, currentUser(r).SessionID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

@@ -267,7 +267,7 @@ func TestNastyIDsAreRefusedEverywhere(t *testing.T) {
 			continue
 		}
 		for _, bad := range nasty {
-			target := strings.NewReplacer("{id}", bad, "{fileID}", bad).Replace(rt.Pattern)
+			target := strings.NewReplacer("{id}", bad, "{fileID}", bad, "{token}", bad, "{lesson}", bad).Replace(rt.Pattern)
 			if rt.Policy == SignedLink {
 				target += "?e=99999999999&s=0123456789abcdef0123456789abcdef&g=x"
 			}

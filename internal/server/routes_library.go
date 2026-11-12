@@ -184,6 +184,9 @@ type version struct {
 	fileID, rel, libPath, container string
 	size, mtime, durationMs         int64
 	probed                          bool
+	// bitRate is how many bits a second the file spends, 0 where it does
+	// not say. Only a lesson about a slow connection asks.
+	bitRate int
 
 	// What judge adds.
 	plan   playback.Plan // how this device would get this copy, with the file's own main sound
@@ -249,7 +252,7 @@ func (s *Server) judge(u *User, copies []*version) error {
 	fileIDs := make([]any, 0, len(copies))
 	for _, v := range copies {
 		byFile[v.fileID] = v
-		media[v.fileID] = &playback.Media{Probed: v.probed, Container: v.container}
+		media[v.fileID] = &playback.Media{Probed: v.probed, Container: v.container, BitRate: v.bitRate}
 		fileIDs = append(fileIDs, v.fileID)
 	}
 	for start := 0; start < len(fileIDs); start += 400 {
@@ -290,9 +293,11 @@ func (s *Server) judge(u *User, copies []*version) error {
 	}
 	// What a film would need on this device with the PC otherwise idle: a
 	// list must not call a film unplayable because the PC happens to be
-	// converting for someone else at this moment.
-	caps, limits := s.playCaps(u), s.limits(nil)
+	// converting for someone else at this moment. What was learned about
+	// the device is read once for the whole list (see planFor).
+	with := s.planFor(u, true)
 	for _, v := range copies {
+		caps, limits := with.file(v.fileID)
 		v.plan = playback.DecideFor(*media[v.fileID], caps, playback.Want{Audio: -1, Subtitle: -1}, limits)
 	}
 	return nil
@@ -300,7 +305,7 @@ func (s *Server) judge(u *User, copies []*version) error {
 
 // copiesOf lists the copies of one film or episode that are there to play.
 func (s *Server) copiesOf(itemID string) ([]*version, error) {
-	rows, err := s.db.Query(`SELECT f.id, f.rel_path, l.path, f.size, f.mtime, f.probed, f.container, f.duration_ms
+	rows, err := s.db.Query(`SELECT f.id, f.rel_path, l.path, f.size, f.mtime, f.probed, f.container, f.duration_ms, f.bit_rate
 		FROM versions v JOIN files f ON f.version_id=v.id JOIN libraries l ON l.id=f.library_id
 		WHERE v.item_id=? AND f.missing=0 AND f.part_index=0`, itemID)
 	if err != nil {
@@ -311,7 +316,7 @@ func (s *Server) copiesOf(itemID string) ([]*version, error) {
 	for rows.Next() {
 		v := &version{}
 		var probed int
-		if err := rows.Scan(&v.fileID, &v.rel, &v.libPath, &v.size, &v.mtime, &probed, &v.container, &v.durationMs); err != nil {
+		if err := rows.Scan(&v.fileID, &v.rel, &v.libPath, &v.size, &v.mtime, &probed, &v.container, &v.durationMs, &v.bitRate); err != nil {
 			return nil, err
 		}
 		v.probed = probed == 1
@@ -344,7 +349,7 @@ func (s *Server) loadItems(u *User, where, order string, args ...any) ([]itemVie
 		order = "i.sort_title"
 	}
 	q := `SELECT i.id, i.kind, i.title, i.year, COALESCE(i.season_number,0), COALESCE(i.episode_number,0), COALESCE(i.episode_end,0),
-		COALESCE(sh.id,''), COALESCE(sh.title,''), f.id, f.rel_path, f.probed, f.container, f.duration_ms, f.size,
+		COALESCE(sh.id,''), COALESCE(sh.title,''), f.id, f.rel_path, f.probed, f.container, f.duration_ms, f.size, f.bit_rate,
 		COALESCE(p.position_ms,0), COALESCE(p.duration_ms,0), COALESCE(p.played,0), COALESCE(p.updated_at,0), i.overview, i.poster <> ''
 		FROM items i
 		LEFT JOIN items sh ON sh.id = i.show_id
@@ -368,7 +373,7 @@ func (s *Server) loadItems(u *User, where, order string, args ...any) ([]itemVie
 		var probed, played int
 		var progDur int64
 		if err := rows.Scan(&v.ID, &v.Kind, &v.Title, &v.Year, &v.Season, &v.Episode, &v.EpisodeEnd, &v.ShowID, &v.ShowTitle,
-			&c.fileID, &c.rel, &probed, &c.container, &c.durationMs, &c.size, &v.PositionMs, &progDur, &played, &v.updatedAt, &v.Overview, &v.Poster); err != nil {
+			&c.fileID, &c.rel, &probed, &c.container, &c.durationMs, &c.size, &c.bitRate, &v.PositionMs, &progDur, &played, &v.updatedAt, &v.Overview, &v.Poster); err != nil {
 			rows.Close()
 			return nil, err
 		}

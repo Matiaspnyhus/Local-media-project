@@ -47,6 +47,11 @@ func (s *Server) routeTable() []Route {
 		{"GET", "/api/items/{id}/handoff.xspf", Session, s.handleHandoffXSPF},
 		{"GET", "/api/files/{fileID}/subtitles/{key}", Session, s.handleSubtitle},
 		{"POST", "/api/hls/{token}/stop", Session, s.handleHLSStop},
+		{"POST", "/api/hls/{token}/trouble", Session, s.handleTrouble},
+		{"GET", "/api/hls/{token}/state", Session, s.handlePlayState},
+		{"GET", "/api/device", Session, s.handleDevice},
+		{"DELETE", "/api/device/lessons/{id}", Session, s.handleForgetLesson},
+		{"POST", "/api/device/hdr-wrong", Session, s.handleHDRWrong},
 		{"GET", "/api/prefs", Session, s.handleGetPrefs},
 		{"PUT", "/api/prefs", Session, s.handleSetPrefs},
 		{"GET", "/api/diagnostics", Session, s.handleDiagnostics},
@@ -59,6 +64,8 @@ func (s *Server) routeTable() []Route {
 		{"POST", "/api/libraries", Owner, s.handleAddLibrary},
 		{"POST", "/api/libraries/scan", Owner, s.handleScan},
 		{"GET", "/api/support-bundle", Owner, s.handleSupportBundle},
+		{"GET", "/api/devices", Owner, s.handleDevices},
+		{"DELETE", "/api/devices/{id}/lessons/{lesson}", Owner, s.handleForgetDeviceLesson},
 		{"GET", "/api/settings", Owner, s.handleSettings},
 		{"GET", "/api/update", Owner, s.handleUpdateStatus},
 		{"POST", "/api/update/check", Owner, s.handleUpdateCheck},
@@ -200,6 +207,10 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 		s.hls.Drop(u.SessionID) // stop anything being converted for this sign-in
 	}
 	s.forgetCaps(u.SessionID)
+	s.forgetFilms(u.SessionID)
+	// The cookie that tells this device from others stays (see devices.go):
+	// what was learned about the device is about the device, whoever signs
+	// in on it next. It lets nobody in.
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", HttpOnly: true, MaxAge: -1, SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -484,11 +495,14 @@ func (s *Server) handleSupportBundle(w http.ResponseWriter, r *http.Request) {
 	}
 	add("playback-problems.json", problems)
 	add("devices.json", s.deviceReports())
+	// What was learned about each kind of device and about this PC's
+	// speed, and how often films ran into trouble. Kinds and counts only.
+	add("learned.json", s.learnedReport())
 	if f, err := zw.Create("log.txt"); err == nil {
 		f.Write(s.log.tail(512 << 10))
 	}
 	if f, err := zw.Create("README.txt"); err == nil {
-		f.Write([]byte("Local Media support bundle.\r\n\r\nContains: program version, counts of files by type, the names of files that failed to play,\r\nwhat each signed-in browser said it can play (devices.json), and recent log lines with\r\nnetwork addresses and secrets removed.\r\nContains no video, no passwords and no list of your whole library.\r\n\r\nAttach this file to the chat. Do not post it on GitHub.\r\n"))
+		f.Write([]byte("Local Media support bundle.\r\n\r\nContains: program version, counts of files by type, the names of files that failed to play,\r\nwhat each signed-in browser said it can play (devices.json), what the app has learned about\r\neach kind of device and about this PC's speed, with counts of how often films ran into\r\ntrouble (learned.json; kinds of device and kinds of film only, no titles), and recent log\r\nlines with network addresses and secrets removed.\r\nContains no video, no passwords and no list of your whole library.\r\n\r\nAttach this file to the chat. Do not post it on GitHub.\r\n"))
 	}
 }
 

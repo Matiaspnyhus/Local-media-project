@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -20,23 +21,19 @@ import (
 
 // conversion is what the server keeps in memory for converting pictures.
 type conversion struct {
-	// What the converter on this PC was built to do, asked once.
+	// What the converter on this PC was built to do, and which version it
+	// is, asked once.
 	mu      sync.Mutex
 	asked   bool
 	can     hls.Abilities
+	version string
 	retryAt time.Time // after a failed ask: not before this
 
-	// Facts about films' pictures, kept while the program runs, and the
-	// looks at films that are under way.
+	// The looks at films' pictures that are under way. What a look finds
+	// is kept in the database (see pictureFacts).
 	factMu    sync.Mutex
-	facts     map[string]keptFacts  // by file
 	looks     map[string]*factsLook // by file and stamp
 	factSlots chan struct{}
-}
-
-type keptFacts struct {
-	stamp string
-	facts hls.PictureFacts
 }
 
 // factsLook is one look at a film's picture. Every Play of the film while
@@ -54,12 +51,14 @@ const (
 	// factLookLimit is how long one look may take. It takes a moment,
 	// except on a disk that has to wake up first.
 	factLookLimit = 45 * time.Second
-	// maxKeptFacts bounds the memory the kept facts take.
-	maxKeptFacts = 5000
+	// factsForm is part of the stamp kept facts are filed under. Change it
+	// when hls.PictureFacts comes to mean something else or gains a field
+	// a conversion needs: every film is then looked at afresh.
+	factsForm = "f1"
 )
 
 func newConversion() *conversion {
-	return &conversion{facts: map[string]keptFacts{}, looks: map[string]*factsLook{}, factSlots: make(chan struct{}, maxFactLooks)}
+	return &conversion{looks: map[string]*factsLook{}, factSlots: make(chan struct{}, maxFactLooks)}
 }
 
 // abilities says what this PC's converter can do. The converter is asked
@@ -96,6 +95,8 @@ func (s *Server) askConverter(ffmpeg string) {
 		return
 	}
 	c.asked, c.can = true, can
+	// The speed table is filed under the converter's version (speeds.go).
+	c.version = readConverterVersion(ctx, ffmpeg)
 }
 
 // askConverterSoon asks the converter what it can do, in the background, so
@@ -137,21 +138,28 @@ func (s *Server) limits(u *User) playback.Limits {
 
 // pictureFacts returns the facts about a film's picture that converting it
 // starts from (see hls.PictureFacts), looking at the file the first time
-// and keeping the answer for as long as the file stays the same.
+// and keeping the answer in the database for as long as the file stays the
+// same. However many Play calls ask for a film at once, it is looked at
+// once, and only a few films are looked at at a time.
 func (s *Server) pictureFacts(ctx context.Context, fileID, path string, size, mtime int64) (hls.PictureFacts, error) {
 	if s.ffprobe == "" {
 		return hls.PictureFacts{}, errors.New("the file inspector is not installed")
 	}
-	stamp := fmt.Sprintf("%d-%d", size, mtime)
+	stamp := fmt.Sprintf("%d-%d-%s", size, mtime, factsForm)
+	if facts, ok := s.keptFacts(fileID, stamp); ok {
+		return facts, nil
+	}
 	c := s.helpers.convert
 	c.factMu.Lock()
-	if k, ok := c.facts[fileID]; ok && k.stamp == stamp {
-		c.factMu.Unlock()
-		return k.facts, nil
-	}
 	key := fileID + " " + stamp
 	look := c.looks[key]
 	if look == nil {
+		// A look that ended between the question above and this moment
+		// has kept its answer by now (see lookAtPicture).
+		if facts, ok := s.keptFacts(fileID, stamp); ok {
+			c.factMu.Unlock()
+			return facts, nil
+		}
 		if s.ctx.Err() != nil {
 			c.factMu.Unlock()
 			return hls.PictureFacts{}, s.ctx.Err()
@@ -185,16 +193,34 @@ func (s *Server) lookAtPicture(look *factsLook, key, fileID, stamp, path string)
 	case <-s.ctx.Done():
 		look.err = s.ctx.Err()
 	}
+	if look.err == nil {
+		// Kept before the look is taken off the list, so that whoever asks
+		// next finds either the look or what it found.
+		raw, err := json.Marshal(look.facts)
+		if err == nil {
+			_, err = s.db.Exec(`INSERT INTO picture_facts(file_id,stamp,facts) VALUES(?,?,?)
+				ON CONFLICT(file_id) DO UPDATE SET stamp=excluded.stamp, facts=excluded.facts`, fileID, stamp, string(raw))
+		}
+		if err != nil && s.ctx.Err() == nil {
+			s.log.Printf("what was found about a film's picture could not be kept, so the film is looked at again next time: %s", s.pathless(err.Error()))
+		}
+	}
 	c.factMu.Lock()
 	delete(c.looks, key)
-	if look.err == nil {
-		if len(c.facts) >= maxKeptFacts {
-			c.facts = map[string]keptFacts{} // each is found again when next needed
-		}
-		c.facts[fileID] = keptFacts{stamp: stamp, facts: look.facts}
-	}
 	c.factMu.Unlock()
 	close(look.done)
+}
+
+// keptFacts reads what an earlier look found about a file's picture, if the
+// file is still as it was then.
+func (s *Server) keptFacts(fileID, stamp string) (hls.PictureFacts, bool) {
+	var have, raw string
+	var facts hls.PictureFacts
+	if s.db.QueryRow(`SELECT stamp, facts FROM picture_facts WHERE file_id=?`, fileID).Scan(&have, &raw) != nil || have != stamp ||
+		json.Unmarshal([]byte(raw), &facts) != nil {
+		return hls.PictureFacts{}, false
+	}
+	return facts, true
 }
 
 // convertSpec works out how one film's picture is converted for one play:

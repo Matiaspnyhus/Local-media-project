@@ -69,6 +69,13 @@ type helpers struct {
 
 	// convert is what converting pictures needs kept (see convert.go).
 	convert *conversion
+
+	// speeds is how fast this PC converts (see speeds.go), open the films
+	// that devices have open, and trouble the count of what they reported
+	// about them (see trouble.go).
+	speeds  speedBook
+	open    openFilms
+	trouble troubleLog
 }
 
 func newHelpers() *helpers {

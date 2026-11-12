@@ -87,6 +87,7 @@ type Server struct {
 	port       int
 	assets     fs.FS
 	linkKey    []byte
+	deviceKey  []byte // signs the cookie that tells devices apart (see devices.go)
 	setupDone  atomic.Bool
 	limiter    *loginLimiter
 	log        *logger
@@ -112,10 +113,16 @@ type Server struct {
 	convMu     sync.Mutex
 	converting map[string]string
 	helpers    *helpers // shared and limited runs of ffmpeg and ffprobe, see helpers.go
-	ctx        context.Context
-	stop       context.CancelFunc
-	handler    http.Handler
-	routes     []Route
+	// now is the clock that devices, lessons and trouble go by. Tests
+	// replace it, so that a month can pass without anyone waiting.
+	now func() time.Time
+	// testPace, when a test sets it, stands in for the converter's own
+	// measure of how fast a film is being converted (see paceOf).
+	testPace func(token string) (pace float64, chunks int)
+	ctx      context.Context
+	stop     context.CancelFunc
+	handler  http.Handler
+	routes   []Route
 }
 
 type ctxKey int
@@ -128,6 +135,9 @@ type User struct {
 	Name      string
 	Role      string
 	SessionID string
+	// DeviceID is the device the request comes from (see devices.go). It
+	// is "" only where a device could not be noted.
+	DeviceID string
 }
 
 const (
@@ -141,7 +151,7 @@ func New(cfg Config) (*Server, error) {
 	s := &Server{
 		db: cfg.DB, dataDir: cfg.DataDir, version: cfg.Version, port: cfg.Port, assets: cfg.Assets,
 		limiter: newLoginLimiter(), events: &eventLog{}, update: cfg.Update, ffprobe: cfg.FFprobe, caps: map[string]*playback.Caps{},
-		helpers: newHelpers(),
+		helpers: newHelpers(), now: time.Now,
 	}
 	s.ctx, s.stop = context.WithCancel(context.Background())
 	s.newTMDB = metadata.New
@@ -151,6 +161,9 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	if s.linkKey, err = s.loadOrCreateKey("link_key"); err != nil {
+		return nil, err
+	}
+	if s.deviceKey, err = s.loadOrCreateKey("device_key"); err != nil {
 		return nil, err
 	}
 	if cfg.FFmpeg != "" {
@@ -339,7 +352,7 @@ func (s *Server) guard(rt Route) http.HandlerFunc {
 				return
 			}
 		case Session, Owner:
-			u := s.userFromRequest(r)
+			u, seen, label := s.signedIn(r)
 			if u == nil {
 				writeErr(w, http.StatusUnauthorized, "Please sign in.")
 				return
@@ -348,6 +361,9 @@ func (s *Server) guard(rt Route) http.HandlerFunc {
 				writeErr(w, http.StatusForbidden, "Only the owner can do this.")
 				return
 			}
+			// Which device this is comes after who it is, and changes
+			// nothing about what the request may do.
+			s.requestDevice(w, r, u, seen, label)
 			r = r.WithContext(context.WithValue(r.Context(), userKey, u))
 		case SignedLink:
 			// The handler verifies the signature; it needs the route's
@@ -366,21 +382,30 @@ func currentUser(r *http.Request) *User {
 }
 
 func (s *Server) userFromRequest(r *http.Request) *User {
+	u, _, _ := s.signedIn(r)
+	return u
+}
+
+// signedIn finds the user a request's sign-in cookie belongs to, or nil.
+// With it comes what is noted about the device the sign-in was made on
+// (when it was last seen, and what kind it is), for requestDevice.
+func (s *Server) signedIn(r *http.Request) (u *User, deviceSeen sql.NullInt64, deviceLabel sql.NullString) {
 	c, err := r.Cookie(cookieName)
 	if err != nil || c.Value == "" {
-		return nil
+		return nil, deviceSeen, deviceLabel
 	}
-	var u User
+	u = &User{}
 	var created int64
-	err = s.db.QueryRow(`SELECT u.id, u.name, u.role, s.id, s.created_at FROM sessions s JOIN users u ON u.id = s.user_id
-		WHERE s.token_hash = ? AND s.revoked_at IS NULL`, auth.HashToken(c.Value)).Scan(&u.ID, &u.Name, &u.Role, &u.SessionID, &created)
-	if err != nil {
-		return nil
+	var device sql.NullString
+	err = s.db.QueryRow(`SELECT u.id, u.name, u.role, s.id, s.created_at, d.id, d.last_seen_at, d.label
+		FROM sessions s JOIN users u ON u.id = s.user_id LEFT JOIN devices d ON d.id = s.device_id
+		WHERE s.token_hash = ? AND s.revoked_at IS NULL`, auth.HashToken(c.Value)).Scan(&u.ID, &u.Name, &u.Role, &u.SessionID, &created,
+		&device, &deviceSeen, &deviceLabel)
+	if err != nil || signInExpired(created) {
+		return nil, deviceSeen, deviceLabel
 	}
-	if signInExpired(created) {
-		return nil
-	}
-	return &u
+	u.DeviceID = device.String
+	return u, deviceSeen, deviceLabel
 }
 
 // signInExpired reports whether a sign-in made at created (in Unix
@@ -410,8 +435,14 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request, userID str
 	if len(device) > 200 {
 		device = device[:200]
 	}
-	if _, err := s.db.Exec(`INSERT INTO sessions(id, token_hash, user_id, device_name, created_at, last_seen_at) VALUES(?,?,?,?,?,?)`,
-		newID(), hash, userID, device, now, now); err != nil {
+	// The sign-in is noted as made on this device. Should the device not
+	// be noted (the disk is full), signing in still works.
+	on, err := s.signInDevice(w, r)
+	if err != nil {
+		s.log.Printf("a device could not be noted, so nothing learned about it is used for now: %s", s.pathless(err.Error()))
+	}
+	if _, err := s.db.Exec(`INSERT INTO sessions(id, token_hash, user_id, device_name, created_at, last_seen_at, device_id) VALUES(?,?,?,?,?,?,?)`,
+		newID(), hash, userID, device, now, now, on); err != nil {
 		return err
 	}
 	http.SetCookie(w, &http.Cookie{
@@ -511,7 +542,11 @@ func (s *Server) handleAsset(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
 	}
-	if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/stream/") {
+	// Nothing of the app's own lives under these: an address there that
+	// matches no route is a mangled one, and a player that asked for a
+	// list of chunks must not be handed the app's start page as if it
+	// were one.
+	if strings.HasPrefix(r.URL.Path, "/api/") || strings.HasPrefix(r.URL.Path, "/stream/") || strings.HasPrefix(r.URL.Path, "/hls/") {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
 	}
