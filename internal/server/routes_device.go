@@ -7,6 +7,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Matiaspnyhus/Local-media-project/internal/ids"
+	"github.com/Matiaspnyhus/Local-media-project/internal/playback"
 )
 
 // These routes show what was learned about devices (lessons.go) and about
@@ -97,6 +98,21 @@ func (s *Server) handleHDRWrong(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// hdrAsItIs says a film is HDR and reaches the device with its own picture.
+// Which films count as HDR is package playback's business, so it is asked:
+// would the viewer's word that HDR colours look wrong have this film
+// converted to normal colour, on a PC that can do that? The answer is the
+// same on a PC that cannot: there the viewer's word is still kept, for the
+// day the PC can.
+func hdrAsItIs(m playback.Media, c *playback.Caps, w playback.Want, l playback.Limits, p playback.Plan) bool {
+	if p.Playable == playback.No || p.Method == playback.Convert || p.Method == playback.None || len(m.Video) == 0 {
+		return false
+	}
+	l.Convert, l.NoConverter, l.ToneMap, l.DoViTone, l.NoHDR = true, false, true, true, true
+	l.Speed, l.Busy = nil, 0
+	return playback.DecideFor(m, c, w, l).Video.HDRToSDR
 }
 
 // handleDevices lists, for the owner, every device with what was learned

@@ -631,6 +631,10 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	// "lighter" is the setting to ask for ("lower") when the viewer wants
 	// a lighter picture than this one; 0 when none is made.
 	out["lighter"] = playback.Lighter(ft.media, plan)
+	// "hdr" says the film's picture is HDR and is sent as it is, so its
+	// colours are for the device to get right. The page then lets the
+	// viewer say that they look wrong here (see handleHDRWrong).
+	out["hdr"] = hdrAsItIs(ft.media, caps, want, limits, plan)
 	// The place to carry on from is kept in the film's own time. The player
 	// this answer is for gets it on its own clock, and what it reports from
 	// now on is read on that clock (see playerClocks). A film that starts
