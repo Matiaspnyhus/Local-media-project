@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -386,70 +387,23 @@ func sizeName(v Track) string {
 // for every one of them, whatever the answer is; and asking for a lighter
 // picture must never give a better one.
 func TestRulesHoldForEveryCombination(t *testing.T) {
-	combinations, n, failed := 0, 0, 0
+	var mu sync.Mutex // the devices are walked side by side: the decisions share nothing
+	combinations, n := 0, 0
 	answers := map[Method]int{}
-	last := len(surfaces) - 1
-	for dname, base := range newDevices {
-		var shown []*Caps
-		for _, s := range surfaces {
-			shown = append(shown, s.on(base))
-		}
-		for _, cont := range oldContainers {
-			for _, v := range oldVideos {
-				for _, a := range oldAudios {
-					for _, sz := range sizes {
-						for _, col := range colours {
-							// What M3 would have answered depends on none
-							// of what follows.
-							m3 := decideM3(film(cont, v.codec, v.depth, a, sz, col, ""), base, -1)
-							for _, sub := range subtitles {
-								m := film(cont, v.codec, v.depth, a, sz, col, sub.kind)
-								w := Want{Audio: -1, Subtitle: -1, Styled: sub.styled}
-								if sub.kind != "" {
-									w.Subtitle = 0
-								}
-								for si, dev := range shown {
-									if sub.kind == "" && si > 0 {
-										break // without subtitles the surface changes nothing
-									}
-									combinations++
-									for _, pc := range pcs {
-										if !pc.full && si != 0 && si != last {
-											continue
-										}
-										lightest := 0
-										if pc.sweep == si || pc.sweep >= 0 && sub.kind == "" {
-											lightest = NumRungs + 1
-										}
-										before := 0
-										for w.Lower = 0; w.Lower <= lightest; w.Lower++ {
-											p := DecideFor(m, dev, w, pc.l)
-											n++
-											answers[p.Method]++
-											msg := broken(m, dev, w, pc.l, p, m3)
-											if msg == "" && rank(p) < before {
-												msg = "asking for a lighter picture gave a better one"
-											}
-											before = rank(p)
-											if msg != "" {
-												failed++
-												t.Errorf("%s %s/%d %s, %s %s, %s, on %s (%s), %s, lighter=%d -> %s %v: %s", cont, v.codec, v.depth, a, sz.name, col.name,
-													sub.name, dname, surfaces[si].name, pc.name, w.Lower, p.Method, p.Reasons, msg)
-												if failed >= 25 {
-													t.Fatalf("stopping after %d broken rules", failed)
-												}
-											}
-										}
-										w.Lower = 0
-									}
-								}
-							}
-						}
-					}
+	t.Run("devices", func(t *testing.T) {
+		for dname, base := range newDevices {
+			t.Run(dname, func(t *testing.T) {
+				t.Parallel()
+				c, checked, methods := walkDevice(t, dname, base)
+				mu.Lock()
+				defer mu.Unlock()
+				combinations, n = combinations+c, n+checked
+				for method, count := range methods {
+					answers[method] += count
 				}
-			}
+			})
 		}
-	}
+	})
 	for _, method := range []Method{Direct, Remux, Audio, Convert, None} {
 		if answers[method] == 0 {
 			t.Errorf("no combination was answered %q: the table does not reach it", method)
@@ -461,6 +415,75 @@ func TestRulesHoldForEveryCombination(t *testing.T) {
 		t.Errorf("%d combinations walked, want %d", combinations, want)
 	}
 	t.Logf("%d combinations, %d answers checked: %v", combinations, n, answers)
+}
+
+// walkDevice is the part of the table that belongs to one device. It
+// returns how many combinations it walked, how many answers it checked
+// and how they were answered.
+func walkDevice(t *testing.T, dname string, base *Caps) (combinations, n int, answers map[Method]int) {
+	failed := 0
+	answers = map[Method]int{}
+	last := len(surfaces) - 1
+	var shown []*Caps
+	for _, s := range surfaces {
+		shown = append(shown, s.on(base))
+	}
+	for _, cont := range oldContainers {
+		for _, v := range oldVideos {
+			for _, a := range oldAudios {
+				for _, sz := range sizes {
+					for _, col := range colours {
+						// What M3 would have answered depends on none
+						// of what follows.
+						m3 := decideM3(film(cont, v.codec, v.depth, a, sz, col, ""), base, -1)
+						for _, sub := range subtitles {
+							m := film(cont, v.codec, v.depth, a, sz, col, sub.kind)
+							w := Want{Audio: -1, Subtitle: -1, Styled: sub.styled}
+							if sub.kind != "" {
+								w.Subtitle = 0
+							}
+							for si, dev := range shown {
+								if sub.kind == "" && si > 0 {
+									break // without subtitles the surface changes nothing
+								}
+								combinations++
+								for _, pc := range pcs {
+									if !pc.full && si != 0 && si != last {
+										continue
+									}
+									lightest := 0
+									if pc.sweep == si || pc.sweep >= 0 && sub.kind == "" {
+										lightest = NumRungs + 1
+									}
+									before := 0
+									for w.Lower = 0; w.Lower <= lightest; w.Lower++ {
+										p := DecideFor(m, dev, w, pc.l)
+										n++
+										answers[p.Method]++
+										msg := broken(m, dev, w, pc.l, p, m3)
+										if msg == "" && rank(p) < before {
+											msg = "asking for a lighter picture gave a better one"
+										}
+										before = rank(p)
+										if msg != "" {
+											failed++
+											t.Errorf("%s %s/%d %s, %s %s, %s, on %s (%s), %s, lighter=%d -> %s %v: %s", cont, v.codec, v.depth, a, sz.name, col.name,
+												sub.name, dname, surfaces[si].name, pc.name, w.Lower, p.Method, p.Reasons, msg)
+											if failed >= 25 {
+												t.Fatalf("stopping after %d broken rules", failed)
+											}
+										}
+									}
+									w.Lower = 0
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return combinations, n, answers
 }
 
 // The planner never picks a setting this PC was measured too slow for,
