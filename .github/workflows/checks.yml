@@ -32,6 +32,25 @@ jobs:
           echo "all_os=${ALL_OS}" >> "$GITHUB_OUTPUT"
           echo "public=${{ github.event.repository.visibility == 'public' }}" >> "$GITHUB_OUTPUT"
 
+  # Measures how fast the test machine converts pictures with the pinned
+  # converter (see packaging/speed-probe.sh). Only on request: put
+  # [speed-probe] in a commit message.
+  speed-probe:
+    if: contains(github.event.head_commit.message, '[speed-probe]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the pinned converter
+        run: |
+          set -euo pipefail
+          . packaging/ffmpeg.env
+          curl -sSL --retry 3 -o ffmpeg-linux64.tar.xz "$FFMPEG_LINUX64_URL"
+          echo "$FFMPEG_LINUX64_SHA256  ffmpeg-linux64.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/ffmpeg"
+          tar -xJf ffmpeg-linux64.tar.xz -C "$RUNNER_TEMP/ffmpeg"
+      - name: Measure
+        run: bash packaging/speed-probe.sh "$RUNNER_TEMP/ffmpeg/ffmpeg" "$RUNNER_TEMP/probe" 20
+
   linux:
     runs-on: ubuntu-latest
     steps:
