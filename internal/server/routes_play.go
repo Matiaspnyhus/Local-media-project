@@ -239,10 +239,12 @@ const playedFile = ` FROM items i JOIN versions v ON v.item_id=i.id JOIN files f
 // handleChoice remembers the sound and subtitles a viewer picked, so the
 // same film, and the next episode of a show, start the same way.
 //
-// The page says which tracks were picked (audioIndex and subKey). What is
-// kept of them, their language and kind, is read from the server's own
-// record of the file. A page loaded before those two were added sends only
-// two languages and whether subtitles were on, which is kept as it comes.
+// The page says which sound track is playing and which subtitle is showing
+// (audioIndex and subKey), whichever of the two the viewer just changed.
+// What is kept of them, their language and kind, is read from the server's
+// own record of the file. A page loaded before those two were added sends
+// only two languages and whether subtitles were on, which is kept as it
+// comes.
 func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 	itemID := chi.URLParam(r, "id")
 	var in struct {
@@ -276,7 +278,10 @@ func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 				// A pick the file does not have (it changed meanwhile) is
 				// not kept as one; the languages sent with it still are.
 				if m, ok := playback.Remember(ft.media.Audio, ft.subs, *in.AudioIndex, *in.SubKey); ok {
-					mem = m
+					// A subtitle sent along with a change of sound is the one
+					// the app itself had showing, not a pick (see AfterPick).
+					u := currentUser(r).ID
+					mem = playback.AfterPick(ft.media.Audio, ft.subs, s.loadPrefs(u), s.loadMemory(u, scope), m)
 				}
 			}
 		}
@@ -313,7 +318,9 @@ func (s *Server) loadMemory(userID, scope string) *playback.Memory {
 		return nil
 	}
 	m.SubsOn, m.Commentary = on != 0, audioKind == "commentary"
-	if m.SubKind != "" {
+	// A record from an earlier version has neither a kind nor a track. One
+	// with a track and no kind is such a record after a pick of sound alone.
+	if m.SubKind != "" || audioIndex >= 0 {
 		m.Pick = &playback.Pick{Audio: audioIndex, Subtitle: subKey}
 	}
 	return &m

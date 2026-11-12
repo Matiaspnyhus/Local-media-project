@@ -223,7 +223,7 @@ CREATE TABLE device_reports (
 ALTER TABLE track_memory ADD COLUMN audio_index INTEGER NOT NULL DEFAULT -1;  -- the sound track, counted from 0
 ALTER TABLE track_memory ADD COLUMN audio_kind TEXT NOT NULL DEFAULT '';      -- '' ordinary sound, 'commentary'
 ALTER TABLE track_memory ADD COLUMN sub_key TEXT NOT NULL DEFAULT '';         -- the subtitle as the page names it, '' for none
-ALTER TABLE track_memory ADD COLUMN sub_kind TEXT NOT NULL DEFAULT '';        -- 'full', 'described', 'forced' or 'off'
+ALTER TABLE track_memory ADD COLUMN sub_kind TEXT NOT NULL DEFAULT '';        -- 'full', 'described', 'forced', 'off', or 'untouched' (only sound was picked)
 
 -- The four-letter label a file gives each codec ("hvc1", "hev1"). HEVC in
 -- an MP4 plays on Apple devices under the first label and not the second.

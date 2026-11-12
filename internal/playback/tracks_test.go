@@ -72,6 +72,8 @@ func TestChooseSubtitles(t *testing.T) {
 		{"switched on for this show", en, Prefs{AudioLang: "en"}, &Memory{SubsOn: true, SubLang: "no"}, 3},
 		{"switched off for this show, although the sound is foreign", ja, Prefs{AudioLang: "en"}, &Memory{SubsOn: false}, 2},
 		{"switched on for this show although the default is off", en, Prefs{AudioLang: "en", Subs: "off"}, &Memory{SubsOn: true, SubLang: "en"}, 1},
+		{"only the sound was ever picked: the preferences decide", ja, Prefs{AudioLang: "en"}, &Memory{AudioLang: "ja", SubKind: "untouched"}, 1},
+		{"only the sound was ever picked, and the default is off", en, Prefs{AudioLang: "en", Subs: "off"}, &Memory{AudioLang: "en", SubKind: "untouched"}, -1},
 	}
 	for _, c := range cases {
 		if got := Choose([]Track{c.audio}, subs, c.prefs, c.mem).Subtitle; got != c.want {
@@ -222,4 +224,133 @@ func TestThePickItselfIsRemembered(t *testing.T) {
 	if c := next(0, "e1", film, []Subtitle{{Key: "e0", Language: "eng"}}); c.Subtitle != -1 {
 		t.Errorf("forced subtitles were picked, this episode has only full ones: %+v", c)
 	}
+}
+
+// viewer watches a show the way the page lets them: an episode starts with
+// what Choose says, and every pick is sent with the sound track and the
+// subtitle showing at that moment, whichever of the two was changed.
+type viewer struct {
+	t     *testing.T
+	prefs Prefs
+	mem   *Memory // what is kept for the show
+
+	audio []Track
+	subs  []Subtitle
+	sound int    // the sound track playing
+	sub   string // the subtitle showing, "" for none
+}
+
+func (v *viewer) open(audio []Track, subs []Subtitle) {
+	v.audio, v.subs = audio, subs
+	c := Choose(audio, subs, v.prefs, v.mem)
+	v.sound, v.sub = c.Audio, ""
+	if c.Subtitle >= 0 {
+		v.sub = subs[c.Subtitle].Key
+	}
+}
+
+func (v *viewer) send() {
+	v.t.Helper()
+	pick, ok := Remember(v.audio, v.subs, v.sound, v.sub)
+	if !ok {
+		v.t.Fatalf("Remember(%d, %q) refused a pick that exists", v.sound, v.sub)
+	}
+	kept := AfterPick(v.audio, v.subs, v.prefs, v.mem, pick)
+	v.mem = &kept
+}
+
+func (v *viewer) pickSound(i int)       { v.t.Helper(); v.sound = i; v.send() }
+func (v *viewer) pickSubtitle(k string) { v.t.Helper(); v.sub = k; v.send() }
+
+func (v *viewer) expect(when string, sound int, sub string) {
+	v.t.Helper()
+	if v.sound != sound || v.sub != sub {
+		v.t.Errorf("%s: sound %d and subtitle %q, want sound %d and subtitle %q", when, v.sound, v.sub, sound, sub)
+	}
+}
+
+// Changing the sound is not a wish about subtitles: what the app had
+// showing at that moment, or nothing, must not become a rule for the show.
+// Changing the subtitles is such a wish, and stays one.
+func TestAPickOfSoundAloneLeavesTheSubtitlesToThePreferences(t *testing.T) {
+	en51 := Track{Codec: "ac3", Language: "eng", Default: true, Title: "5.1"}
+	enStereo := Track{Codec: "aac", Language: "eng", Title: "Stereo"}
+	ja := Track{Codec: "aac", Language: "jpn"}
+	full := Subtitle{Key: "e0", Language: "eng"}
+	forced := Subtitle{Key: "e1", Language: "eng", Forced: true}
+	twoEnglish := []Track{en51, enStereo}
+
+	// An episode without subtitles; the next has them for its foreign lines.
+	v := &viewer{t: t, prefs: Prefs{AudioLang: "en"}}
+	v.open(twoEnglish, nil)
+	v.pickSound(1)
+	v.open(twoEnglish, []Subtitle{full, forced})
+	v.expect("the sound was changed in an episode without subtitles; the next one", 1, "e1")
+	// Switched off by hand, they stay off, and a change of sound afterwards
+	// does not bring them back.
+	v.pickSubtitle("")
+	v.pickSound(0)
+	v.open(twoEnglish, []Subtitle{full, forced})
+	v.expect("subtitles were switched off by hand, then the sound changed; the next episode", 0, "")
+
+	// A viewer who always wants subtitles, an episode with only the
+	// foreign-lines kind (shown for want of better), then one with both.
+	v = &viewer{t: t, prefs: Prefs{AudioLang: "en", Subs: "always"}}
+	v.open(twoEnglish, []Subtitle{{Key: "e0", Language: "eng", Forced: true}})
+	v.expect("always, only forced subtitles here", 0, "e0")
+	v.pickSound(1)
+	v.open(twoEnglish, []Subtitle{full, forced})
+	v.expect("always, the sound was changed while forced subtitles were the stand-in; the next episode", 1, "e0")
+	// Picked by hand, the foreign-lines kind is a wish like any other.
+	v.pickSubtitle("e1")
+	v.open(twoEnglish, []Subtitle{full, forced})
+	v.expect("always, forced subtitles picked by hand; the next episode", 1, "e1")
+
+	// To the Japanese sound and back. The page goes on showing what the
+	// app chose for the English sound, which is not what it would choose
+	// for the Japanese one; neither change is a wish about subtitles.
+	v = &viewer{t: t, prefs: Prefs{AudioLang: "en"}}
+	dub := []Track{en51, ja}
+	v.open(dub, []Subtitle{full})
+	v.expect("an English dub, nothing picked yet", 0, "")
+	v.pickSound(1)
+	v.pickSound(0)
+	if v.mem.SubKind != "untouched" {
+		t.Errorf("to the Japanese sound and back: subtitles were kept as %q although they were never touched", v.mem.SubKind)
+	}
+	v.open(dub, []Subtitle{full, forced})
+	v.expect("to the Japanese sound and back; the next episode", 0, "e1")
+	// Left on the Japanese sound, the app gives it subtitles next time.
+	v.pickSound(1)
+	v.open(dub, []Subtitle{full, forced})
+	v.expect("left on the Japanese sound; the next episode", 1, "e0")
+
+	// Subtitles picked first, then the sound changed: the pick is kept,
+	// with the very track it was.
+	v = &viewer{t: t, prefs: Prefs{AudioLang: "en"}}
+	two := []Subtitle{full, forced, {Key: "e2", Language: "eng", Title: "Songs too"}}
+	v.open(twoEnglish, two)
+	v.pickSubtitle("e2")
+	v.pickSound(1)
+	v.open(twoEnglish, two)
+	v.expect("full subtitles picked, then the sound changed; the same film again", 1, "e2")
+
+	// Both changed in one message (the page never does, another app may).
+	v = &viewer{t: t, prefs: Prefs{AudioLang: "en"}}
+	v.open(twoEnglish, []Subtitle{full, forced})
+	v.sound, v.sub = 1, ""
+	v.send()
+	v.open(twoEnglish, []Subtitle{full, forced})
+	v.expect("stereo and no subtitles sent together; the same film again", 1, "")
+
+	// What an earlier version kept (languages, and subtitles "not on") is
+	// left as it was by a change of sound.
+	v = &viewer{t: t, prefs: Prefs{AudioLang: "en"}, mem: &Memory{AudioLang: "en"}}
+	v.open(twoEnglish, nil)
+	v.pickSound(1)
+	if v.mem.SubKind != "" || v.mem.Pick == nil || v.mem.Pick.Audio != 1 {
+		t.Errorf("an earlier record after a change of sound: %+v, pick %+v", *v.mem, v.mem.Pick)
+	}
+	v.open(twoEnglish, []Subtitle{full, forced})
+	v.expect("an earlier record, the sound changed in an episode without subtitles; the next one", 1, "e1")
 }

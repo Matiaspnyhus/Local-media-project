@@ -235,6 +235,108 @@ func TestAChoiceCarriesToTheNextEpisode(t *testing.T) {
 	}
 }
 
+// setTracks records, as the inspector would, what is inside an episode's
+// file. rows are as for filmWith.
+func (e trackEnv) setTracks(t *testing.T, item string, rows ...string) {
+	t.Helper()
+	var fileID string
+	e.s.db.QueryRow(`SELECT f.id FROM files f JOIN versions v ON v.id=f.version_id WHERE v.item_id=?`, item).Scan(&fileID)
+	e.s.db.Exec(`UPDATE files SET probed=1, container='matroska', duration_ms=1400000 WHERE id=?`, fileID)
+	for _, row := range rows {
+		if _, err := e.s.db.Exec(`INSERT INTO streams(file_id,idx,kind,codec,is_default,is_forced,is_commentary,is_hearing_impaired,language,title) VALUES(?,`+row+`)`, fileID); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// The page sends the sound track and the subtitle that is showing with
+// every pick, also when the viewer only changed the sound. The subtitle is
+// then whatever the app itself had switched on, or nothing, and must not
+// become a wish of the viewer's for the rest of the show.
+func TestChangingOnlyTheSoundIsNotASubtitleChoice(t *testing.T) {
+	const (
+		picture  = `0,'video','h264',1,0,0,0,'',''`
+		surround = `1,'audio','aac',1,0,0,0,'eng','5.1'`
+		stereo   = `2,'audio','aac',0,0,0,0,'eng','Stereo'`
+	)
+	start := func(subs string) (trackEnv, func(n int) string) {
+		env, c := showEnv(t)
+		e := trackEnv{env: env, c: c}
+		e.pretendConverter(t)
+		e.do("POST", "/api/capabilities", remote, c, map[string]any{"containers": map[string]bool{"mp4": true, "matroska": true},
+			"video": map[string]bool{"h264": true}, "audio": map[string]bool{"aac": true}, "hls": true})
+		e.do("PUT", "/api/prefs", remote, c, map[string]string{"audioLang": "en", "subLang": "", "subs": subs})
+		return e, func(n int) string { return env.episode(c, "Good Show", 1, n).ID }
+	}
+
+	// Episode 1 has no subtitles at all, episode 2 has the kind that only
+	// covers its foreign lines. The viewer switches episode 1 to stereo.
+	e, ep := start("auto")
+	e.setTracks(t, ep(1), picture, surround, stereo)
+	e.setTracks(t, ep(2), picture, surround, stereo, `3,'subtitle','subrip',0,1,0,0,'eng',''`)
+	if a, s := selected(e.playItem(t, ep(2))); a != 0 || s != "e0" {
+		t.Fatalf("episode 2 before any pick: sound %d, subtitle %q", a, s)
+	}
+	e.choose(t, ep(1), map[string]any{"audioLang": "en", "subLang": "", "subsOn": false, "audioIndex": 1, "subKey": ""})
+	if a, s := selected(e.playItem(t, ep(2))); a != 1 || s != "e0" {
+		t.Errorf("after only the sound was changed in an episode without subtitles, episode 2 starts with sound %d and subtitle %q; want the stereo sound, and its foreign lines still translated", a, s)
+	}
+	// Switching the subtitles off by hand is a choice, and does carry over.
+	e.choose(t, ep(2), map[string]any{"audioLang": "en", "subLang": "", "subsOn": false, "audioIndex": 1, "subKey": ""})
+	if a, s := selected(e.playItem(t, ep(2))); a != 1 || s != "" {
+		t.Errorf("after the subtitles were switched off by hand: sound %d, subtitle %q", a, s)
+	}
+
+	// A viewer who always wants subtitles. Episode 1 has only the
+	// foreign-lines kind, which the app shows for want of better; episode 2
+	// has full ones too. The viewer switches episode 1 to stereo.
+	e, ep = start("always")
+	e.setTracks(t, ep(1), picture, surround, stereo, `3,'subtitle','subrip',0,1,0,0,'eng',''`)
+	e.setTracks(t, ep(2), picture, surround, stereo, `3,'subtitle','subrip',0,0,0,0,'eng',''`, `4,'subtitle','subrip',0,1,0,0,'eng',''`)
+	if _, s := selected(e.playItem(t, ep(1))); s != "e0" {
+		t.Fatalf("episode 1 before any pick: subtitle %q", s)
+	}
+	if _, s := selected(e.playItem(t, ep(2))); s != "e0" {
+		t.Fatalf("episode 2 before any pick: subtitle %q", s)
+	}
+	e.choose(t, ep(1), map[string]any{"audioLang": "en", "subLang": "en", "subsOn": true, "audioIndex": 1, "subKey": "e0"})
+	if a, s := selected(e.playItem(t, ep(1))); a != 1 || s != "e0" {
+		t.Errorf("episode 1 again: sound %d, subtitle %q", a, s)
+	}
+	if a, s := selected(e.playItem(t, ep(2))); a != 1 || s != "e0" {
+		t.Errorf("after only the sound was changed, episode 2 starts with sound %d and subtitle %q; the viewer always wants subtitles and never touched them, so want the full ones (e0)", a, s)
+	}
+	// Picking the foreign-lines kind by hand in episode 2 is a choice.
+	e.choose(t, ep(2), map[string]any{"audioLang": "en", "subLang": "en", "subsOn": true, "audioIndex": 1, "subKey": "e1"})
+	if a, s := selected(e.playItem(t, ep(2))); a != 1 || s != "e1" {
+		t.Errorf("after the foreign-lines subtitles were picked by hand: sound %d, subtitle %q", a, s)
+	}
+}
+
+// A record an earlier version wrote holds only languages and whether
+// subtitles were on. A sound pick made now must keep that, and still be
+// remembered as the track it was.
+func TestASoundPickKeepsWhatAnEarlierVersionRemembered(t *testing.T) {
+	e := filmWith(t, []string{`0,'video','h264',1,0,0,0,'',''`,
+		`1,'audio','aac',1,0,0,0,'eng','Surround'`, `2,'audio','aac',0,0,0,0,'eng','Stereo'`,
+		`3,'subtitle','subrip',0,0,0,0,'eng',''`, `4,'subtitle','subrip',0,0,0,0,'nor',''`}, nil)
+	e.pretendConverter(t)
+	// As a page from before the update sent it: Norwegian subtitles, on.
+	e.choose(t, e.film, map[string]any{"audioLang": "en", "subLang": "no", "subsOn": true})
+	if a, s := selected(e.play(t)); a != 0 || s != "e1" {
+		t.Fatalf("from the earlier record: sound %d, subtitle %q", a, s)
+	}
+	e.choose(t, e.film, map[string]any{"audioLang": "en", "subLang": "no", "subsOn": true, "audioIndex": 1, "subKey": "e1"})
+	if a, s := selected(e.play(t)); a != 1 || s != "e1" {
+		t.Errorf("after the sound was changed: sound %d, subtitle %q; want the stereo sound and the Norwegian subtitles", a, s)
+	}
+	var kind string
+	e.s.db.QueryRow(`SELECT sub_kind FROM track_memory`).Scan(&kind)
+	if kind != "" {
+		t.Errorf("the earlier record's subtitles were rewritten as %q although only the sound was changed", kind)
+	}
+}
+
 // A file found to be WebM plays in a browser that plays WebM and not MKV
 // (Firefox, Safari), and is sent as WebM even when it is named .mkv.
 func TestAWebMFilePlaysWhereMKVDoesNot(t *testing.T) {
