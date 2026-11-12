@@ -220,8 +220,13 @@ func TestTheOrderOfVersions(t *testing.T) {
 	plan := func(a playback.Answer, m playback.Method) playback.Plan { return playback.Plan{Playable: a, Method: m} }
 	inOrder := []*version{
 		{rel: "direct, 4K", plan: plan(playback.Yes, playback.Direct), pixels: 3840 * 2160, size: 10},
-		{rel: "direct, 1080p, bigger file", plan: plan(playback.Yes, playback.Direct), pixels: 1920 * 1080, size: 30},
-		{rel: "direct, 1080p, smaller file", plan: plan(playback.Yes, playback.Direct), pixels: 1920 * 1080, size: 20},
+		// These two differ in the size of the file alone. Their names are in
+		// the other order, so that it is the size that is seen to decide.
+		{rel: "direct, 1080p, the larger file", plan: plan(playback.Yes, playback.Direct), pixels: 1920 * 1080, size: 30},
+		{rel: "direct, 1080p, a smaller file", plan: plan(playback.Yes, playback.Direct), pixels: 1920 * 1080, size: 20},
+		// And these two in nothing but their names.
+		{rel: "direct, 720p, copy 1", plan: plan(playback.Yes, playback.Direct), pixels: 1280 * 720, size: 20},
+		{rel: "direct, 720p, copy 2", plan: plan(playback.Yes, playback.Direct), pixels: 1280 * 720, size: 20},
 		{rel: "repackaged", plan: plan(playback.Yes, playback.Remux), pixels: 3840 * 2160, size: 90},
 		{rel: "sound converted", plan: plan(playback.Yes, playback.Audio), pixels: 3840 * 2160, size: 90},
 		{rel: "picture converted", plan: plan(playback.Yes, playback.Convert), pixels: 3840 * 2160, size: 90},

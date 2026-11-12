@@ -550,3 +550,53 @@ func TestWhichEncodingASubtitleFileIsIn(t *testing.T) {
 		t.Error("text with one zero byte in it was taken for two bytes a letter")
 	}
 }
+
+// The first version kept every subtitle ffmpeg had made, the ones that had
+// lost lines among them, and a kept copy is served for good. Copies are
+// kept under another name now (see keptName), so that none of those is
+// used again: each subtitle is made afresh once.
+func TestSubtitlesKeptByTheFirstVersionAreMadeAfresh(t *testing.T) {
+	e := filmWith(t, []string{`0,'video','h264',1,0,0,0,'',''`, `1,'audio','aac',1,0,0,0,'eng',''`, `2,'subtitle','subrip',0,0,0,0,'eng',''`},
+		map[string]string{"Track Film (2019).no.ass": styledFile})
+	subs := e.play(t).Subtitles
+	if len(subs) != 2 {
+		t.Fatalf("subtitles: %+v", subs)
+	}
+	var size, mtime int64
+	e.s.db.QueryRow(`SELECT size, mtime FROM files WHERE id=?`, e.fileID).Scan(&size, &mtime)
+	var rel string
+	e.s.db.QueryRow(`SELECT rel_path FROM sidecars WHERE file_id=?`, e.fileID).Scan(&rel)
+	beside, err := os.Stat(filepath.Join(e.media, filepath.FromSlash(rel)))
+	if err != nil || size == 0 || mtime == 0 {
+		t.Fatalf("the film (%d bytes, changed at %d) or the file beside it (%q) was not found: %v", size, mtime, rel, err)
+	}
+	// What the first version would have left behind: for a track inside the
+	// film, the film's id, the track, the film's size and date; for a file
+	// beside it, the same with that file's date and without a size. And, to
+	// be sure, each name in the other's form.
+	dir := filepath.Join(e.s.dataDir, "cache", "subtitles")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const old = "WEBVTT\n\n00:01.000 --> 00:02.000\nKept by the first version\n\n"
+	key := sidecarKey(rel)
+	for _, name := range []string{
+		fmt.Sprintf("%s-e0-%d-%d", e.fileID, size, mtime),
+		fmt.Sprintf("%s-e0-%d", e.fileID, mtime),
+		fmt.Sprintf("%s-%s-%d", e.fileID, key, beside.ModTime().Unix()),
+		fmt.Sprintf("%s-%s-%d-%d", e.fileID, key, beside.Size(), beside.ModTime().Unix()),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name+".vtt"), []byte(old), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.s.ffmpeg = script(t, `printf 'WEBVTT\n\n00:01.000 --> 00:02.000\nMade afresh\n\n'`)
+	for _, s := range subs {
+		for _, when := range []string{"the first time", "the second time"} {
+			w := e.do("GET", s.URL, remote, e.c, nil)
+			if w.Code != 200 || !strings.Contains(w.Body.String(), "Made afresh") || strings.Contains(w.Body.String(), "Kept by the first version") {
+				t.Errorf("subtitle %s, %s: answered %d %q; want it made afresh, not the copy the first version kept", s.Key, when, w.Code, w.Body)
+			}
+		}
+	}
+}
