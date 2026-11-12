@@ -388,12 +388,19 @@ func TestThePageKnowsEveryFieldOfTheDecision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// On Windows the file may have been checked out with the line endings
+	// Windows uses.
+	src = bytes.ReplaceAll(src, []byte("\r\n"), []byte("\n"))
 	start := bytes.Index(src, []byte("export interface PlayPlan {"))
 	if start < 0 {
 		t.Fatal("web/src/api.ts has no PlayPlan")
 	}
 	block := src[start:]
-	block = block[:bytes.Index(block, []byte("\n}\n"))]
+	end := bytes.Index(block, []byte("\n}\n"))
+	if end < 0 {
+		t.Fatal("PlayPlan in web/src/api.ts has no end")
+	}
+	block = block[:end]
 	known := map[string]bool{}
 	for _, m := range regexp.MustCompile(`(?m)^\s+(\w+)\??:`).FindAllSubmatch(block, -1) {
 		known[string(m[1])] = true
