@@ -105,8 +105,8 @@ async function playsBeyond(page, beyond, why) {
 // sends. "stop" is the request to stop converting a film, with only the
 // time it was sent: it is sent so as to outlive the page, and a test is not
 // told when such a request is answered. "old" is the film that was already
-// playing, "new1" and "new2" the films the PC opened for the first and the
-// second "open".
+// playing, "new1", "new2" and so on the films the PC opened for the first
+// "open", the second and so on.
 async function record(page) {
   const t0 = Date.now()
   const asked = []
@@ -160,13 +160,10 @@ async function record(page) {
     }
     const lists = asked.filter((e) => e.what === 'index.m3u8')
     return {
-      // Whether the PC's answer to the first pick was back before the
-      // second pick went out. The page takes a different path for each.
-      firstAnswerFirst: opens.length > 1 && opens[0].ms !== undefined && opens[0].at + opens[0].ms <= opens[1].at,
       lists: lists.length,
       films: new Set(lists.map((e) => e.film)).size,
-      player: went.slice(0, 60).join(' ') || '(nothing)',
-      asked: asked.slice(0, 60).map(one).join(' ') || '(nothing)',
+      player: went.slice(0, 90).join(' ') || '(nothing)',
+      asked: asked.slice(0, 90).map(one).join(' ') || '(nothing)',
     }
   }
 }
@@ -498,11 +495,10 @@ try {
   await step('changing the sound twice in a row keeps the place in the film, and the subtitles', async () => {
     const subtitles = await page.inputValue('[data-testid=pick-subtitles]')
     // In Safari's engine this step once took 15 seconds where 4 are usual,
-    // and nothing said which of its three waits that was, or why. Until
-    // that is known a record is kept and printed, whether the step passes
-    // or fails: how long each wait took, which way round the PC's first
-    // answer and the second pick fell, what the player went through and
-    // what it fetched.
+    // and nothing said which of its waits that was, or why. Until that is
+    // known a record is kept and printed, whether the step passes or fails:
+    // how long each wait took, what the player went through and what it
+    // fetched.
     const waits = []
     let since = Date.now()
     const waited = (what) => {
@@ -510,38 +506,63 @@ try {
       since = Date.now()
     }
     const recorded = await record(page)
-    try {
-      await page.evaluate(() => (document.querySelector('video').currentTime = 60))
-      await playsBeyond(page, 60.5, 'a jump to one minute')
-      waited('for the jump')
+    // Picks twice and checks the film plays on from where it was, with the
+    // sound picked last.
+    const twice = async (how, last, pick) => {
       const place = await page.evaluate(() => document.querySelector('video').currentTime)
-      // Not with the keyboard for once: until the PC answers, the list goes
-      // back to the track that is playing, so two key presses cannot be aimed
-      // at the third track. The second pick follows the first at once; the
-      // PC's answer to the first may or may not be back by then.
       since = Date.now()
-      await page.selectOption('[data-testid=pick-sound]', '1')
-      await page.selectOption('[data-testid=pick-sound]', '2')
-      await playsBeyond(page, place + 0.5, 'after two changes of sound')
-      waited('to play on after the two picks')
+      await pick()
+      await playsBeyond(page, place + 0.5, `after two changes of sound, ${how}`)
+      waited(`to play on with ${how}`)
       const v = await page.evaluate(() => {
         const el = document.querySelector('video')
         return { at: el.currentTime, sound: document.querySelector('[data-testid=pick-sound]').value, method: el.dataset.method }
       })
-      assert.ok(v.at < place + 15, `the film was at ${place} s and is now at ${v.at} s`)
-      assert.equal(v.sound, '2', 'the list shows the sound track picked last')
+      assert.ok(v.at < place + 15, `${how}: the film was at ${place} s and is now at ${v.at} s`)
+      assert.equal(v.sound, last, `${how}: the list shows the sound track picked last`)
       // The PC opened the film once for each pick. The one that was not used
       // must be closed again, leaving the one that is playing.
-      since = Date.now()
       for (let i = 0; (await converters()) !== 1; i++) {
-        assert.ok(i < 50, `${await converters()} films are held open for conversion 5 seconds after changing the sound; one is playing`)
+        assert.ok(i < 50, `${how}: ${await converters()} films are held open for conversion 5 seconds after changing the sound; one is playing`)
         await new Promise((r) => setTimeout(r, 100))
       }
       waited('for the film not used to be closed')
-      console.log(`      (was at ${place.toFixed(2)} s, plays on at ${v.at.toFixed(2)} s by method ${v.method})`)
+      console.log(`      (${how}: was at ${place.toFixed(2)} s, plays on at ${v.at.toFixed(2)} s by method ${v.method})`)
+    }
+    try {
+      await page.evaluate(() => (document.querySelector('video').currentTime = 60))
+      await playsBeyond(page, 60.5, 'a jump to one minute')
+      waited('for the jump')
+      // The PC answers each pick by opening the film afresh. Its answer to
+      // the first pick can come after the second pick or before it, and the
+      // page has a different job in each case, so both are tried. Left to
+      // chance, the same one came up nearly every time.
+      //
+      // First the second pick before the PC can have answered: the first
+      // answer must then be left unused, and the film it opened closed. Not
+      // with the keyboard for once: until the PC answers, the list goes
+      // back to the track that is playing, so two key presses cannot be
+      // aimed at the third track, nor be sure to beat the answer.
+      await twice('the second pick ahead of the first answer', '2', () => page.evaluate(() => {
+        const list = document.querySelector('[data-testid=pick-sound]')
+        for (const track of ['1', '2']) {
+          list.value = track
+          list.dispatchEvent(new Event('change', { bubbles: true }))
+        }
+      }))
+      // Then the second pick as soon as the first answer is in use (the list
+      // then shows the first pick): the player is starting afresh at that
+      // moment and its clock reads nothing.
+      await twice('the second pick just after the first answer', '0', async () => {
+        const answer = page.waitForResponse((res) => /\/api\/items\/[^/]+\/play$/.test(res.url()))
+        await page.selectOption('[data-testid=pick-sound]', '1')
+        await answer
+        await page.waitForFunction(() => document.querySelector('[data-testid=pick-sound]').value === '1', null, { timeout: 10000 })
+        await page.selectOption('[data-testid=pick-sound]', '0')
+      })
     } finally {
       const r = await recorded()
-      console.log(`      (waited ${waits.join(', ') || 'for nothing yet'}; the PC's first answer was back before the second pick: ${r.firstAnswerFirst ? 'yes' : 'no'}; lists of chunks asked for: ${r.lists}, for ${r.films} ${r.films === 1 ? 'film' : 'films'})`)
+      console.log(`      (waited ${waits.join(', ') || 'for nothing yet'}; lists of chunks asked for: ${r.lists}, for ${r.films} ${r.films === 1 ? 'film' : 'films'})`)
       console.log(`      (the player, with milliseconds since the step began: ${r.player})`)
       console.log(`      (asked of the PC, from when to when: ${r.asked})`)
     }
