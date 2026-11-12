@@ -4,6 +4,9 @@ package main
 
 import (
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 	"unsafe"
@@ -63,5 +66,58 @@ func watchProcess(t *testing.T, pid int) func(limit time.Duration) bool {
 	return func(limit time.Duration) bool {
 		event, err := windows.WaitForSingleObject(p, uint32(limit.Milliseconds()))
 		return err == nil && event == windows.WAIT_OBJECT_0
+	}
+}
+
+// Every ending the program can catch (Quit from the icon beside the clock,
+// the hand-over to a new version) finishes by ending whatever helpers are
+// left, and an update swaps ffmpeg.exe and ffprobe.exe straight after. A
+// test cannot ask a program without a console to stop, so this one does
+// the tying and the ending itself: a stand-in helper is started by this
+// test program, tied to it the way the program ties its helpers, and must
+// be gone once the program's way out has run.
+func TestTheWayOutStopsTheHelpersThatWereTied(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	helper := exec.Command(self)
+	helper.Env = append(os.Environ(), standInEnv+"="+dir)
+	if err := helper.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() { helper.Wait(); close(exited) }()
+	t.Cleanup(func() {
+		helper.Process.Kill()
+		<-exited
+	})
+
+	tie := tieHelpers(self)
+	if tie == nil {
+		t.Fatal("Windows would not make the group that helpers are tied in")
+	}
+	defer tie.end()
+	// The stand-in says so itself once it finds that it is in the group.
+	tied := filepath.Join(dir, "tied-"+strconv.Itoa(helper.Process.Pid))
+	for deadline := time.Now().Add(60 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		if _, err := os.Stat(tied); err == nil {
+			break
+		}
+		select {
+		case <-exited:
+			t.Fatal("the stand-in helper stopped by itself")
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the helper was never tied to the program (waited 60 seconds)")
+		}
+	}
+	tie.end()
+	select {
+	case <-exited:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the program's way out has run, but the helper it had tied is still running 20 seconds later")
 	}
 }
