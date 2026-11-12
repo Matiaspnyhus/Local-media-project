@@ -444,8 +444,13 @@ func (s *Server) takeOver(from, sessionID, itemID string) takenOver {
 	if !ids.Valid(from) {
 		return takenOver{}
 	}
-	f, known, _ := s.filmOf(from, sessionID)
+	f, known, open := s.filmOf(from, sessionID)
 	if !known || f.item != itemID {
+		return takenOver{}
+	}
+	// A film that was closed a while ago is not being replaced by this
+	// play: this is the viewer coming back to the film later.
+	if !open && !f.closed.IsZero() && s.now().Sub(f.closed) > handover {
 		return takenOver{}
 	}
 	return takenOver{steps: f.taken, noSubs: f.noSubs}

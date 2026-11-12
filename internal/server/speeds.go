@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"os/exec"
 	"regexp"
@@ -204,6 +205,9 @@ func (s *Server) speeds(encoder string) playback.Speeds {
 // calls with its results. What real plays have shown stays, and goes on
 // lowering the new figures until it is 30 days old.
 func (s *Server) setMeasuredSpeeds(encoder string, measured playback.Speeds) error {
+	if s.hls == nil {
+		return errors.New("this PC has no converter to keep speeds for")
+	}
 	book, done := s.openSpeedBook()
 	defer done()
 	kept := playback.Speeds{}
@@ -228,7 +232,7 @@ func (s *Server) setMeasuredSpeeds(encoder string, measured playback.Speeds) err
 // while the PC was converting more than this one picture (see
 // playback.SpeedLesson).
 func (s *Server) sawSpeed(l playback.SpeedLesson) bool {
-	if !(l.Speed > 0) || math.IsInf(l.Speed, 0) || l.Rung < 1 || l.Rung > playback.NumRungs || speedClasses[l.Class] == "" {
+	if s.hls == nil || !(l.Speed > 0) || math.IsInf(l.Speed, 0) || l.Rung < 1 || l.Rung > playback.NumRungs || speedClasses[l.Class] == "" {
 		return false
 	}
 	book, done := s.openSpeedBook()
@@ -242,7 +246,9 @@ func (s *Server) sawSpeed(l playback.SpeedLesson) bool {
 		t.Seen = map[playback.Class][playback.NumRungs]seenSpeed{}
 	}
 	row := t.Seen[l.Class]
-	row[l.Rung-1] = seenSpeed{Speed: math.Round(l.Speed*100) / 100, At: now}
+	// Kept with two decimals, cut off rather than rounded: a speed just
+	// under the film's own must not be written down as having reached it.
+	row[l.Rung-1] = seenSpeed{Speed: math.Floor(l.Speed*100) / 100, At: now}
 	if !(row[l.Rung-1].Speed > 0) {
 		row[l.Rung-1].Speed = 0.01 // slower than can be written: still a speed, not "never seen"
 	}
@@ -263,7 +269,6 @@ func (s *Server) speedLessons() []lessonView {
 	book, done := s.openSpeedBook()
 	defer done()
 	now := s.now().Unix()
-	ladder := playback.Ladder()
 	for _, encoder := range sortedKeys(book.byEncoder) {
 		t := book.byEncoder[encoder]
 		if t == nil {
@@ -276,13 +281,13 @@ func (s *Server) speedLessons() []lessonView {
 				}
 				with := ""
 				if encoder != softwareEncoder {
-					with = " with the graphics card"
+					with = ", with the graphics card"
 				}
 				out = append(out, lessonView{
 					ID: encoder + "." + string(class) + "." + strconv.Itoa(i+1), Kind: "speed",
-					Text: "While a film played, this PC converted " + speedClasses[class] + " to " + strconv.Itoa(ladder[i].Height) + "p (setting " +
-						strconv.Itoa(i+1) + " of " + strconv.Itoa(playback.NumRungs) + ")" + with + " at only " + oneDecimal(v.Speed) +
-						" seconds of film a second, so a lighter picture is picked for such films.",
+					Text: "While a film played, this PC converted only " + oneDecimal(v.Speed) + " seconds of it each second (" + speedClasses[class] +
+						", at setting " + strconv.Itoa(i+1) + " of " + strconv.Itoa(playback.NumRungs) + with +
+						"), so a lighter setting is picked for such films.",
 					LearnedAt: stamp(v.At), ExpiresAt: stamp(v.At + int64(seenLife.Seconds())),
 				})
 			}
