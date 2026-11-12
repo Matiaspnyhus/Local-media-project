@@ -1,6 +1,7 @@
 // Package hls repackages a file into short chunks as it is watched, and
-// when asked converts its sound on the way. It runs ffmpeg, a separate
-// program, and never more of it than the viewer needs:
+// when asked converts its sound, or its picture and its sound, on the way.
+// It runs ffmpeg, a separate program, and never more of it than the viewer
+// needs:
 //
 //   - The viewer's player is given the whole film's list of chunks at once,
 //     so it can show the full timeline and jump anywhere.
@@ -11,6 +12,11 @@
 //     so a chunk holds the same part of the film however ffmpeg got there.
 //   - When nobody has asked for anything for a while, ffmpeg is stopped and
 //     its chunks deleted. Asking again starts it again.
+//
+// A picture that is passed on untouched can only be cut at its own key
+// frames, so those are found first (see FindCuts). A picture that is
+// converted is cut wherever the converter is told to put a key frame: on an
+// even row of cuts worked out by arithmetic (see Lattice and Convert).
 //
 // Every ffmpeg command line is built here from typed values. Nothing a
 // client sends is ever part of one.
@@ -59,6 +65,10 @@ type Spec struct {
 	AudioCopy  bool   // pass the sound through untouched, or convert it to stereo AAC
 	AudioCodec string // the chosen sound track's codec, as ffprobe names it; matters when it is passed through
 	Owner      string // the sign-in this session belongs to
+	// Convert, when not nil, has the picture converted as well, and says
+	// how. Grid is then the lattice that came with it (see Lattice), and
+	// VideoCodec does not matter.
+	Convert *Convert
 }
 
 // Manager owns every running conversion.
@@ -72,6 +82,12 @@ type Manager struct {
 	// before it is made to wait, and Behind how many already-watched chunks
 	// are kept. Together they bound the disk space one viewer uses.
 	Ahead, Behind int
+	// ConvertAhead and ConvertBehind are the same two bounds for a film
+	// whose picture is converted, in seconds of film: its chunks are
+	// shorter, and how long they are differs from film to film. They are
+	// tighter, because every second made ahead of the viewer costs the PC
+	// real work that is wasted if the viewer jumps or stops.
+	ConvertAhead, ConvertBehind int
 	// ReadRate is how many times faster than playback ffmpeg may read, and
 	// Burst how many seconds it may read at full speed first.
 	ReadRate, Burst int
@@ -124,6 +140,29 @@ type session struct {
 	// run. Later runs are made to agree with it: see slice.
 	edit   int64
 	edited bool
+	// pace is how fast the picture is being converted (see Manager.Pace).
+	pace pacer
+}
+
+// A converted picture's bounds are kept in seconds, and here turned into
+// numbers of chunks for the session's own step. For an untouched picture
+// the numbers are the manager's, as they always were.
+
+// ahead is how many chunks past the last one asked for ffmpeg may get
+// before it is made to wait.
+func (m *Manager) ahead(s *session) int {
+	if c := s.spec.Convert; c != nil {
+		return max(1, m.ConvertAhead/int(max(c.step(), 1)))
+	}
+	return m.Ahead
+}
+
+// behind is how many chunks the viewer has already had are kept.
+func (m *Manager) behind(s *session) int {
+	if c := s.spec.Convert; c != nil {
+		return max(1, m.ConvertBehind/int(max(c.step(), 1)))
+	}
+	return m.Behind
 }
 
 // run is one ffmpeg process and the chunks cut from its output.
@@ -140,6 +179,10 @@ type run struct {
 	stopped sync.Once
 	exited  chan struct{} // closed when ffmpeg is gone and its output read
 	stderr  *tail
+	// why is set when the run was ended here, by the cutter, because a
+	// converted picture did not come out where the list says (see
+	// ErrLeftLattice). ffmpeg itself has then said nothing.
+	why error
 }
 
 func (r *run) alive() bool {
@@ -178,7 +221,7 @@ func New(ffmpeg, root string) (*Manager, error) {
 		return nil, err
 	}
 	m := &Manager{ffmpeg: ffmpeg, root: root, IdleStop: 75 * time.Second, Forget: 12 * time.Hour,
-		Ahead: 50, Behind: 20, ReadRate: 8, Burst: 60,
+		Ahead: 50, Behind: 20, ConvertAhead: 120, ConvertBehind: 60, ReadRate: 8, Burst: 60,
 		Log: func(string, ...any) {}, sessions: map[string]*session{}, live: map[*run]struct{}{}, stop: make(chan struct{})}
 	m.done.Add(1)
 	go m.janitor()
@@ -225,9 +268,11 @@ func (m *Manager) end(token string, s *session) {
 // Open registers a session and returns its token: a random value that is
 // the only way to reach the session's chunks.
 func (m *Manager) Open(spec Spec) string {
-	if !spec.Grid.Valid() {
+	if !spec.Grid.Valid() && spec.Convert == nil {
 		// Nothing to cut by, or cuts so far apart that a chunk could never
-		// be made in time: cut evenly instead, on the same clock.
+		// be made in time: cut evenly instead, on the same clock. (Not for
+		// a converted picture, whose cuts are the ones the converter is
+		// told about: with a list that cannot be used it is not started.)
 		lead := spec.Grid.LeadMs
 		spec.Grid = uniform(spec.Grid.StartMs, spec.Grid.EndMs-spec.Grid.StartMs)
 		if lead > 0 && lead <= maxChunkMs {
@@ -273,6 +318,25 @@ func (m *Manager) Owner(token string) string {
 		return s.spec.Owner
 	}
 	return ""
+}
+
+// Pace reports how fast a film's picture is being converted: how many
+// seconds of film each second of the clock gives, over the last few chunks
+// made (three at most), and how many chunks that is. Under 1 the PC is not
+// keeping up with a viewer who simply watches. Time the converter spent
+// waiting because it was far enough ahead of its viewer is not counted,
+// nor is the time a run takes to get going after a jump.
+//
+// chunks is 0, and the pace means nothing, when there is nothing to go by:
+// no such session, a picture that is not converted, or fewer than two
+// chunks made in a row.
+func (m *Manager) Pace(token string) (pace float64, chunks int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if s := m.sessions[token]; s != nil && s.spec.Convert != nil {
+		return s.pace.pace()
+	}
+	return 0, 0
 }
 
 // Running reports how many ffmpeg processes are alive.
@@ -380,7 +444,12 @@ func (m *Manager) Segment(ctx context.Context, token string, n int) ([]byte, err
 
 // reach is how many chunks past the one being written it is quicker to
 // wait for than to restart ffmpeg at: about two seconds' worth of its work.
-func (m *Manager) reach() int {
+// A picture that is converted is made far more slowly than one that is
+// only read, so there it is two chunks, however fast the film is read.
+func (m *Manager) reach(s *session) int {
+	if s.spec.Convert != nil {
+		return 2
+	}
 	return max(1, 2*m.ReadRate/SegmentSeconds)
 }
 
@@ -451,7 +520,7 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 		// does), it reads to the end of the film and has sent nothing: it
 		// ends having made no chunk, or says it cannot write the header.
 		dry := r != nil && !alive && !r.quiet && s.spec.AudioTrack >= 0 && r.first > 0 && r.next == r.first &&
-			n >= r.first && n < r.first+m.reach() &&
+			n >= r.first && n < r.first+m.reach(s) &&
 			(r.ended || strings.Contains(r.stderr.String(), "Cannot write moov atom before"))
 		startAt := -1
 		switch {
@@ -480,7 +549,7 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 			} else if !alive && !r.header {
 				startAt = r.first
 			}
-		case r == nil || n < r.low || n >= r.next+m.reach() || !alive && !r.ended:
+		case r == nil || n < r.low || n >= r.next+m.reach(s) || !alive && !r.ended:
 			// Not started, behind this run, too far ahead of it, or the run
 			// was stopped: start ffmpeg at this chunk.
 			startAt = n
@@ -498,6 +567,8 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 				switch {
 				case lost:
 					err = errors.New("the converter's files are removed from the disk as fast as it makes them")
+				case r != nil && !alive && r.first == startAt && r.why != nil:
+					err = fmt.Errorf("the converter was stopped: %w", r.why)
 				case r != nil && !alive && r.first == startAt:
 					err = fmt.Errorf("the converter stopped: %s", s.spec.said(r.stderr))
 				}
@@ -537,6 +608,9 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 
 // args builds the ffmpeg command line for one run.
 func args(spec Spec, startSeg int, readRate, burst int) []string {
+	if spec.Convert != nil {
+		return convertArgs(spec, startSeg, readRate, burst)
+	}
 	a := []string{"-hide_banner", "-nostdin", "-loglevel", "error"}
 	if startSeg > 0 && startSeg < len(spec.Grid.Cuts) {
 		// Start a little before the chunk, which lands ffmpeg one key frame
@@ -577,18 +651,28 @@ func args(spec Spec, startSeg int, readRate, burst int) []string {
 			a = append(a, "-c:a", "aac", "-ac", "2", "-b:a", "192k")
 		}
 	}
-	// Keep the file's own times (so every run agrees on them), write a new
-	// fragment at every key frame, and send it all to this program.
-	return append(a,
+	return append(a, outputArgs(spec.Grid)...)
+}
+
+// outputArgs is the end of every command line, which says what ffmpeg
+// writes: keep the file's own times (so every run agrees on them), write a
+// new fragment at every key frame, and send it all to this program.
+func outputArgs(g Grid) []string {
+	return []string{
 		"-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1",
-		"-copyts", "-avoid_negative_ts", "disabled", "-output_ts_offset", fmt.Sprintf("%d.%03d", spec.Grid.shift()/1000, spec.Grid.shift()%1000),
+		"-copyts", "-avoid_negative_ts", "disabled", "-output_ts_offset", fmt.Sprintf("%d.%03d", g.shift()/1000, g.shift()%1000),
 		"-max_muxing_queue_size", "2048",
-		"-f", "mp4", "-movflags", "+frag_keyframe+delay_moov+default_base_moof+frag_discont", "pipe:1")
+		"-f", "mp4", "-movflags", "+frag_keyframe+delay_moov+default_base_moof+frag_discont", "pipe:1"}
 }
 
 // launch starts a fresh run at startSeg for the request ctx belongs to. The
 // caller holds the lock; it is released while the old run stops.
 func (m *Manager) launch(ctx context.Context, s *session, startSeg int) error {
+	if c := s.spec.Convert; c != nil {
+		if err := c.fits(s.spec.Grid); err != nil {
+			return err
+		}
+	}
 	m.halt(s)
 	// The lock was let go of. From here to the end it is held, so what is
 	// true now stays true until the new run is in place.
@@ -623,6 +707,7 @@ func (m *Manager) launch(ctx context.Context, s *session, startSeg int) error {
 	r.cmd = cmd
 	s.run = r
 	s.starts++
+	s.pace.restart()
 	m.live[r] = struct{}{}
 	go m.pump(s, r, out)
 	return nil
@@ -638,6 +723,9 @@ func (m *Manager) pump(s *session, r *run, out io.Reader) {
 	werr := r.cmd.Wait()
 	m.mu.Lock()
 	r.ended = err == nil && werr == nil
+	if errors.Is(err, ErrLeftLattice) {
+		r.why = err
+	}
 	delete(m.live, r)
 	m.mu.Unlock()
 	select {
@@ -659,9 +747,18 @@ var errStopped = errors.New("stopped")
 // fragments, each a short index (moof) and its data (mdat), one per key
 // frame. A fragment goes into the chunk that the moment its key frame is
 // shown falls in.
+//
+// When the picture is converted, the key frames are where the converter
+// was told to put them: one at each cut. A fragment is then one chunk and
+// must begin exactly where the list says (see latticeChunk), and the chunk
+// is finished the moment the fragment's data has been copied. That matters
+// to a viewer who is waiting: ffmpeg only sends a fragment once it has
+// encoded the first frame of the next, so waiting for the next fragment to
+// arrive before calling this one finished would cost a whole chunk's time.
 func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 	br := bufio.NewReaderSize(out, 256<<10)
 	grid := s.spec.Grid
+	converted := s.spec.Convert != nil
 	var header []byte
 	var video videoTrack
 	var move int64 // added to the time each fragment's picture is stamped with: see below
@@ -679,9 +776,18 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 		m.mu.Lock()
 		r.next = cur + 1
 		// Chunks well behind the viewer are not kept.
-		for r.low < s.lastSeg-m.Behind && r.low < cur {
+		for r.low < s.lastSeg-m.behind(s) && r.low < cur {
 			os.Remove(r.file(r.low))
 			r.low++
+		}
+		if converted {
+			// The last chunk also holds whatever sound outlasts the picture,
+			// so its length says nothing about how fast the picture is made.
+			var film int64
+			if cur+1 < len(grid.Cuts) {
+				film = grid.Cuts[cur+1] - grid.Cuts[cur]
+			}
+			s.pace.made(time.Duration(film)*time.Millisecond, time.Now())
 		}
 		m.mu.Unlock()
 		return err
@@ -754,26 +860,45 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 				return err
 			}
 			seg := max(cur, r.first)
-			if ms, stamp, ok := fragmentStart(body, video); ok {
-				seg = grid.index(ms - float64(grid.shift()))
+			if converted {
+				ms, stamp, ok := fragmentStart(body, video)
+				if !ok {
+					return errors.New("the converter's output is not in the expected form")
+				}
 				if move != 0 {
 					setNumber(stamp, number(stamp)+move)
 				}
-			}
-			if cur < 0 && seg < r.first {
-				skip = true // the lead-in before the chunk that was asked for
-				continue
-			}
-			skip = false
-			// Chunk numbers never go back and never skip, whatever the
-			// times say, so every chunk the list promises exists.
-			switch {
-			case cur < 0:
-				seg = r.first
-			case seg > cur+1:
-				seg = cur + 1
-			case seg < cur:
-				seg = cur
+				var lead bool
+				if seg, lead, err = latticeChunk(grid, r.first, cur, ms-float64(grid.shift())); err != nil {
+					return err
+				}
+				if lead {
+					skip = true // the lead-in before the chunk that was asked for
+					continue
+				}
+				skip = false
+			} else {
+				if ms, stamp, ok := fragmentStart(body, video); ok {
+					seg = grid.index(ms - float64(grid.shift()))
+					if move != 0 {
+						setNumber(stamp, number(stamp)+move)
+					}
+				}
+				if cur < 0 && seg < r.first {
+					skip = true // the lead-in before the chunk that was asked for
+					continue
+				}
+				skip = false
+				// Chunk numbers never go back and never skip, whatever the
+				// times say, so every chunk the list promises exists.
+				switch {
+				case cur < 0:
+					seg = r.first
+				case seg > cur+1:
+					seg = cur + 1
+				case seg < cur:
+					seg = cur
+				}
 			}
 			if seg != cur {
 				if err := finish(); err != nil {
@@ -801,6 +926,13 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 			if err != nil {
 				return err
 			}
+			if converted && f != nil && cur < len(grid.Cuts)-1 {
+				// One fragment is one chunk: this one is whole. (Not the
+				// last chunk, which is whole when ffmpeg is done.)
+				if err := finish(); err != nil {
+					return err
+				}
+			}
 		default:
 			if _, err := io.CopyN(io.Discard, br, payload); err != nil {
 				return err
@@ -812,12 +944,19 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 // hold makes the reader wait while it is far enough ahead of the viewer.
 // ffmpeg, finding nobody reading, waits too.
 func (m *Manager) hold(s *session, r *run, seg int) error {
+	var since time.Time // when the wait began, if there has been one
 	for {
 		m.mu.Lock()
-		ok := seg <= s.lastSeg+m.Ahead
+		ok := seg <= s.lastSeg+m.ahead(s)
+		if ok && !since.IsZero() {
+			s.pace.waited(time.Since(since)) // not time the converter needed
+		}
 		m.mu.Unlock()
 		if ok {
 			return nil
+		}
+		if since.IsZero() {
+			since = time.Now()
 		}
 		select {
 		case <-r.stop:

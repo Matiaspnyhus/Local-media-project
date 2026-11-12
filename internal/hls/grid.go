@@ -16,7 +16,9 @@ import (
 // Grid says where a film is cut into chunks: the time each chunk begins, in
 // milliseconds on the file's own clock. Every cut after the first is a key
 // frame of the picture (a frame that can be shown without the ones before
-// it), because an untouched picture can only be cut there.
+// it), because an untouched picture can only be cut there. (A picture that
+// is converted gets its key frames where the cuts are, not the other way
+// round: see Lattice.)
 //
 // The player is told these exact times, so its timeline matches the film
 // wherever it starts: subtitles stay in step and a resumed film resumes at
@@ -27,7 +29,8 @@ type Grid struct {
 	Cuts    []int64 `json:"cuts"` // Cuts[0] == StartMs
 	// From says how the cuts were found: "index" (the file's own list of
 	// key frames), "probe" (ffprobe visited the film every few seconds),
-	// "read" (ffprobe read the film through) or "uniform".
+	// "read" (ffprobe read the film through), "uniform", or "lattice" (worked
+	// out for a picture that is converted).
 	From string `json:"from,omitempty"`
 	// LeadMs is how long before StartMs the file's first frame lies. It is
 	// 0 for nearly every file. A clip cut out of a longer film without
