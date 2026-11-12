@@ -966,6 +966,86 @@ func TestJumpingToWhereTheSoundHasEnded(t *testing.T) {
 	}
 }
 
+// A player may ask for the header and for its first chunk at the same
+// moment, and a film that was left near its end is taken up again where its
+// sound may already have stopped. The two requests then need the converter
+// in two places: a header with the sound in it can only be made where there
+// is sound, the chunk only in the silent end. Both must be answered,
+// whichever of them arrives first.
+func TestTheHeaderAndAChunkOfTheSilentEndAskedForTogether(t *testing.T) {
+	ffmpeg, ffprobe := tools(t)
+	src := source(t, ffmpeg, "hush")
+	g := grid(t, ffprobe, src, 60000)
+	last := len(g.Cuts) - 1
+	bg := context.Background()
+	join := func(parts ...[]byte) string {
+		p := filepath.Join(t.TempDir(), "joined.mp4")
+		os.WriteFile(p, bytes.Join(parts, nil), 0o600)
+		return p
+	}
+	type answer struct {
+		b   []byte
+		err error
+	}
+	for _, copySound := range []bool{true, false} {
+		for _, first := range []string{"the header", "the chunk"} {
+			spec := Spec{Path: src, Grid: g, VideoCodec: "h264", AudioTrack: 0, AudioCopy: copySound, AudioCodec: "ac3"}
+			m := manager(t, ffmpeg)
+			m.Log = func(string, ...any) {} // the run that finds no sound says so
+			m.Ahead = 1
+			if first == "the header" {
+				// As in a long film on a slow disk: the run from the top has
+				// not got as far as its header when the chunk is asked for.
+				m.ReadRate, m.Burst = 1, 0
+			}
+			token := m.Open(spec)
+			starts := func() int {
+				m.mu.Lock()
+				defer m.mu.Unlock()
+				return m.sessions[token].starts
+			}
+			header, chunk := make(chan answer, 1), make(chan answer, 1)
+			ask := map[string]func(){
+				"the header": func() { b, err := m.Init(bg, token); header <- answer{b, err} },
+				"the chunk":  func() { b, err := m.Segment(bg, token, last); chunk <- answer{b, err} },
+			}
+			go ask[first]()
+			if !settled(func() bool { return starts() == 1 }) {
+				t.Fatalf("copy sound %v, %s first: ffmpeg was not started", copySound, first)
+			}
+			m.mu.Lock()
+			m.ReadRate, m.Burst = 8, 60 // whatever is started from here on is as quick as usual
+			m.mu.Unlock()
+			for other, fn := range ask {
+				if other != first {
+					go fn()
+				}
+			}
+			h, c := <-header, <-chunk
+			if h.err != nil || c.err != nil {
+				t.Errorf("copy sound %v, %s first: the header: %v; the chunk in the silent end: %v", copySound, first, h.err, c.err)
+				m.Close()
+				continue
+			}
+			got := inspect(t, ffprobe, join(h.b, c.b))
+			if got["video"].Packets != "144" || math.Abs(f(got["video"].StartTime)-54-shift) > 0.002 {
+				t.Errorf("copy sound %v, %s first: the silent end has %s frames from %s s, want 144 from %.3f", copySound, first, got["video"].Packets, got["video"].StartTime, 54+shift)
+			}
+			decodes(t, ffmpeg, join(h.b, c.b))
+			// The header is one with the sound in it: back where there is
+			// sound, a player that goes by this header plays it.
+			early, err := m.Segment(bg, token, 2)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := inspect(t, ffprobe, join(h.b, early)); f(got["audio"].Packets) < 100 || got["video"].Packets != "144" {
+				t.Errorf("copy sound %v, %s first: back at 12 seconds: %s frames of picture, %s of sound", copySound, first, got["video"].Packets, got["audio"].Packets)
+			}
+			m.Close()
+		}
+	}
+}
+
 func TestJumpingAheadAndBack(t *testing.T) {
 	ffmpeg, ffprobe := tools(t)
 	src := source(t, ffmpeg, "plain")
