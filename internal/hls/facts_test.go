@@ -267,18 +267,78 @@ func TestKeyFrameGapsAndTheLastFrame(t *testing.T) {
 	}
 }
 
+// Which sound tracks last as long as the picture, from ffprobe's list of the
+// sound near the end of a film.
+func TestWhichSoundTracksLastIsReadFromTheirLastPackets(t *testing.T) {
+	// A film with four sound tracks, which the file numbers 1, 2, 4 and 5
+	// (3 is something else), and its picture's last frame at 100 s. The
+	// first track goes on past it. The second stops 4 seconds before it,
+	// which is near enough. The third has nothing in the last 5 seconds: its
+	// last packet starts 5.03 s before and is 0.02 s long. The fourth has
+	// nothing here at all.
+	answer := []byte(`{"packets":[{"stream_index":1,"pts_time":"94.000000","duration_time":"0.032000"},{"stream_index":4,"pts_time":"94.970000","duration_time":"0.020000"},
+		{"stream_index":2,"pts_time":"95.980000","duration_time":"0.021000","side_data_list":[{}]},{"stream_index":1,"pts_time":"100.500000","duration_time":"0.032000"},
+		{"stream_index":2,"pts_time":"N/A"},{"stream_index":7,"pts_time":"100.000000"},{"pts_time":"100.000000"}],
+		"programs":[],"streams":[{"index":1},{"index":2},{"index":4},{"index":5}]}`)
+	bits, err := parseSound(answer, 100000-soundLastsMs)
+	if err != nil || bits != 0b0011 {
+		t.Errorf("the tracks that last are %04b (%v), want 0011: the first two", bits, err)
+	}
+	for n, want := range map[int]bool{0: true, 1: true, 2: false, 3: false, 4: false, -1: false, 64: false, 1000: false} {
+		if lasts(bits, n) != want {
+			t.Errorf("sound track %d lasts: %v, want %v", n, !want, want)
+		}
+	}
+	// A packet that says how long it is counts to its end; one that does
+	// not, to its start.
+	short := []byte(`{"packets":[{"stream_index":0,"pts_time":"94.990000","duration_time":"0.010000"},{"stream_index":1,"pts_time":"94.990000"}],"streams":[{"index":0},{"index":1}]}`)
+	if bits, _ := parseSound(short, 95000); bits != 0b01 {
+		t.Errorf("a packet that ends exactly in time, and one that starts just too early: %02b, want 01", bits)
+	}
+	// A file without sound, a file with more sound tracks than are kept
+	// count of, and an answer that is not one.
+	if bits, err := parseSound([]byte(`{"packets":[],"streams":[]}`), 0); bits != 0 || err != nil {
+		t.Errorf("no sound: %b %v", bits, err)
+	}
+	var many strings.Builder
+	many.WriteString(`{"packets":[{"stream_index":63,"pts_time":"9"},{"stream_index":64,"pts_time":"9"}],"streams":[`)
+	for n := 0; n < 66; n++ {
+		fmt.Fprintf(&many, `%s{"index":%d}`, strings.Repeat(",", min(n, 1)), n)
+	}
+	many.WriteString(`]}`)
+	if bits, err := parseSound([]byte(many.String()), 0); bits != 1<<63 || err != nil {
+		t.Errorf("66 sound tracks, the 64th and 65th still going: %b %v", bits, err)
+	}
+	if _, err := parseSound([]byte(`not json`), 0); err == nil {
+		t.Error("junk was read as a list of sound packets")
+	}
+	// The facts survive being stored and read back with this in them, and a
+	// conversion is told what the facts say.
+	f := PictureFacts{StartMs: 0, LastMs: 9960, EndMs: 10000, RateNum: 25, RateDen: 1, Width: 320, Height: 180, SarNum: 1, SarDen: 1, Format: "matroska,webm", SoundLasts: 0b101}
+	stored, _ := json.Marshal(f)
+	var back PictureFacts
+	if err := json.Unmarshal(stored, &back); err != nil || back != f || !strings.Contains(string(stored), `"soundLasts":5`) {
+		t.Errorf("stored as %s and read back as %+v (%v)", stored, back, err)
+	}
+	if _, c := f.Lattice(); c.SoundLasts != 0b101 {
+		t.Errorf("the conversion is told that the tracks that last are %b, want 101", c.SoundLasts)
+	}
+}
+
 // The same facts from the real ffprobe, for the films the converter is
 // tested with.
 func TestPictureFactsOfRealFiles(t *testing.T) {
 	ffmpeg, ffprobe := tools(t)
 	ctx := context.Background()
 	for name, want := range map[string]PictureFacts{
-		"film24":    {StartMs: 0, LastMs: 22564, RateNum: 24000, RateDen: 1001},
-		"tv25":      {StartMs: 1440, LastMs: 17400, RateNum: 25, RateDen: 1, KeyGapMs: 600},
-		"phone":     {StartMs: 0, LastMs: 15967, RateNum: 30, RateDen: 1},
-		"frozen":    {StartMs: 0, LastMs: 18967, RateNum: 30, RateDen: 1},
-		"longsound": {StartMs: 0, LastMs: 9792, RateNum: 24, RateDen: 1},
-		"longgop":   {StartMs: 1480, LastMs: 20440, RateNum: 25, RateDen: 1, KeyGapMs: 6000},
+		"film24":    {StartMs: 0, LastMs: 22564, RateNum: 24000, RateDen: 1001, SoundLasts: 1},
+		"tv25":      {StartMs: 1440, LastMs: 17400, RateNum: 25, RateDen: 1, KeyGapMs: 600, SoundLasts: 1},
+		"phone":     {StartMs: 0, LastMs: 15967, RateNum: 30, RateDen: 1, SoundLasts: 1},
+		"frozen":    {StartMs: 0, LastMs: 18967, RateNum: 30, RateDen: 1, SoundLasts: 1},
+		"longsound": {StartMs: 0, LastMs: 9792, RateNum: 24, RateDen: 1, SoundLasts: 1},
+		"longgop":   {StartMs: 1480, LastMs: 20440, RateNum: 25, RateDen: 1, KeyGapMs: 6000, SoundLasts: 1},
+		// Its one sound track stops 18 seconds before its picture does.
+		"shortsound": {StartMs: 0, LastMs: 21958, RateNum: 24, RateDen: 1, SoundLasts: 0},
 	} {
 		src := convertFilm(t, ffmpeg, name)
 		f, err := ProbePicture(ctx, ffprobe, src)
@@ -302,6 +362,10 @@ func TestPictureFactsOfRealFiles(t *testing.T) {
 		}
 		if f.Width != 320 || f.Height != 180 || f.SarNum != 1 || f.SarDen != 1 || f.Rotation != 0 || f.FieldOrder != "progressive" || f.EndMs <= f.LastMs || f.ContainerStartMs > f.StartMs {
 			t.Errorf("%s: %+v", name, f)
+		}
+		// Each has one sound track.
+		if f.SoundLasts != want.SoundLasts {
+			t.Errorf("%s: the sound tracks that last as long as the picture are %b, want %b", name, f.SoundLasts, want.SoundLasts)
 		}
 	}
 	// A file that is not there, and no ffprobe to ask.

@@ -233,12 +233,14 @@ func TestEveryConvertedChunkBeginsWhereTheListSays(t *testing.T) {
 					t.Errorf("with key frames 6 seconds apart the lead-in is %d ms, want 6500", c.LeadMs)
 				}
 			case "longsound":
-				if last := g.Cuts[len(g.Cuts)-1]; g.EndMs-facts.LastMs < 9000 || last > facts.LastMs || len(g.Cuts) != 4 || !c.SoundRunsOn {
+				if last := g.Cuts[len(g.Cuts)-1]; g.EndMs-facts.LastMs < 9000 || last > facts.LastMs || len(g.Cuts) != 4 {
 					t.Errorf("the list should end with the picture (last frame at %d ms) and the file's end stay where it is (%d): %v", facts.LastMs, facts.EndMs, g.Cuts)
 				}
 			}
-			if c.SoundRunsOn != (film.name == "longsound") {
-				t.Errorf("the sound is taken to run on after the picture: %v", c.SoundRunsOn)
+			// Each of these films has one sound track, and it goes on to the
+			// picture's last frame: ffmpeg is told to wait for the picture.
+			if c.SoundLasts != 1 || !strings.Contains(strings.Join(args(spec, 0, 8, 60), " "), " -max_interleave_delta 0 ") {
+				t.Errorf("the sound tracks said to last as long as the picture: %b, want the one there is", c.SoundLasts)
 			}
 			for _, sound := range film.sounds {
 				spec.AudioCopy, spec.AudioCodec = sound != "", sound
@@ -429,18 +431,27 @@ func TestTheCommandLineForAConvertedPicture(t *testing.T) {
 	if one := strings.Join(args(Spec{Path: "x", Grid: g1, AudioTrack: -1, Convert: &c1}, 0, 8, 60), " "); strings.Contains(one, "force_key_frames") || strings.Contains(one, "0:a") || !strings.Contains(one, " -g 152 ") {
 		t.Errorf("a film of one chunk, without sound: %s", one)
 	}
-	// A film whose sound runs on after its picture: ffmpeg is told to wait
-	// for the picture however long it takes. No other film is.
+	// ffmpeg is told to wait for the picture however long it takes beside a
+	// sound track that is known to last as long as the picture, and beside
+	// no other: not one that is not known to (here nothing is known yet),
+	// not when it is another track that lasts, and not when there is no
+	// sound to wait with.
 	if strings.Contains(strings.Join(args(spec, 0, 8, 60), " ")+strings.Join(args(spec, 5, 8, 60), " "), "interleave") {
-		t.Errorf("a film that ends with its picture has ffmpeg told how long to wait for it")
+		t.Errorf("beside a sound track not known to last, ffmpeg is told how long to wait")
 	}
-	c.SoundRunsOn = true
+	c.SoundLasts = 0b10 // the second track, which is the one chosen
 	for _, seg := range []int{0, 5} {
 		if on := strings.Join(args(spec, seg, 8, 60), " "); !strings.Contains(on, " -b:a 192k -max_interleave_delta 0 -sn ") {
-			t.Errorf("a film whose sound runs on, from chunk %d: %s", seg, on)
+			t.Errorf("beside a sound track that lasts, from chunk %d: %s", seg, on)
 		}
 	}
-	c.SoundRunsOn = false
+	c.SoundLasts = 0b101
+	silent := spec
+	silent.AudioTrack = -1
+	if strings.Contains(strings.Join(args(spec, 0, 8, 60), " ")+strings.Join(args(silent, 0, 8, 60), " "), "interleave") {
+		t.Errorf("ffmpeg is told to wait beside a track that stops early because others last, or with no sound at all")
+	}
+	c.SoundLasts = 0
 	// Sound that is passed through as AAC is rewrapped, as it is beside an
 	// untouched picture; times below zero are written as such; and each
 	// preset has its word.
@@ -925,8 +936,8 @@ func TestJumpingToWhereTheSoundHasEndedInAConvertedFilm(t *testing.T) {
 func TestAFilmWhoseSoundStopsEarlyStillArrivesAsItIsMade(t *testing.T) {
 	ffmpeg, ffprobe := tools(t)
 	spec, _ := convertSpec(t, ffprobe, convertFilm(t, ffmpeg, "shortsound"))
-	if spec.Convert.SoundRunsOn {
-		t.Fatal("a film whose sound stops first is taken for one whose sound runs on")
+	if spec.Convert.SoundLasts != 0 || strings.Contains(strings.Join(args(spec, 0, 8, 60), " "), "interleave") {
+		t.Fatal("a sound track that stops 18 seconds before the picture is taken for one that lasts")
 	}
 	for _, sound := range []string{"ac3", ""} {
 		spec.AudioCopy, spec.AudioCodec = sound != "", sound
