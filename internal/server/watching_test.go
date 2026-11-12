@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -167,6 +168,25 @@ func TestWhoIsWatching(t *testing.T) {
 	e.wantWatching("the PC's clock was set back three hours", "owner on an iPhone")
 	clock.pass(16 * time.Minute)
 	e.wantWatching("16 minutes after the clock was set back")
+}
+
+// On a PC where nobody ever asks who is watching, the list of films that
+// have been opened must not grow for ever.
+func TestTheListOfOpenedFilmsStaysShort(t *testing.T) {
+	e := newEnv(t)
+	clock := handClock(e)
+	for day := 0; day < 30; day++ {
+		for film := 0; film < 50; film++ {
+			e.s.watch.sign("a-sign-in", fmt.Sprintf("film-%d-%d", day, film))
+		}
+		clock.pass(24 * time.Hour)
+	}
+	e.s.watch.mu.Lock()
+	n := len(e.s.watch.films)
+	e.s.watch.mu.Unlock()
+	if n > manyFilms+50 {
+		t.Errorf("after a month of 50 films a day, %d films are still remembered", n)
+	}
 }
 
 func TestDevicesAreNamedInAWordOrTwo(t *testing.T) {
