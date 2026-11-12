@@ -61,11 +61,11 @@ func TestCheckLatticeBounds(t *testing.T) {
 		}
 		g, c := Lattice(start, last, end, r[0], r[1])
 		if !g.Valid() {
-			if length < 239*3600*1000 && length > 100 && end > start {
-				// Not cut although it could be?
-				if length < 200*3600*1000 {
-					t.Errorf("Lattice(%d, %d, %d, %d/%d) gave nothing", start, last, end, r[0], r[1])
-				}
+			// A film too long for chunks of a minute is not cut (57 hours and
+			// more, fewer when its times have many digits). Anything
+			// under 30 hours that makes sense must be.
+			if length > 100 && length < 30*3600*1000 {
+				t.Errorf("Lattice(%d, %d, %d, %d/%d) gave nothing", start, last, end, r[0], r[1])
 			}
 			continue
 		}
