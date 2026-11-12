@@ -73,6 +73,24 @@ async function waitPlaying(page, beyond) {
   await page.waitForFunction((b) => document.querySelector('video').currentTime > b, beyond, { timeout: 20000 })
 }
 
+// Waits until the film is playing on beyond a given second. Used where the
+// film is handed to the player afresh while it is open (a change of sound,
+// a jump): the nudge that waitPlaying gives once is given until it takes.
+async function playsBeyond(page, beyond, why) {
+  await page.waitForFunction((b) => {
+    const v = document.querySelector('video')
+    if (!v) return false
+    if (v.paused && v.readyState >= 1) {
+      v.muted = true
+      v.play().catch(() => {})
+    }
+    return !v.seeking && v.currentTime > b
+  }, beyond, { timeout: 20000, polling: 200 }).catch(async () => {
+    const t = await page.evaluate(() => document.querySelector('video')?.currentTime)
+    assert.fail(`${why}: after 20 seconds the film is at ${t} s, not playing beyond ${beyond} s`)
+  })
+}
+
 assert.ok(existsSync(bin), `program not found at ${bin}; build it first`)
 const data = mkdtempSync(join(tmpdir(), 'lm-data-'))
 const media = mkdtempSync(join(tmpdir(), 'lm-media-'))
@@ -92,6 +110,17 @@ const made = spawnSync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
 assert.equal(made.status, 0, `ffmpeg is needed for this test (set LOCALMEDIA_FFMPEG and LOCALMEDIA_FFPROBE, or put both on the PATH): ${made.error || made.stderr}`)
 writeFileSync(join(media, 'Dolby.Sound.Test.en.srt'),
   '1\n00:00:00,500 --> 00:00:20,000\nThe subtitle is showing\n\n2\n00:00:20,000 --> 00:00:39,000\nStill in step after a jump\n')
+// A longer film with three sound tracks to switch between and subtitles
+// stored inside it: 90 seconds, more than a player keeps ready at once.
+writeFileSync(join(media, 'three-sounds-subtitles.txt'),
+  '1\n00:00:00,500 --> 00:00:45,000\nSaid in the first half\n\n2\n00:00:45,000 --> 00:01:29,000\nSaid in the second half\n')
+const made3 = spawnSync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
+  '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=24:duration=90', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=90',
+  '-f', 'srt', '-i', join(media, 'three-sounds-subtitles.txt'), '-map', '0:v', '-map', '1:a', '-map', '1:a', '-map', '1:a', '-map', '2:s',
+  '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '34', '-g', '48', '-pix_fmt', 'yuv420p', '-c:a', 'ac3', '-b:a', '96k', '-c:s', 'srt',
+  '-metadata:s:a', 'language=eng', '-metadata:s:s:0', 'language=eng', '-disposition:a:0', 'default', '-disposition:a:1', '0', '-disposition:a:2', '0',
+  join(media, 'Three.Sounds.Test.mkv')], { encoding: 'utf8' })
+assert.equal(made3.status, 0, `ffmpeg could not make the film with three sound tracks: ${made3.error || made3.stderr}`)
 
 const server = spawn(bin, ['--data', data, '--port', String(port), '--no-browser'], { stdio: ['ignore', 'pipe', 'pipe'] })
 let serverLog = ''
@@ -136,7 +165,7 @@ try {
     await setupPage.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
     await setupPage.keyboard.type(media)
     await setupPage.keyboard.press('Enter')
-    await setupPage.waitForSelector('text=Films (2)')
+    await setupPage.waitForSelector('text=Films (3)')
   })
 
   await step('the PC shows the address and a QR code for other devices', async () => {
@@ -173,7 +202,31 @@ try {
     await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
     await page.keyboard.type('a good password')
     await page.keyboard.press('Enter')
-    await page.waitForSelector('text=Films (2)')
+    await page.waitForSelector('text=Films (3)')
+    // The line at the foot of the page describes this version, not the
+    // first one, which played only what a browser plays by itself.
+    const foot = await page.textContent('main')
+    assert.match(foot, /repackaged while you watch/)
+    assert.doesNotMatch(foot, /plays only files your browser can play by itself/)
+  })
+
+  await step('the page tells the PC whether this device plays 10-bit H.264, and HEVC in which labelling', async () => {
+    const r = await page.evaluate(async () => {
+      const can = (...types) => types.some((t) => document.createElement('video').canPlayType(t) !== '')
+      return {
+        told: (await (await fetch('/api/diagnostics')).json()).device.video,
+        h264in10bit: can('video/mp4; codecs="avc1.6E0033"'),
+        hevc: can('video/mp4; codecs="hvc1.1.6.L120.90"', 'video/mp4; codecs="hev1.1.6.L120.90"'),
+        hev1: can('video/mp4; codecs="hev1.1.6.L120.90"', 'video/mp4; codecs="hev1.2.4.L120.90"'),
+      }
+    })
+    console.log(`      (told the PC: ${Object.keys(r.told).filter((k) => r.told[k]).join(', ')})`)
+    // The PC looks these up by name when it decides how to play a file. A
+    // name the page never sends counts as "cannot play".
+    assert.equal(r.told['h264-10'], r.h264in10bit, '10-bit H.264: what the page told the PC against what the browser says')
+    assert.equal(r.told['hevc-hev1'], r.hev1, 'HEVC labelled hev1: what the page told the PC against what the browser says')
+    assert.equal(r.told.hevc, r.hevc, 'HEVC is still reported when either labelling plays')
+    if (browserName === 'chromium') assert.equal(r.told['h264-10'], true, 'Chromium plays 10-bit H.264, and must not be told it cannot')
   })
 
   await step('play a file, keyboard only', async () => {
@@ -182,6 +235,7 @@ try {
     await waitPlaying(page, 1)
     const w = await page.evaluate(() => document.querySelector('video').videoWidth)
     assert.equal(w, 320, 'the picture is decoded')
+    assert.equal(await page.locator('[data-testid=play-problem]').count(), 0, `nothing is wrong, yet the page says: ${await page.locator('[data-testid=play-problem]').allTextContents()}`)
   })
 
   await step('seek, then leave', async () => {
@@ -201,7 +255,7 @@ try {
     const t = await page.evaluate(() => document.querySelector('video').currentTime)
     assert.ok(t >= 11 && t < 19, `resumed at ${t}`)
     await page.goBack()
-    await page.waitForSelector('text=Films (2)')
+    await page.waitForSelector('text=Films (3)')
   })
 
   // How many films the PC holds open for conversion.
@@ -227,12 +281,29 @@ try {
     const why = await page.textContent('[data-testid=how-text]')
     assert.match(why, /Repackaging the file/)
     assert.equal(await converters(), 1, 'the PC holds one film open for conversion')
+    // Safari's engine learns the size of a repackaged film's picture a
+    // moment after the film opens, which the page once took for "no picture".
+    assert.equal(await page.locator('[data-testid=play-problem]').count(), 0, `nothing is wrong, yet the page says: ${await page.locator('[data-testid=play-problem]').allTextContents()}`)
   })
 
   await step('subtitles show, and are still in step after a jump far ahead', async () => {
+    const choices = []
+    const noteChoice = (r) => /\/choice$/.test(r.url()) && choices.push(r.postDataJSON())
+    page.on('request', noteChoice)
     await pressUntilFocused(page, '[data-testid=pick-subtitles]')
     await page.keyboard.press('ArrowDown')
     if ((await page.inputValue('[data-testid=pick-subtitles]')) === '') await page.selectOption('[data-testid=pick-subtitles]', { index: 1 })
+    // What is remembered is the track itself, not only its language: a
+    // film can have two sound tracks in one language, and subtitles with
+    // no language named at all.
+    for (let i = 0; choices.length === 0; i++) {
+      assert.ok(i < 50, 'the page did not tell the PC which subtitles were picked')
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    page.off('request', noteChoice)
+    const picked = choices[choices.length - 1]
+    assert.equal(picked.subKey, await page.inputValue('[data-testid=pick-subtitles]'), `the subtitles picked are named in what the PC is told to remember: ${JSON.stringify(picked)}`)
+    assert.equal(picked.audioIndex, 0, `the sound track playing is named in what the PC is told to remember: ${JSON.stringify(picked)}`)
     const cue = () => page.evaluate(() => {
       const t = document.querySelector('video').textTracks[0]
       return t && t.mode === 'showing' && t.activeCues && t.activeCues.length ? t.activeCues[0].text : ''
@@ -260,6 +331,181 @@ try {
     }
   })
 
+  // "Show subtitles" in the settings, set with the keyboard.
+  const showSubtitles = async (when) => {
+    await focusByText(page, 'Settings')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('[data-testid=pref-when]')
+    await pressUntilFocused(page, '[data-testid=pref-when]')
+    await page.keyboard.press(when === 'always' ? 'ArrowDown' : 'ArrowUp')
+    if ((await page.inputValue('[data-testid=pref-when]')) !== when) await page.selectOption('[data-testid=pref-when]', when)
+    await page.waitForFunction(async (w) => (await (await fetch('/api/prefs')).json()).subs === w, when, { timeout: 10000 })
+  }
+  // Waits until the subtitles that are switched on show the given words.
+  const subtitleShows = (words) => page.waitForFunction((w) => {
+    const t = Array.from(document.querySelector('video').textTracks).find((x) => x.mode === 'showing')
+    return !!t && !!t.activeCues && t.activeCues.length > 0 && t.activeCues[0].text.trim() === w
+  }, words, { timeout: 15000 }).catch(() => assert.fail(`the subtitles did not come to show "${words}"`))
+
+  await step('a film starts without waiting for its subtitles, and they join it when they arrive', async () => {
+    await showSubtitles('always')
+    // Subtitles stored inside a film take as long to arrive as the PC takes
+    // to read the film through: minutes, for a long one. Here they are held
+    // back until the film has been seen playing.
+    let wanted = false
+    let release
+    const held = new Promise((r) => (release = r))
+    await page.route('**/subtitles/**', async (route) => {
+      wanted = true
+      await held
+      await route.continue()
+    })
+    await focusByText(page, 'Three Sounds Test')
+    await page.keyboard.press('Enter')
+    await waitPlaying(page, 1).catch(() => assert.fail('the film did not start while its subtitles were still on their way'))
+    assert.notEqual(await page.inputValue('[data-testid=pick-subtitles]'), '', 'subtitles were chosen when the film opened')
+    for (let i = 0; !wanted; i++) {
+      assert.ok(i < 50, 'the chosen subtitles were not asked for once the film was playing')
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    release()
+    await subtitleShows('Said in the first half')
+    await page.unroute('**/subtitles/**')
+    // Subtitles can also be switched in the browser's own menu, which the
+    // page does not hear about. What was set there must be left alone when
+    // the film stops and plays again, as it does after every jump: here
+    // they are switched off that way, and must still be off afterwards.
+    await page.evaluate(() => {
+      const v = document.querySelector('video')
+      window.switchedByHand = Array.from(v.textTracks).find((x) => x.mode === 'showing')
+      window.switchedByHand.mode = 'disabled'
+      v.currentTime = 50
+    })
+    await playsBeyond(page, 50.5, 'a jump to 50 seconds')
+    const after = await page.evaluate(() => {
+      const mode = window.switchedByHand.mode
+      window.switchedByHand.mode = 'showing'
+      return mode
+    })
+    assert.equal(after, 'disabled', 'subtitles switched off in the browser\'s own menu, after a jump')
+  })
+
+  await step('changing the sound twice in a row keeps the place in the film, and the subtitles', async () => {
+    const subtitles = await page.inputValue('[data-testid=pick-subtitles]')
+    await page.evaluate(() => (document.querySelector('video').currentTime = 60))
+    await playsBeyond(page, 60.5, 'a jump to one minute')
+    const place = await page.evaluate(() => document.querySelector('video').currentTime)
+    // Not with the keyboard for once: until the PC answers, the list goes
+    // back to the track that is playing, so two key presses cannot be aimed
+    // at the third track. The second pick is made before the first has
+    // taken effect.
+    await page.selectOption('[data-testid=pick-sound]', '1')
+    await page.selectOption('[data-testid=pick-sound]', '2')
+    await playsBeyond(page, place + 0.5, 'after two changes of sound')
+    const v = await page.evaluate(() => {
+      const el = document.querySelector('video')
+      return { at: el.currentTime, sound: document.querySelector('[data-testid=pick-sound]').value, method: el.dataset.method }
+    })
+    assert.ok(v.at < place + 15, `the film was at ${place} s and is now at ${v.at} s`)
+    assert.equal(v.sound, '2', 'the list shows the sound track picked last')
+    // The PC opened the film once for each pick. The one that was not used
+    // must be closed again, leaving the one that is playing.
+    for (let i = 0; (await converters()) !== 1; i++) {
+      assert.ok(i < 50, `${await converters()} films are held open for conversion 5 seconds after changing the sound; one is playing`)
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    console.log(`      (was at ${place.toFixed(2)} s, plays on at ${v.at.toFixed(2)} s by method ${v.method})`)
+    // Changing the sound hands the film to the player afresh. The subtitles
+    // are switched back on once it plays.
+    assert.equal(await page.inputValue('[data-testid=pick-subtitles]'), subtitles, 'the same subtitles are still chosen')
+    await subtitleShows('Said in the second half')
+  })
+
+  await step('a page the browser puts aside and brings back goes on playing', async () => {
+    // When the viewer goes to another page in the same tab, a browser may
+    // keep this one exactly as it is and bring it back on Back. It says so
+    // with these two events. (A browser run by a test does not reliably do
+    // this, so the events are sent by hand.)
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })))
+    await page.waitForTimeout(500) // time for a request to stop converting, had one been sent, to arrive
+    assert.equal(await converters(), 1, 'the film is still open on the PC for the page that may come back')
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })))
+    // A part of the film the player does not hold has to come from the PC.
+    await page.evaluate(() => (document.querySelector('video').currentTime = 10))
+    await playsBeyond(page, 10.5, 'the page came back and jumped to a part it had not fetched')
+    const at = await page.evaluate(() => document.querySelector('video').currentTime)
+    assert.ok(at < 20, `jumped to 10 s, now at ${at} s`)
+    // A page that is closed for good still stops the conversion at once.
+    await page.evaluate(() => {
+      document.querySelector('video').pause()
+      window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }))
+    })
+    for (let i = 0; (await converters()) > 0; i++) {
+      assert.ok(i < 50, 'the film is still held open for conversion 5 seconds after its page was closed')
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    await focusByText(page, '← Back')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('text=Continue watching')
+    // Back to how it was, so that the next film's subtitles are down to
+    // what was chosen for that film.
+    await showSubtitles('auto')
+  })
+
+  await step('a picture whose size is only known once the film plays raises no false alarm', async () => {
+    // Safari's own chunk player does not know the size of the picture when
+    // it first describes the film; the size follows a moment later. The
+    // other engines know it at once, so the wait is imitated in all of
+    // them: the size reads as nothing until the test says otherwise.
+    const sizeUnknown = () => page.evaluate(() => {
+      const real = Object.getOwnPropertyDescriptor(HTMLVideoElement.prototype, 'videoWidth')
+      Object.defineProperty(HTMLVideoElement.prototype, 'videoWidth', { configurable: true, get: () => 0 })
+      window.sizeBecomesKnown = () => {
+        Object.defineProperty(HTMLVideoElement.prototype, 'videoWidth', real)
+        document.querySelector('video').dispatchEvent(new Event('resize'))
+      }
+    })
+    const alarm = () => page.evaluate(() => document.querySelector('[data-testid=play-problem]')?.textContent || '')
+    await sizeUnknown()
+    await focusByText(page, 'Three Sounds Test')
+    await page.keyboard.press('Enter')
+    await waitPlaying(page, 0.1)
+    const from = await page.evaluate(() => document.querySelector('video').currentTime)
+    await playsBeyond(page, from + 0.5, 'the film whose picture size is not known yet')
+    const early = await page.evaluate(() => {
+      const v = document.querySelector('video')
+      let played = 0
+      for (let i = 0; i < v.played.length; i++) played += v.played.end(i) - v.played.start(i)
+      return { played, alarm: document.querySelector('[data-testid=play-problem]')?.textContent || '' }
+    })
+    // (On a machine so slow that seconds of film went by before this look,
+    // the alarm may rightly be there already.)
+    if (early.played < 2.5) assert.equal(early.alarm, '', 'no alarm while the film has only just begun to play')
+    else console.log(`      (looked ${early.played.toFixed(1)} s into playing: too late to tell whether the alarm came too early)`)
+    // If the size never comes, there really is no picture this browser can
+    // show, and the viewer is told after a few seconds of playing.
+    await page.waitForSelector('[data-testid=play-problem]', { timeout: 15000 }).catch(() => assert.fail('a film that plays on with no picture must be reported'))
+    assert.match(await alarm(), /sound but not its picture/)
+    await page.evaluate(() => window.sizeBecomesKnown())
+    await page.waitForSelector('[data-testid=play-problem]', { state: 'detached', timeout: 5000 }).catch(() => assert.fail('the alarm must go once the size of the picture is known'))
+    await page.evaluate(() => document.querySelector('video').pause())
+    await focusByText(page, '← Back')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('text=Continue watching')
+    // An ordinary file knows the size of its picture from the start. For
+    // those, no size still means no picture, and is said at once.
+    await sizeUnknown()
+    await focusByText(page, 'Test Clip')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('[data-testid=play-problem]', { timeout: 15000 }).catch(() => assert.fail('an ordinary file with no picture must be reported as soon as it opens'))
+    assert.match(await alarm(), /sound but not its picture/)
+    await page.evaluate(() => window.sizeBecomesKnown())
+    await page.evaluate(() => document.querySelector('video').pause())
+    await focusByText(page, '← Back')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('text=Continue watching')
+  })
+
   await step('a repackaged film resumes where it stopped, with its subtitles', async () => {
     const asked = []
     const note = (r) => /\/hls\//.test(r.url()) && asked.push(r.url().split('/').pop())
@@ -273,21 +519,29 @@ try {
     await page.waitForFunction((t) => document.querySelector('video').currentTime > t + 0.7, resumedAt, { timeout: 20000 })
     const v = await page.evaluate(() => {
       const el = document.querySelector('video')
-      return { at: el.currentTime, from: el.buffered.length ? el.buffered.start(0) : -1, sub: document.querySelector('[data-testid=pick-subtitles]').value }
+      const held = Array.from({ length: el.buffered.length }, (_, i) => [el.buffered.start(i), el.buffered.end(i)])
+      return {
+        at: el.currentTime,
+        from: held.length ? held[0][0] : -1,
+        // A tenth of a second of slack, for an edge that falls a hair
+        // beside the clock.
+        covered: held.some(([a, b]) => a <= el.currentTime + 0.1 && el.currentTime <= b + 0.1),
+        ranges: held.map(([a, b]) => `${a.toFixed(2)}-${b.toFixed(2)}`).join(' '),
+        sub: document.querySelector('[data-testid=pick-subtitles]').value,
+      }
     })
     assert.ok(resumedAt >= 30 && resumedAt < 38 && v.at < 39.5, `resumed at ${resumedAt}, now at ${v.at}`)
+    page.off('request', note)
+    console.log(`      (resumed at ${resumedAt.toFixed(2)} s and played on to ${v.at.toFixed(2)} s; asked for ${asked.join(' ')}; holding ${v.ranges})`)
+    // In every engine: the player holds the part of the film it says it is
+    // playing. Its clock alone only says where it was told to be.
+    assert.ok(v.covered, `the player says it is at ${v.at} s but holds only: ${v.ranges || 'nothing'}`)
     // The first chunk fetched is the one from 30 seconds; the player must
     // place it exactly there, or everything after would be out of step.
-    page.off('request', note)
-    const ranges = await page.evaluate(() => {
-      const b = document.querySelector('video').buffered
-      return Array.from({ length: b.length }, (_, i) => `${b.start(i).toFixed(2)}-${b.end(i).toFixed(2)}`).join(' ')
-    })
-    console.log(`      (resumed at ${resumedAt.toFixed(2)} s and played on to ${v.at.toFixed(2)} s; asked for ${asked.join(' ')}; holding ${ranges})`)
     if (browserName === 'chromium') assert.ok(Math.abs(v.from - 30) < 0.25, `the chunk for 30 s was placed at ${v.from}`)
     assert.notEqual(v.sub, '', 'the subtitle choice was remembered')
     await page.goBack()
-    await page.waitForSelector('text=Films (2)')
+    await page.waitForSelector('text=Films (3)')
   })
 
   await step('a show: open it, finish episode 1, and episode 2 is next up', async () => {
@@ -317,7 +571,7 @@ try {
     await page.waitForSelector('text=2 episodes · 1 watched')
     await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
     await page.keyboard.press('Backspace')
-    await page.waitForSelector('text=Films (2)')
+    await page.waitForSelector('text=Films (3)')
   })
 
   await step('the stream link stops working after signing out', async () => {

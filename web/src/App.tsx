@@ -415,9 +415,10 @@ function Library({
         </>
       )}
       <p className="dim" style={{ marginTop: '2rem' }}>
-        Local Media {state.version}. This early version plays only files your browser can play by itself. The others
-        are marked; converting them arrives in a later version. Posters and descriptions come from TMDB: this product
-        uses the TMDB API but is not endorsed or certified by TMDB.
+        Local Media {state.version}. Files this device cannot play as they are get repackaged while you watch, with
+        their sound converted if need be. Files whose picture would have to be converted are marked; that arrives in a
+        later version. Posters and descriptions come from TMDB: this product uses the TMDB API but is not endorsed or
+        certified by TMDB.
       </p>
     </main>
   )
@@ -738,6 +739,17 @@ const mediaErrors: Record<number, string> = {
   4: 'MEDIA_ERR_SRC_NOT_SUPPORTED',
 }
 
+const NO_PICTURE =
+  "This browser can play this file's sound but not its picture. Converting the picture of such files arrives in a later version (M4)."
+
+// playedSeconds is how much of the film has really been played since it was
+// handed to the player.
+function playedSeconds(v: HTMLVideoElement): number {
+  let total = 0
+  for (let i = 0; i < v.played.length; i++) total += v.played.end(i) - v.played.start(i)
+  return total
+}
+
 function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; onSignedOut: () => void }) {
   const [info, setInfo] = useState<PlayInfo | null>(null)
   const [error, setError] = useState('')
@@ -750,25 +762,45 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
   const carryOn = useRef<number | null>(null) // where to pick up after switching sound, in seconds
   const first = useRef(true)
   const chunkPlayer = useRef(false)
+  const pictureJudged = useRef(false) // a film that arrives as chunks has been checked for a picture
+  const asked = useRef(0) // how many times the film has been asked for
 
+  // Each request for the film is numbered and only the newest one's answer
+  // is used. When the sound is changed twice in a row the answers can come
+  // back in either order, and the first would otherwise use up the place to
+  // carry on from. The PC opens the film for every answer, so one that is
+  // not used is closed again.
   const load = useCallback(
     (audio?: number) => {
+      const n = ++asked.current
       api
         .play(id, audio)
         .then((p) => {
+          if (n !== asked.current) {
+            if (p.hls) api.hlsStop(p.hls)
+            return
+          }
           if (carryOn.current !== null) p.positionMs = Math.floor(carryOn.current * 1000)
           carryOn.current = null
           if (first.current) setSubKey(p.subtitles.find((s) => s.selected)?.key || '')
           first.current = false
           setInfo(p)
         })
-        .catch((e: ApiError) => (e.status === 401 ? onSignedOut() : setError(e.message)))
+        .catch((e: ApiError) => {
+          if (n !== asked.current) return
+          if (e.status === 401) onSignedOut()
+          else setError(e.message)
+        })
     },
     [id, onSignedOut],
   )
   useEffect(() => {
     first.current = true
     load()
+    // An answer that arrives after the player has been left is not used.
+    return () => {
+      asked.current++
+    }
   }, [load])
 
   const report = useCallback(
@@ -805,6 +837,36 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
 
   const showPlayer = !!info && (info.plan.playable !== 'no' || tryAnyway)
 
+  // Subtitles: the chosen track is switched on and every other off. A
+  // track that is off is not even downloaded. None is switched on before
+  // the film is playing, because a browser will not start a film while
+  // subtitles that were already on when it began loading are still on
+  // their way, and subtitles stored inside a film take as long to arrive
+  // as the PC takes to read the film through. So each time the film is
+  // handed to the player they are all switched off, and the chosen one is
+  // switched on once the film plays.
+  const started = useRef(false) // the film has played since it was last handed to the player
+  const subWanted = useRef('') // the same as subKey, for code that runs between two drawings of the page
+  const applySubs = useCallback(() => {
+    const tracks = videoRef.current ? videoRef.current.querySelectorAll('track') : []
+    for (let i = 0; i < tracks.length; i++) {
+      const want = started.current && tracks[i].getAttribute('data-key') === subWanted.current ? 'showing' : 'disabled'
+      if (tracks[i].track.mode !== want) tracks[i].track.mode = want
+    }
+  }, [])
+  const subsOff = useCallback(() => {
+    started.current = false
+    applySubs()
+  }, [applySubs])
+  // Only the first time the film plays after being handed over: later (the
+  // film plays again after every jump) whatever is showing is left alone,
+  // which may be subtitles the viewer switched on in the browser's own menu.
+  const onPlaying = () => {
+    if (started.current) return
+    started.current = true
+    applySubs()
+  }
+
   // Hand the address to the player. The original file, and a list of
   // chunks where the browser plays those by itself (Safari, every iPhone),
   // go straight in. Elsewhere the chunks are played by hls.js, which is
@@ -814,12 +876,24 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     if (!info || !showPlayer || !v) return
     const token = info.hls
     const stop = () => token && api.hlsStop(token)
-    window.addEventListener('pagehide', stop)
+    // Leaving the page for good stops the conversion at once. But a browser
+    // may only put the page aside, to bring it back exactly as it was when
+    // the viewer returns to it (Back after a visit to another page; Safari
+    // on an iPhone does this readily). The film must then still be open on
+    // the PC, or the player that comes back holds addresses that no longer
+    // work. If the page never comes back, the PC stops converting by itself
+    // after a little over a minute without requests.
+    const onHide = (e: PageTransitionEvent) => {
+      if (!e.persisted) stop()
+    }
+    window.addEventListener('pagehide', onHide)
     chunkPlayer.current = false
+    pictureJudged.current = false
+    subsOff()
     if (!token || builtInChunks()) {
       v.src = info.url
       return () => {
-        window.removeEventListener('pagehide', stop)
+        window.removeEventListener('pagehide', onHide)
         stop()
         v.removeAttribute('src')
         v.load()
@@ -843,6 +917,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
           if (!data.fatal) return
           if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recovered) {
             recovered = true
+            subsOff() // recovering hands the film to the player afresh
             hls.recoverMediaError()
             return
           }
@@ -855,36 +930,32 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       .catch(() => setProblem('The part of the app that plays repackaged video could not be loaded. Reload the page and try again.'))
     return () => {
       gone = true
-      window.removeEventListener('pagehide', stop)
+      window.removeEventListener('pagehide', onHide)
       if (player) player.destroy()
       stop()
     }
-  }, [info, showPlayer, report])
+  }, [info, showPlayer, report, subsOff])
 
-  // Switch the chosen subtitles on and every other off. A track that is
-  // off is not even downloaded.
+  // A choice of subtitles takes effect at once if the film is playing. If
+  // it is not yet, the choice is kept and takes effect when it is.
   useEffect(() => {
-    const v = videoRef.current
-    if (!info || !showPlayer || !v) return
-    const apply = () => {
-      for (let i = 0; i < v.textTracks.length; i++) {
-        const want = info.subtitles[i] && info.subtitles[i].key === subKey ? 'showing' : 'disabled'
-        if (v.textTracks[i].mode !== want) v.textTracks[i].mode = want
-      }
-    }
-    apply()
-    v.addEventListener('loadedmetadata', apply)
-    return () => v.removeEventListener('loadedmetadata', apply)
-  }, [info, showPlayer, subKey])
+    subWanted.current = subKey
+    applySubs()
+  }, [info, showPlayer, subKey, applySubs])
 
   const remember = (audioIndex: number, sub: string) => {
     if (!info) return
+    const a = info.audio[audioIndex]
     const s = info.subtitles.find((x) => x.key === sub)
-    api.choice(id, info.audio[audioIndex]?.language || '', s?.language || '', !!s)
+    api.choice(id, { audioLang: a?.language || '', subLang: s?.language || '', subsOn: !!s, audioIndex: a ? audioIndex : -1, subKey: s ? s.key : '' })
   }
   const pickAudio = (index: number) => {
     const v = videoRef.current
-    carryOn.current = v && v.currentTime > 0 ? v.currentTime : null
+    // Carry on from where the film is. While it is still starting again
+    // after an earlier change its clock reads nothing, and the place to
+    // keep is the one it was about to start from.
+    if (v && v.currentTime > 0) carryOn.current = v.currentTime
+    else if (carryOn.current === null && info) carryOn.current = info.positionMs / 1000
     remember(index, subKey)
     load(index)
   }
@@ -893,17 +964,29 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     remember(info ? info.plan.audioTrack : -1, key)
   }
 
+  const noPicture = () => {
+    setProblem(NO_PICTURE)
+    report('no-picture', `${info?.container} videoWidth=0`)
+  }
+
   const onLoaded = () => {
     const v = videoRef.current
     if (!v || !info) return
     // hls.js was told where to start; everything else is told here.
     if (!chunkPlayer.current && info.positionMs > 0 && info.positionMs / 1000 < v.duration - 5) v.currentTime = info.positionMs / 1000
-    if (v.videoWidth === 0) {
-      setProblem(
-        "This browser can play this file's sound but not its picture. Converting the picture of such files arrives in a later version (M4).",
-      )
-      report('no-picture', `${info.container} videoWidth=0`)
-    }
+    applySubs() // a track the browser switched on by itself goes off again, like the rest
+    // An ordinary file knows the size of its picture by now, so no size
+    // means no picture. A film that arrives as chunks may not know it yet:
+    // Safari's own chunk player learns it a moment later. That case is
+    // judged in onTime, once the film has really been playing.
+    if (!info.hls && v.videoWidth === 0) noPicture()
+  }
+
+  // The size of the picture has become known, so there is a picture after
+  // all.
+  const onResize = () => {
+    const v = videoRef.current
+    if (v && v.videoWidth > 0) setProblem((p) => (p === NO_PICTURE ? '' : p))
   }
 
   const onTime = () => {
@@ -917,6 +1000,13 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
         'If you hear no sound: this file has not been inspected yet, so the app could not tell that its sound (probably Dolby or DTS) needs converting for this browser. Go back and try again in a minute.',
       )
       report('no-sound', `${info?.container} webkitAudioDecodedByteCount=0`)
+    }
+    // A film that arrives as chunks is judged here, and like an ordinary
+    // file only once: after three seconds of playing every browser knows
+    // the size of the picture, if there is one.
+    if (v && info?.hls && !pictureJudged.current && playedSeconds(v) > 3) {
+      pictureJudged.current = true
+      if (v.videoWidth === 0) noPicture()
     }
   }
 
@@ -960,13 +1050,15 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
             preload="metadata"
             data-method={info.plan.method}
             onLoadedMetadata={onLoaded}
+            onPlaying={onPlaying}
+            onResize={onResize}
             onTimeUpdate={onTime}
             onPause={() => save(true)}
             onEnded={() => save(true)}
             onError={onError}
           >
             {info.subtitles.map((s) => (
-              <track key={s.key} kind="subtitles" src={s.url} srcLang={s.language || 'und'} label={s.label} />
+              <track key={s.key} data-key={s.key} kind="subtitles" src={s.url} srcLang={s.language || 'und'} label={s.label} />
             ))}
           </video>
           <div className="bar picks">

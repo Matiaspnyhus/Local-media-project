@@ -192,8 +192,12 @@ export const api = {
   capabilities: (c: Caps) => call<{ ok: boolean }>('POST', '/api/capabilities', c),
   play: (id: string, audio?: number) =>
     call<PlayInfo>('POST', `/api/items/${id}/play`, audio === undefined ? {} : { audio }),
-  choice: (id: string, audioLang: string, subLang: string, subsOn: boolean) =>
-    call<{ ok: boolean }>('PUT', `/api/items/${id}/choice`, { audioLang, subLang, subsOn }).catch(() => undefined),
+  // What the viewer picked while watching. The tracks themselves are sent
+  // (audioIndex, -1 for none; subKey, '' for off) as well as their
+  // languages: the same film is opened again with exactly those tracks,
+  // and the languages carry the choice to the next episode.
+  choice: (id: string, c: { audioLang: string; subLang: string; subsOn: boolean; audioIndex: number; subKey: string }) =>
+    call<{ ok: boolean }>('PUT', `/api/items/${id}/choice`, c).catch(() => undefined),
   // Tells the PC to stop converting at once. Sent in a way that still
   // goes out while the page is being closed.
   hlsStop: (token: string) => {
