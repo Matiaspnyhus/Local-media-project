@@ -111,10 +111,11 @@ func anchor(startMs, num, den int64) (anchorMs, tick0 int64) {
 // to, one of the usual ones.
 //
 // It returns the list of cuts, and in Convert what the converter has to be
-// told to cut exactly there: the rate, the anchor and the whole seconds at
-// which key frames are asked for. The caller adds how large and how good
-// the picture is to be. If the numbers make no sense the grid returned is
-// not valid (see Grid.Valid), and there is nothing to convert by.
+// told to cut exactly there: the rate, the anchor, the whole seconds at
+// which key frames are asked for, and whether the sound runs on after the
+// picture. The caller adds how large and how good the picture is to be. If
+// the numbers make no sense the grid returned is not valid (see
+// Grid.Valid), and there is nothing to convert by.
 //
 // The list ends with the picture. Sound that carries on after the last
 // frame, as it does in some films for many seconds, sits in the last chunk:
