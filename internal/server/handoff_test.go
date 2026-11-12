@@ -752,6 +752,104 @@ func TestHandoffAddressIsAlwaysOneOfTheServersOwn(t *testing.T) {
 	}
 }
 
+// A player outside the browser reads a film in one long request. Signing
+// out has to end that too, not only the next request.
+func TestAFilmBeingSentStopsWhenItsSignInEnds(t *testing.T) {
+	e := newEnv(t)
+	// Far more than a network connection holds on its way: the film
+	// cannot have "already arrived" when the sign-out comes.
+	const size = 96 << 20
+	film, err := os.Create(filepath.Join(e.media, "Long Film (2001).mkv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := film.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	film.Close()
+	c := e.setup()
+	every := streamCheckEvery
+	streamCheckEvery = 0 // looked up with every piece that is sent, so the test waits for nothing
+	t.Cleanup(func() { streamCheckEvery = every })
+	srv := httptest.NewServer(e.s)
+	// Closed last of all, after every film still being read has been let
+	// go of (see begin): closing waits for requests that are under way.
+	t.Cleanup(srv.Close)
+	homeAt(t, srv.URL)
+	id := e.firstItem(c, "Long Film")
+	signIn := func() *http.Cookie {
+		c := sessionCookie(e.do("POST", "/api/login", remote, nil, map[string]string{"name": "owner", "password": "a good password"}))
+		if c == nil {
+			t.Fatal("could not sign in")
+		}
+		return c
+	}
+	link := func(c *http.Cookie) string {
+		var h handoffAnswer
+		decode(t, e.ask("GET", "/api/items/"+id+"/handoff", remote, strings.TrimPrefix(srv.URL, "http://"), c, nil, ""), &h)
+		if !strings.HasPrefix(h.URL, srv.URL+"/stream/") {
+			t.Fatalf("the link is %q", h.URL)
+		}
+		return h.URL
+	}
+	begin := func(link string) *http.Response {
+		res, err := http.Get(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { res.Body.Close() })
+		if res.StatusCode != 200 || res.ContentLength != size {
+			t.Fatalf("the film: %d, %d bytes", res.StatusCode, res.ContentLength)
+		}
+		if _, err := io.ReadFull(res.Body, make([]byte, 1<<20)); err != nil {
+			t.Fatalf("the first megabyte: %v", err)
+		}
+		return res
+	}
+
+	// While the sign-in stands, all of the film arrives, and the server
+	// knows the whole time that somebody is watching.
+	phone := signIn()
+	res := begin(link(phone))
+	e.s.lastStream.Store(0)
+	n, err := io.Copy(io.Discard, res.Body)
+	if err != nil || n != size-1<<20 {
+		t.Fatalf("with the sign-in standing, %d more bytes arrived (%v), want the rest of %d", n, err, size)
+	}
+	if e.s.lastStream.Load() == 0 {
+		t.Errorf("a film in the middle of being sent did not count as somebody watching")
+	}
+
+	// Signed out with the film under way: the rest never arrives.
+	tablet := signIn()
+	other := begin(link(tablet)) // another sign-in's film, which must go on
+	res = begin(link(phone))
+	if w := e.do("POST", "/api/logout", remote, phone, nil); w.Code != 200 {
+		t.Fatalf("sign-out: %d", w.Code)
+	}
+	n, err = io.Copy(io.Discard, res.Body)
+	if err == nil || n >= size-1<<20 {
+		t.Fatalf("after sign-out the film went on to its end: %d more bytes, error %v", n, err)
+	}
+	if again, err := http.Get(res.Request.URL.String()); err != nil || again.StatusCode != 403 {
+		t.Errorf("asking again with the signed-out link: %v %v", again, err)
+	} else {
+		again.Body.Close()
+	}
+	if n, err := io.Copy(io.Discard, other.Body); err != nil || n != size-1<<20 {
+		t.Errorf("signing out on the phone cut the tablet's film: %d more bytes, %v", n, err)
+	}
+
+	// And the same when the sign-in runs out by itself.
+	res = begin(link(tablet))
+	if _, err := e.s.db.Exec(`UPDATE sessions SET created_at=? WHERE revoked_at IS NULL`, time.Now().Add(-sessionLife-time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := io.Copy(io.Discard, res.Body); err == nil || n >= size-1<<20 {
+		t.Fatalf("after the sign-in ran out the film went on to its end: %d more bytes, error %v", n, err)
+	}
+}
+
 // What a player reads out of the playlist.
 type xspfFile struct {
 	XMLName xml.Name `xml:"http://xspf.org/ns/0/ playlist"`
