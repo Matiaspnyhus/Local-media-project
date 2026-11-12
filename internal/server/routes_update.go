@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"net/http"
-	"time"
 )
 
 // UpdateStatus is what the settings screen shows about updates.
@@ -46,16 +45,6 @@ type Updater interface {
 
 // AutoUpdate reports whether the owner lets updates install by themselves.
 func (s *Server) AutoUpdate() bool { return s.setting("auto_update") != "off" }
-
-// IdleFor reports how long it has been since anything was streamed, so an
-// update never interrupts someone who is watching.
-func (s *Server) IdleFor() time.Duration {
-	last := s.lastStream.Load()
-	if last == 0 {
-		return 24 * time.Hour
-	}
-	return time.Since(time.Unix(last, 0))
-}
 
 func (s *Server) updateStatus(st UpdateStatus) UpdateStatus {
 	st.Auto = s.AutoUpdate()

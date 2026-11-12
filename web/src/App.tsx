@@ -551,10 +551,28 @@ function UpdateCard() {
   const [st, setSt] = useState<UpdateStatus | null>(null)
   const [msg, setMsg] = useState('')
   const [waiting, setWaiting] = useState('') // the version we were on when a restart began
+  const [interrupts, setInterrupts] = useState('') // whose film installing now can stop, as the server put it
   const load = useCallback(() => {
     api.update().then(setSt).catch(() => undefined)
   }, [])
   useEffect(load, [load])
+  // While a new version waits for a quiet moment, keep what is shown about
+  // it true: who is watching changes, and the wait ends with a restart.
+  const held = !!st?.waiting && !waiting
+  const heldOn = st?.current || ''
+  useEffect(() => {
+    if (!held) return
+    const t = window.setInterval(() => {
+      api
+        .update()
+        .then((now) => {
+          if (now.current !== heldOn) window.location.reload()
+          else setSt(now)
+        })
+        .catch(() => undefined)
+    }, 20000)
+    return () => window.clearInterval(t)
+  }, [held, heldOn])
   // While the program restarts into another version, ask now and then
   // whether it is back, and reload the page when it is.
   useEffect(() => {
@@ -588,12 +606,18 @@ function UpdateCard() {
       })
       .catch((e: ApiError) => setMsg(e.message))
   }
-  const install = () => {
+  // Installing restarts the program. When someone else is watching, the
+  // server does not start but says who (409); the owner then decides.
+  const install = (anyway: boolean) => {
+    setInterrupts('')
     setMsg('Installing. Local Media restarts by itself; this takes about a minute.')
     setWaiting(st.current)
-    api.updateInstall().catch((e: ApiError) => {
-      setMsg(e.message)
+    api.updateInstall(anyway).catch((e: ApiError) => {
       setWaiting('')
+      if (e.status === 409) {
+        setMsg('')
+        setInterrupts(e.message)
+      } else setMsg(e.message)
     })
   }
   const undo = () => {
@@ -615,9 +639,22 @@ function UpdateCard() {
           {st.available && (
             <p>
               Version {st.available} is available.{' '}
-              <button className="primary" onClick={install} disabled={!!waiting}>
+              <button className="primary" onClick={() => install(false)} disabled={!!waiting}>
                 Install it now
               </button>
+            </p>
+          )}
+          {st.available && st.waiting && !waiting && !interrupts && (
+            <p className="note" data-testid="update-waiting">
+              It is waiting for a quiet moment: it installs by itself as soon as nobody is watching.
+              {st.watching.length > 0 && ` Watching right now: ${st.watching.join(', ')}.`}
+            </p>
+          )}
+          {interrupts && (
+            <p className="note" role="alert" data-testid="update-interrupts">
+              {interrupts}{' '}
+              <button onClick={() => install(true)}>Install anyway</button>{' '}
+              <button onClick={() => setInterrupts('')}>Not now</button>
             </p>
           )}
           {st.problem && <p className="note">{st.problem}</p>}

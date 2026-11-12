@@ -256,7 +256,9 @@ func Unpack(zipPath, installDir, version string) (string, error) {
 		return "", errors.New("the downloaded package could not be opened")
 	}
 	defer zr.Close()
-	staged := filepath.Join(installDir, "update-"+safeName(version))
+	staged := stagedDir(installDir, version)
+	// A note left by an earlier unpacking says nothing about this one.
+	os.Remove(staged + readySuffix)
 	if err := os.RemoveAll(staged); err != nil {
 		return "", err
 	}
@@ -303,6 +305,104 @@ func Unpack(zipPath, installDir, version string) (string, error) {
 	return staged, nil
 }
 
+func stagedDir(installDir, version string) string {
+	return filepath.Join(installDir, "update-"+safeName(version))
+}
+
+// An unpacked version may have to wait before it is installed: an update
+// that installs by itself waits for a moment when nobody is watching, and
+// the PC may be switched off before that moment comes. So that the version
+// need not be downloaded again every time, its folder is kept, with a note
+// beside it ("update-v1.2.3.ready") that lists what the folder held when it
+// was unpacked from a package that matched the release's checksum. A folder
+// is only used again if it still holds exactly that.
+const readySuffix = ".ready"
+
+type readyNote struct {
+	Version string            `json:"version"`
+	Files   map[string]string `json:"files"` // each file's SHA-256, by name
+}
+
+func hashFile(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// holds lists what is in an unpacked folder: each file's SHA-256, by name.
+func holds(staged string) (map[string]string, error) {
+	entries, err := os.ReadDir(staged)
+	if err != nil {
+		return nil, err
+	}
+	files := map[string]string{}
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			return nil, fmt.Errorf("%s is not a plain file", e.Name())
+		}
+		sum, err := hashFile(filepath.Join(staged, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		files[e.Name()] = sum
+	}
+	return files, nil
+}
+
+// MarkReady writes the note that lets a folder made by Unpack be used
+// later (see Ready). Call it straight after Unpack.
+func MarkReady(staged, version string) error {
+	files, err := holds(staged)
+	if err != nil {
+		return err
+	}
+	b, _ := json.MarshalIndent(readyNote{Version: version, Files: files}, "", "  ")
+	tmp := staged + readySuffix + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, staged+readySuffix)
+}
+
+// readNote returns the note beside an unpacked folder, if it has one that
+// can be read.
+func readNote(staged string) (readyNote, bool) {
+	var note readyNote
+	b, err := os.ReadFile(staged + readySuffix)
+	if err != nil || json.Unmarshal(b, &note) != nil || len(note.Files) == 0 {
+		return note, false
+	}
+	return note, true
+}
+
+// Ready returns the folder that holds version, unpacked earlier and still
+// exactly as it was then. ok is false when there is none, or when anything
+// about it has changed: a file missing, added or different.
+func Ready(installDir, version string) (staged string, ok bool) {
+	staged = stagedDir(installDir, version)
+	note, ok := readNote(staged)
+	if !ok || note.Version != version {
+		return "", false
+	}
+	files, err := holds(staged)
+	if err != nil || len(files) != len(note.Files) {
+		return "", false
+	}
+	for name, sum := range note.Files {
+		if files[name] != sum {
+			return "", false
+		}
+	}
+	return staged, true
+}
+
 const previousSuffix = ".previous"
 
 // Swap moves the unpacked files into installDir. Each file it replaces is
@@ -340,6 +440,7 @@ func Swap(installDir, staged string) error {
 		done = append(done, name)
 	}
 	os.Remove(staged)
+	os.Remove(staged + readySuffix)
 	return nil
 }
 
@@ -388,9 +489,12 @@ func Rollback(installDir string) error {
 }
 
 // Tidy removes what earlier updates left behind: old downloads, unpacked
-// folders and files set aside by a rollback.
-func Tidy(installDir string) {
-	for _, pattern := range []string{"download-*.zip", "*.failed", "*.stale-*"} {
+// folders and files set aside by a rollback. One unpacked folder may stay:
+// a version newer than current, the one that is running, that was made
+// ready and is still waiting to be installed (see Ready, which checks the
+// folder itself when the time comes).
+func Tidy(installDir, current string) {
+	for _, pattern := range []string{"download-*.zip", "*.failed", "*.stale-*", "update-*" + readySuffix + ".tmp"} {
 		m, _ := filepath.Glob(filepath.Join(installDir, pattern))
 		for _, p := range m {
 			os.Remove(p)
@@ -398,9 +502,24 @@ func Tidy(installDir string) {
 	}
 	m, _ := filepath.Glob(filepath.Join(installDir, "update-*"))
 	for _, p := range m {
-		if st, err := os.Stat(p); err == nil && st.IsDir() {
-			os.RemoveAll(p)
+		st, err := os.Lstat(p)
+		if err != nil {
+			continue
 		}
+		if !st.IsDir() {
+			// A note whose folder is gone says nothing any more.
+			if dir, isNote := strings.CutSuffix(p, readySuffix); isNote {
+				if _, err := os.Stat(dir); err != nil {
+					os.Remove(p)
+				}
+			}
+			continue
+		}
+		if note, ok := readNote(p); ok && p == stagedDir(installDir, note.Version) && Newer(note.Version, current) {
+			continue
+		}
+		os.RemoveAll(p)
+		os.Remove(p + readySuffix)
 	}
 }
 

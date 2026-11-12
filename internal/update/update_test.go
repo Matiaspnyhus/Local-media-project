@@ -234,14 +234,110 @@ func TestSwapRollbackAndTidy(t *testing.T) {
 	if err := Rollback(dir); err == nil {
 		t.Fatal("rolled back twice")
 	}
-	Tidy(dir)
+	Tidy(dir, "v1.0.0")
+	if got := listing(dir); got != "NEW.txt ffprobe.exe localmedia.exe unrelated.txt" {
+		t.Fatalf("after tidying: %s", got)
+	}
+}
+
+func listing(dir string) string {
 	left, _ := os.ReadDir(dir)
 	var names []string
 	for _, e := range left {
 		names = append(names, e.Name())
 	}
-	if got := strings.Join(names, " "); got != "NEW.txt ffprobe.exe localmedia.exe unrelated.txt" {
+	return strings.Join(names, " ")
+}
+
+// A version that was unpacked but could not be installed yet (someone was
+// watching, and then the PC was switched off) is kept for the next start,
+// so that it is not downloaded again every evening. It is only used again
+// if it is still exactly what was unpacked.
+func TestAnUnpackedVersionIsKeptUntilItCanBeInstalled(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "localmedia.exe"), []byte("v1 program"), 0o755)
+	unpack := func(version string) string {
+		t.Helper()
+		z := filepath.Join(dir, "download-"+version+".zip")
+		os.WriteFile(z, pkg(t, map[string]string{"LocalMedia/localmedia.exe": version + " program", "LocalMedia/ffmpeg.exe": version + " converter"}), 0o600)
+		staged, err := Unpack(z, dir, version)
+		os.Remove(z)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return staged
+	}
+
+	staged := unpack("v1.1.0")
+	if _, ok := Ready(dir, "v1.1.0"); ok {
+		t.Fatal("a folder that was never noted as whole is called ready")
+	}
+	if err := MarkReady(staged, "v1.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := Ready(dir, "v1.1.0"); !ok || got != staged {
+		t.Fatalf("Ready = %q, %v; want the unpacked folder", got, ok)
+	}
+	if _, ok := Ready(dir, "v1.2.0"); ok {
+		t.Fatal("the folder for one version was offered for another")
+	}
+
+	// The next start tidies up, and must leave the waiting version alone.
+	Tidy(dir, "v1.0.0")
+	if got, ok := Ready(dir, "v1.1.0"); !ok || got != staged {
+		t.Fatalf("tidying removed a version that was waiting to be installed (the folder now holds: %s)", listing(dir))
+	}
+	if got := listing(dir); got != "localmedia.exe update-v1.1.0 update-v1.1.0.ready" {
 		t.Fatalf("after tidying: %s", got)
+	}
+
+	// Anything about the folder that has changed makes it unusable.
+	for name, change := range map[string]func(){
+		"a file was changed": func() { os.WriteFile(filepath.Join(staged, "ffmpeg.exe"), []byte("something else"), 0o755) },
+		"a file is missing":  func() { os.Remove(filepath.Join(staged, "ffmpeg.exe")) },
+		"a file was added":   func() { os.WriteFile(filepath.Join(staged, "extra.exe"), []byte("x"), 0o755) },
+		"the note is junk":   func() { os.WriteFile(staged+".ready", []byte("{"), 0o600) },
+		"the note is gone":   func() { os.Remove(staged + ".ready") },
+	} {
+		staged = unpack("v1.1.0")
+		if err := MarkReady(staged, "v1.1.0"); err != nil {
+			t.Fatal(err)
+		}
+		change()
+		if _, ok := Ready(dir, "v1.1.0"); ok {
+			t.Errorf("%s, and the folder was still called ready", name)
+		}
+	}
+
+	// Unpacking again starts afresh: the old note does not vouch for it.
+	staged = unpack("v1.1.0")
+	if err := MarkReady(staged, "v1.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	staged = unpack("v1.1.0")
+	if _, ok := Ready(dir, "v1.1.0"); ok {
+		t.Fatal("a note from an earlier unpacking vouched for a new one")
+	}
+
+	// Once installed, nothing of it is left to tidy; and a folder for a
+	// version that is not newer than the running one is not kept.
+	if err := MarkReady(staged, "v1.1.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := Swap(dir, staged); err != nil {
+		t.Fatal(err)
+	}
+	if got := listing(dir); got != "ffmpeg.exe localmedia.exe localmedia.exe.previous" {
+		t.Fatalf("after installing: %s", got)
+	}
+	old := unpack("v1.1.0")
+	MarkReady(old, "v1.1.0")
+	half := unpack("v1.3.0") // unpacked, never noted as whole
+	os.WriteFile(filepath.Join(dir, "update-v1.4.0.ready"), []byte(`{"version":"v1.4.0","files":{"a":"b"}}`), 0o600)
+	_ = half
+	Tidy(dir, "v1.1.0")
+	if got := listing(dir); got != "ffmpeg.exe localmedia.exe localmedia.exe.previous" {
+		t.Fatalf("after tidying a version that is already installed, a half-unpacked one and a note without a folder: %s", got)
 	}
 }
 
