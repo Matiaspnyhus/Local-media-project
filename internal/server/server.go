@@ -154,8 +154,13 @@ func New(cfg Config) (*Server, error) {
 	if s.linkKey, err = s.loadOrCreateKey("link_key"); err != nil {
 		return nil, err
 	}
-	// Before anything can be written to the cache. (The caller has made
-	// sure no other copy of the program is using this data folder.)
+	// Before anything can be written to the cache. The program takes its
+	// port before it comes here, which stops the usual second copy (the
+	// Start-menu entry pressed while a copy is running) before it can
+	// remove that copy's chunks. Nothing stops a copy started on purpose
+	// with another port on the same data folder: it removes them here,
+	// whether or not it finds a converter, as the converter's own start
+	// below always has when there is one.
 	removeLeftovers(cfg.DataDir)
 	if cfg.FFmpeg != "" {
 		s.ffmpeg = cfg.FFmpeg
