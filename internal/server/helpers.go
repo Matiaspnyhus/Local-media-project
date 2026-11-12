@@ -78,6 +78,7 @@ type subtitleJob struct {
 
 	mu      sync.Mutex
 	text    []byte        // what ffmpeg has produced so far
+	caption bool          // text holds at least one caption, not just its first line
 	done    bool          // ffmpeg is gone; text will not grow
 	ok      bool          // text is the whole subtitle
 	more    chan struct{} // closed, and replaced, whenever text grows or the job ends
@@ -108,6 +109,10 @@ func keptName(fileID, key string, size, mtime int64) string {
 // The caller has said that a browser may keep the answer for a while. That
 // holds for the kept copy, which is whole. An answer that is still being
 // made may yet turn out cut short, so a browser is told not to keep it.
+//
+// When ffmpeg fails, the answer is an error if nothing has been sent yet,
+// and is cut off if captions have (see below). It is never a success with
+// nothing in it.
 func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path string, n int, name string) {
 	dir := filepath.Join(s.dataDir, "cache", "subtitles")
 	cached := filepath.Join(dir, name+".vtt")
@@ -132,9 +137,24 @@ func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path s
 	sent := 0
 	for {
 		job.mu.Lock()
-		text, done, ok, more := job.text[sent:], job.done, job.ok, job.more
+		text, caption, done, ok, more := job.text[sent:], job.caption, job.done, job.ok, job.more
 		job.mu.Unlock()
-		if len(text) > 0 {
+		switch {
+		case done && !ok && sent == 0:
+			// Nothing has been sent, so the answer can still say that it
+			// failed. That is why nothing is sent before the first caption:
+			// ffmpeg writes the answer's first line ("WEBVTT") the moment it
+			// starts, also when it then gives up on the whole subtitle, and
+			// sent on at once that line made a success out of every failure.
+			writeErr(w, http.StatusInternalServerError, "Could not prepare the subtitle.")
+			return
+		case done && !ok:
+			// Captions have gone out under an answer that said "success",
+			// which cannot be taken back. Ending it here would look like a
+			// whole subtitle that simply stops. Cutting the connection tells
+			// the browser the truth: this did not arrive whole.
+			panic(http.ErrAbortHandler)
+		case len(text) > 0 && (caption || done):
 			if _, err := w.Write(text); err != nil {
 				return // this viewer went away
 			}
@@ -143,11 +163,7 @@ func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path s
 			}
 			sent += len(text)
 			continue
-		}
-		if done {
-			if !ok && sent == 0 {
-				writeErr(w, http.StatusInternalServerError, "Could not prepare the subtitle.")
-			}
+		case done:
 			return
 		}
 		select {
@@ -263,6 +279,8 @@ func (s *Server) runSubtitleJob(ctx context.Context, job *subtitleJob, path stri
 		}
 		job.mu.Lock()
 		if whole > 0 {
+			// Every caption has a line with an arrow between its two times.
+			job.caption = job.caption || bytes.Contains(rest[:whole], []byte("-->"))
 			job.text = append(job.text, readable(rest[:whole])...)
 			rest = rest[whole:]
 			job.grew()
@@ -285,6 +303,9 @@ func (s *Server) runSubtitleJob(ctx context.Context, job *subtitleJob, path stri
 		return
 	case err != nil:
 		s.subtitleTrouble(path, "could not be prepared", said.orElse(err.Error()))
+		return
+	case len(job.text) == 0: // (only this function changes the text)
+		s.subtitleTrouble(path, "could not be prepared", said.orElse("ffmpeg ended without writing anything"))
 		return
 	}
 	if said.any() {

@@ -2,6 +2,9 @@ package server
 
 import (
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -242,5 +245,122 @@ func TestEachLineIsReadInItsOwnEncoding(t *testing.T) {
 	}
 	if got := string(readable([]byte(want))); got != want {
 		t.Errorf("text in today's encoding was changed: %q", got)
+	}
+}
+
+// When ffmpeg gives up on a subtitle it has usually written the first line
+// of the answer already ("WEBVTT"). That used to go out as an answer that
+// succeeded, with nothing in it, which a browser was allowed to keep for an
+// hour. Here every caption of the film is in the old encoding, which made
+// ffmpeg give up in just that way (it no longer does: the captions are
+// rescued now). The answer must be the captions or an error; never an
+// empty success.
+func TestASubtitleFFmpegGivesUpOnIsNeverAnEmptySuccess(t *testing.T) {
+	e := newConvertEnv(t)
+	filmWithCaptionsInside(t, e, "All Accents (2002).mkv", oldCaptions[1:4])
+	filmWithCaptionsInside(t, e, "Spoiled Later (2003).mkv", readCaptions)
+	c := e.setup()
+	e.s.InspectNow()
+	var p playAnswer
+	decode(t, e.do("POST", "/api/items/"+e.firstItem(c, "All Accents")+"/play", remote, c, nil), &p)
+	if len(p.Subtitles) != 1 {
+		t.Fatalf("subtitles: %+v", p.Subtitles)
+	}
+	w := e.do("GET", p.Subtitles[0].URL, remote, c, nil)
+	cc := w.Header().Get("Cache-Control")
+	switch {
+	case w.Code == 200:
+		if missing := lacking(w.Body.String(), readCaptions[1:4]); len(missing) > 0 {
+			t.Errorf("answered 200 %q with Cache-Control %q: a success without %q", w.Body, cc, missing)
+		}
+	case cc != "no-store" || !strings.Contains(w.Body.String(), `"error"`):
+		t.Errorf("answered %d %q with Cache-Control %q; an error must say so and must not be kept", w.Code, w.Body, cc)
+	}
+
+	// A film that has become unreadable since it was inspected: ffmpeg
+	// fails on it outright, and the answer says so.
+	p = playAnswer{}
+	decode(t, e.do("POST", "/api/items/"+e.firstItem(c, "Spoiled Later")+"/play", remote, c, nil), &p)
+	if len(p.Subtitles) != 1 {
+		t.Fatalf("subtitles: %+v", p.Subtitles)
+	}
+	os.WriteFile(filepath.Join(e.media, "Spoiled Later (2003).mkv"), []byte("this is not a film any more"), 0o644)
+	w = e.do("GET", p.Subtitles[0].URL, remote, c, nil)
+	if w.Code != 500 || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Body.String(), `"error"`) {
+		t.Errorf("a film ffmpeg cannot read answered %d %q with Cache-Control %q; want an error that is not kept", w.Code, w.Body, w.Header().Get("Cache-Control"))
+	}
+	onDisk, _ := os.ReadFile(filepath.Join(e.s.dataDir, "logs", "localmedia.log"))
+	if !strings.Contains(string(onDisk), "the subtitles of Spoiled Later (2003).mkv could not be prepared") || strings.Contains(string(onDisk), e.media) {
+		t.Errorf("the log should say which film's subtitles failed, without its folder (%s):\n%s", e.media, onDisk)
+	}
+}
+
+// What remains when ffmpeg does fail, shown with a stand-in for it that
+// fails in each of the ways it can.
+func TestASubtitleThatCannotBeMadeIsAnErrorThatIsNotKept(t *testing.T) {
+	e := filmWith(t, []string{`0,'video','h264',1,0,0,0,'',''`, `1,'audio','aac',1,0,0,0,'eng',''`,
+		`2,'subtitle','subrip',0,0,0,0,'eng',''`, `3,'subtitle','subrip',0,0,0,0,'nor',''`, `4,'subtitle','subrip',0,0,0,0,'dan',''`, `5,'subtitle','subrip',0,0,0,0,'swe',''`}, nil)
+	subs := e.play(t).Subtitles
+	if len(subs) != 4 {
+		t.Fatalf("subtitles: %+v", subs)
+	}
+	isError := func(what string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if w.Code != 500 || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Body.String(), `"error"`) {
+			t.Errorf("%s: answered %d %q with Cache-Control %q; want an error that is not kept", what, w.Code, w.Body, w.Header().Get("Cache-Control"))
+		}
+		if kept := keptSubtitles(e.env); len(kept) != 0 {
+			t.Errorf("%s: something was kept for next time: %v", what, kept)
+		}
+	}
+
+	// It stops with an error before the first caption.
+	e.s.ffmpeg = script(t, `printf 'WEBVTT\n\n'; echo 'Error decoding subtitles' >&2; exit 69`)
+	isError("ffmpeg gave up before the first caption", e.do("GET", subs[0].URL, remote, e.c, nil))
+	// The same with the captions asked to be moved later (see laterVTT).
+	isError("ffmpeg gave up before the first caption, captions moved", e.do("GET", subs[0].URL+"?shift=4000", remote, e.c, nil))
+
+	// It reports success and has written nothing at all.
+	e.s.ffmpeg = script(t, `exit 0`)
+	isError("ffmpeg wrote nothing", e.do("GET", subs[1].URL, remote, e.c, nil))
+
+	// It dies after some captions have been sent on. The answer began as a
+	// success and cannot be taken back, so the connection is cut: a browser
+	// then knows the subtitle did not arrive whole, and keeps nothing.
+	e.s.ffmpeg = script(t, `printf 'WEBVTT\n\n00:01.000 --> 00:02.000\nThe only caption that got out\n\n'; sleep 0.3; exit 1`)
+	srv := httptest.NewServer(e.s)
+	defer srv.Close()
+	r, _ := http.NewRequest("GET", srv.URL+subs[2].URL, nil)
+	r.AddCookie(e.c)
+	resp, err := srv.Client().Do(r)
+	if err != nil {
+		t.Fatalf("asking for a subtitle that fails partway: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if err == nil {
+		t.Errorf("a subtitle that failed partway ended like a whole one: %d %q", resp.StatusCode, body)
+	}
+	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
+		t.Errorf("a subtitle still being made was sent with Cache-Control %q, so a browser may keep it if it fails", cc)
+	}
+	if !strings.Contains(string(body), "The only caption that got out") {
+		t.Errorf("what ffmpeg had made before it died was not sent on: %q", body)
+	}
+	if kept := keptSubtitles(e.env); len(kept) != 0 {
+		t.Errorf("a subtitle that failed partway was kept for next time: %v", kept)
+	}
+
+	// And when all goes well: the answer being made is not for keeping (it
+	// might have failed), the kept copy sent next time is.
+	e.s.ffmpeg = script(t, `printf 'WEBVTT\n\n00:01.000 --> 00:02.000\nAll of it\n\n'`)
+	for i, want := range []string{"no-store", "private, max-age=3600"} {
+		w := e.do("GET", subs[3].URL, remote, e.c, nil)
+		if w.Code != 200 || !strings.Contains(w.Body.String(), "All of it") || w.Header().Get("Cache-Control") != want {
+			t.Errorf("a good subtitle, request %d: %d %q with Cache-Control %q, want %q", i+1, w.Code, w.Body, w.Header().Get("Cache-Control"), want)
+		}
+	}
+	if kept := keptSubtitles(e.env); len(kept) != 1 {
+		t.Errorf("after a good run %d subtitles are kept, want 1: %v", len(kept), kept)
 	}
 }
