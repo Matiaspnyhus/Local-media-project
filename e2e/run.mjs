@@ -493,17 +493,25 @@ try {
     await page.waitForFunction((t) => document.querySelector('video').currentTime > t + 0.7, resumedAt, { timeout: 20000 })
     const v = await page.evaluate(() => {
       const el = document.querySelector('video')
-      return { at: el.currentTime, from: el.buffered.length ? el.buffered.start(0) : -1, sub: document.querySelector('[data-testid=pick-subtitles]').value }
+      const held = Array.from({ length: el.buffered.length }, (_, i) => [el.buffered.start(i), el.buffered.end(i)])
+      return {
+        at: el.currentTime,
+        from: held.length ? held[0][0] : -1,
+        // A tenth of a second of slack, for an edge that falls a hair
+        // beside the clock.
+        covered: held.some(([a, b]) => a <= el.currentTime + 0.1 && el.currentTime <= b + 0.1),
+        ranges: held.map(([a, b]) => `${a.toFixed(2)}-${b.toFixed(2)}`).join(' '),
+        sub: document.querySelector('[data-testid=pick-subtitles]').value,
+      }
     })
     assert.ok(resumedAt >= 30 && resumedAt < 38 && v.at < 39.5, `resumed at ${resumedAt}, now at ${v.at}`)
+    page.off('request', note)
+    console.log(`      (resumed at ${resumedAt.toFixed(2)} s and played on to ${v.at.toFixed(2)} s; asked for ${asked.join(' ')}; holding ${v.ranges})`)
+    // In every engine: the player holds the part of the film it says it is
+    // playing. Its clock alone only says where it was told to be.
+    assert.ok(v.covered, `the player says it is at ${v.at} s but holds only: ${v.ranges || 'nothing'}`)
     // The first chunk fetched is the one from 30 seconds; the player must
     // place it exactly there, or everything after would be out of step.
-    page.off('request', note)
-    const ranges = await page.evaluate(() => {
-      const b = document.querySelector('video').buffered
-      return Array.from({ length: b.length }, (_, i) => `${b.start(i).toFixed(2)}-${b.end(i).toFixed(2)}`).join(' ')
-    })
-    console.log(`      (resumed at ${resumedAt.toFixed(2)} s and played on to ${v.at.toFixed(2)} s; asked for ${asked.join(' ')}; holding ${ranges})`)
     if (browserName === 'chromium') assert.ok(Math.abs(v.from - 30) < 0.25, `the chunk for 30 s was placed at ${v.from}`)
     assert.notEqual(v.sub, '', 'the subtitle choice was remembered')
     await page.goBack()
