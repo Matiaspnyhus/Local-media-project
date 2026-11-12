@@ -75,6 +75,33 @@ jobs:
       - name: Measure
         run: bash packaging/speed-probe.sh "$RUNNER_TEMP/ffmpeg/ffmpeg" "$RUNNER_TEMP/probe" 20
 
+  # Answers one question, when a commit message asks with [release-probe]:
+  # may these checks make a tag in this repository, and on which commits?
+  # (Publishing a version by commit message needs it.) It makes tags named
+  # probe-... and removes them again at once; nothing else is touched.
+  release-probe:
+    if: contains(github.event.head_commit.message, '[release-probe]')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          repo="$GITHUB_REPOSITORY"
+          main="$(gh api "repos/$repo/git/ref/heads/main" -q .object.sha)"
+          for target in c4c470dbda3ad759afdd46c7c78f58625b50ad77 "$GITHUB_SHA" "$main"; do
+            name="probe-$GITHUB_RUN_ID-${target:0:7}"
+            echo "=== a tag at $target"
+            gh api -i --method POST "repos/$repo/git/refs" -f ref="refs/tags/$name" -f sha="$target" > out.txt 2>&1
+            grep -iE "^HTTP|x-accepted-github-permissions|\"message\"|\"ref\"|documentation_url" out.txt
+            gh api --method DELETE "repos/$repo/git/refs/tags/$name" >/dev/null 2>&1 && echo "(removed again)"
+          done
+          echo "=== reading the releases list"
+          gh api -i "repos/$repo/releases" 2>&1 | grep -iE "^HTTP|x-accepted-github-permissions" | head -3
+          exit 0
+
   linux:
     needs: plan
     runs-on: ubuntu-latest
