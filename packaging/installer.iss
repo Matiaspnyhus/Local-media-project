@@ -59,25 +59,112 @@ Filename: "{app}\localmedia.exe"; Description: "Start Local Media now"; Flags: n
 
 [UninstallDelete]
 ; What automatic updates leave beside the program: earlier versions kept
-; for going back. The data folder is somewhere else and is not listed here.
+; for going back, and a newer version that was unpacked and was still
+; waiting for a quiet moment to be installed (a folder "update-<version>"
+; and a note beside it). The data folder is somewhere else and is not
+; listed here.
 Type: files; Name: "{app}\*.previous"
 Type: files; Name: "{app}\*.failed"
 Type: files; Name: "{app}\*.stale-*"
 Type: files; Name: "{app}\download-*.zip"
+Type: filesandordirs; Name: "{app}\update-*"
 Type: dirifempty; Name: "{app}"
 
 [Code]
 const
   RuleName = 'Local Media';
+  { How long to wait for the program's files to be let go of: this many
+    looks, a fifth of a second apart (20 seconds). }
+  FreeLooks = 100;
 
-procedure StopRunningCopy();
+{ Windows does not let a program's file be replaced or deleted while the
+  program runs, and tells so when the file is opened for writing. Nothing
+  is written. A file that is not there is not in use. }
+function InUse(FileName: String): Boolean;
+begin
+  Result := False;
+  if FileExists(FileName) then
+    Result := not SaveStringToFile(FileName, '', True);
+end;
+
+{ The running copy starts helper programs (ffmpeg.exe to convert,
+  ffprobe.exe to inspect files) and takes them with it when it ends. One
+  can be left all the same: started by an earlier version, which did not,
+  or in the last moment before the copy was stopped. A helper reading a
+  long film through can run for minutes, and for as long as it runs its
+  file cannot be replaced. So any that is running from this folder is
+  stopped here, whoever started it. Only from this folder: an ffmpeg the
+  owner runs for something else is somewhere else, and is left alone.
+
+  Windows itself is asked which programs are running and from where (the
+  same service Task Manager's details come from). If it cannot be asked,
+  that is noted in the log and the wait below has to do. }
+procedure StopHelpersIn(Dir: String);
+var
+  Locator, Service, Found, Helper: Variant;
+  I: Integer;
+  Path: String;
+begin
+  try
+    Locator := CreateOleObject('WbemScripting.SWbemLocator');
+    Service := Locator.ConnectServer('', 'root\CIMV2', '', '');
+    Found := Service.ExecQuery('SELECT ProcessId, ExecutablePath FROM Win32_Process WHERE Name = "ffmpeg.exe" OR Name = "ffprobe.exe"');
+    for I := 0 to Found.Count - 1 do
+    begin
+      Helper := Found.ItemIndex(I);
+      { One that ended in this very moment is no longer there to read.
+        Another user's program shows no path, and is not ours to stop. }
+      if not VarIsNull(Helper) then
+        if not VarIsNull(Helper.ExecutablePath) then
+        begin
+          Path := Helper.ExecutablePath;
+          if CompareText(ExtractFilePath(Path), AddBackslash(Dir)) = 0 then
+          begin
+            Log('Stopping a helper program that was still running: ' + Path);
+            Helper.Terminate();
+          end;
+        end;
+    end;
+  except
+    Log('Could not look for helper programs that are still running: ' + GetExceptionMessage);
+  end;
+end;
+
+{ Waits until neither the program nor a helper is running from Dir any
+  more. False if one still is after the whole wait. }
+function FilesAreFree(Dir: String): Boolean;
+var
+  Look: Integer;
+begin
+  Result := False;
+  for Look := 1 to FreeLooks do
+  begin
+    if not (InUse(Dir + '\localmedia.exe') or InUse(Dir + '\ffmpeg.exe') or InUse(Dir + '\ffprobe.exe')) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Sleep(200);
+  end;
+end;
+
+{ Stops the running copy and its helpers, and waits until their files can
+  be replaced. False if they still cannot be. }
+function StopRunningCopy(): Boolean;
 var
   ResultCode: Integer;
+  Dir: String;
 begin
+  Dir := ExpandConstant('{app}');
   { Only this user's own copy can be stopped without administrator rights,
-    which is the only copy this installer manages. }
+    which is the only copy this installer manages. (Not with /T, which
+    would also close a film the owner has open in another player: that
+    was started by Local Media too.) }
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM localmedia.exe /F', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Sleep(700);
+  StopHelpersIn(Dir);
+  Result := FilesAreFree(Dir);
+  if not Result then
+    Log('The program or one of its helper programs is still running from ' + Dir);
 end;
 
 procedure Elevated(Params: String);
@@ -91,8 +178,11 @@ end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  StopRunningCopy();
   Result := '';
+  { Better to stop here and say why than to fail half-way through the
+    files with Windows' own "access is denied". }
+  if not StopRunningCopy() then
+    Result := 'Local Media, or a helper program it started, is still running and could not be stopped, so its files cannot be replaced yet. Wait a minute and run this installer again. Restarting the PC also clears it.';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -111,6 +201,8 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
   begin
+    { If something still holds a file after the wait, the uninstaller
+      goes on and removes what it can, as it always has. }
     StopRunningCopy();
     Elevated('netsh advfirewall firewall delete rule name="' + RuleName + '"');
   end;
