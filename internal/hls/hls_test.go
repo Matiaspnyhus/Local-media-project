@@ -499,12 +499,12 @@ func TestAFilmThatCannotBeCutIsNotGivenAListAsIfItCould(t *testing.T) {
 	// A list like that kept from an earlier version is not played from
 	// either: the film is cut evenly instead, on the same clock.
 	m := manager(t, ffmpeg)
-	token := m.Open(Spec{Path: src, Grid: Grid{StartMs: 36000000, EndMs: 36090000, Cuts: []int64{36000000}, From: "probe"}, VideoCodec: "h264", AudioTrack: -1})
+	token := m.Open(Spec{Path: src, Grid: Grid{StartMs: 36000000, EndMs: 36090000, Cuts: []int64{36000000}, From: "probe", LeadMs: 3000}, VideoCodec: "h264", AudioTrack: -1})
 	list, _ := m.Playlist(token)
 	m.mu.Lock()
 	used := m.sessions[token].spec.Grid
 	m.mu.Unlock()
-	if strings.Count(string(list), "#EXTINF") != 15 || used.StartMs != 36000000 || !used.Valid() {
+	if strings.Count(string(list), "#EXTINF") != 15 || used.StartMs != 36000000 || used.LeadMs != 3000 || !used.Valid() {
 		t.Errorf("a one-chunk list for 90 seconds was used as it came: %+v\n%s", used, list)
 	}
 }

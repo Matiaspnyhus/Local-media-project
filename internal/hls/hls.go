@@ -223,7 +223,11 @@ func (m *Manager) Open(spec Spec) string {
 	if !spec.Grid.Valid() {
 		// Nothing to cut by, or cuts so far apart that a chunk could never
 		// be made in time: cut evenly instead, on the same clock.
+		lead := spec.Grid.LeadMs
 		spec.Grid = uniform(spec.Grid.StartMs, spec.Grid.EndMs-spec.Grid.StartMs)
+		if lead > 0 && lead <= maxChunkMs {
+			spec.Grid.LeadMs = lead
+		}
 	}
 	b := make([]byte, 16)
 	rand.Read(b)
