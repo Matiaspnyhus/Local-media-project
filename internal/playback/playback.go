@@ -146,9 +146,9 @@ type Plan struct {
 	TooSlow bool `json:"tooSlow"`
 	// PCCannot says the answer is no because of this PC, not the device:
 	// the file would have to be repackaged or converted for the device,
-	// and this PC cannot do that. It cannot convert pictures, or its
-	// converter lacks what this film needs, or it is too slow (TooSlow is
-	// then set as well).
+	// and this PC cannot do that. It has no converter, or its converter
+	// lacks what this film needs, or it is too slow (TooSlow is then set
+	// as well).
 	PCCannot bool `json:"pcCannot"`
 	// Video says what the picture is converted to. It is empty unless the
 	// method is convert.
@@ -228,6 +228,10 @@ func DecideFor(m Media, c *Caps, w Want, l Limits) Plan {
 func decide(m Media, c *Caps, w Want, l Limits, sub *Subtitle, mode SubtitleMode) Plan {
 	v := m.Video[0]
 	key := videoKey(v.Codec, v.BitDepth)
+	// Repackaging takes a device that plays chunks and a converter on this
+	// PC; converting the picture takes a converter that can do that too.
+	chunks := c.HLS && !l.NoConverter
+	canConvert := l.Convert && !l.NoConverter
 	natural := BrowserAudio(m.Audio)
 	audioTrack := w.Audio
 	if audioTrack < 0 || audioTrack >= len(m.Audio) {
@@ -284,7 +288,7 @@ func decide(m Media, c *Caps, w Want, l Limits, sub *Subtitle, mode SubtitleMode
 	// no other is marked as the main one (see BrowserAudio). Repackaging
 	// names the track, so in any other case that is the way to be sure.
 	inDoubt := len(m.Audio) > 1 && (audioTrack != 0 || natural != 0)
-	if inDoubt && audioTrack == natural && len(other) == 0 && !(c.HLS && packagedVideo[v.Codec] && (copyable || c.Audio["aac"])) {
+	if inDoubt && audioTrack == natural && len(other) == 0 && !(chunks && packagedVideo[v.Codec] && (copyable || c.Audio["aac"])) {
 		// Nothing else is wrong and repackaging is not possible here: the
 		// file plays as it is, with whichever track the browser picks.
 		inDoubt = false
@@ -317,8 +321,13 @@ func decide(m Media, c *Caps, w Want, l Limits, sub *Subtitle, mode SubtitleMode
 			p.AudioCopy = true
 			return advised(p, why(), m, a, c, w, l)
 		}
-		// The original cannot simply be sent. Can it be repackaged?
-		if !c.HLS {
+		// The original cannot simply be sent. Can it be repackaged? Where
+		// the device would take it and this PC has nothing to repackage
+		// with, it is the PC that is named.
+		if c.HLS && l.NoConverter {
+			return cannot(p, append(other, "This PC has no converter, so the file cannot be repackaged for this device."))
+		}
+		if !chunks {
 			return refuse(p, append(other, "This browser cannot play repackaged video either."))
 		}
 		if packagedVideo[v.Codec] {
@@ -334,7 +343,7 @@ func decide(m Media, c *Caps, w Want, l Limits, sub *Subtitle, mode SubtitleMode
 			}
 			return advised(p, why(), m, a, c, w, l)
 		}
-		if !l.Convert {
+		if !canConvert {
 			return refuse(p, append(other, "Its picture ("+VideoName(v)+") cannot be repackaged without converting it, which arrives in a later version."))
 		}
 		return converted(p, why("Its picture ("+VideoName(v)+") cannot be repackaged without converting it."), m, a, c, w, l)
@@ -342,8 +351,10 @@ func decide(m Media, c *Caps, w Want, l Limits, sub *Subtitle, mode SubtitleMode
 
 	// The picture has to be converted. Can this PC do that?
 	switch {
-	case l.Convert:
+	case canConvert:
 		return converted(p, why(), m, a, c, w, l)
+	case l.NoConverter:
+		return cannot(p, why("This PC has no converter, so the picture cannot be converted for this device."))
 	case lacks:
 		// M3's answer and M3's words, kept while Decide stands in for
 		// a PC without picture conversion.

@@ -174,6 +174,8 @@ func TestReplan(t *testing.T) {
 		// playing, not refused, and nobody is promised anything.
 		{"4K H.264 sent as it is, a PC that cannot convert", h264at(sizes[2], 0), uhdH264, plainWish, Limits{}, DecodeTrouble, 0, 0,
 			after{false, LessonDevice, Direct, 0, SubsNone, "This device had trouble showing the picture, but nothing easier to show can be made of this film here, so nothing was changed."}},
+		{"1080p HEVC sent as it is, a PC without a converter", stepHD, stepPhone, plainWish, Limits{NoConverter: true}, DecodeTrouble, 0, 0,
+			after{false, LessonDevice, Direct, 0, SubsNone, "This device had trouble showing the picture, but nothing easier to show can be made of this film here, so nothing was changed."}},
 		{"1080p HEVC sent as it is, a device that takes no chunks", stepHD, caps(false, "mp4", "hevc10", "aac"), plainWish, able, DecodeTrouble, 0, 0,
 			after{false, LessonDevice, Direct, 0, SubsNone, "This device had trouble showing the picture, but nothing easier to show can be made of this film here, so nothing was changed."}},
 		{"a device that has not said what it plays", stepHD, nil, plainWish, able, DecodeTrouble, 0, 0,

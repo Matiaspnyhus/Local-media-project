@@ -1053,7 +1053,7 @@ func TestLessonsAreAdvice(t *testing.T) {
 	}
 	// A PC that cannot convert, or not fast enough, sends the original.
 	tooSlow := measured(slowLink, every(1), every(1), every(1), every(1))
-	for name, l := range map[string]Limits{"cannot convert": {MaxRate: 5_000_000}, "too slow": tooSlow} {
+	for name, l := range map[string]Limits{"cannot convert": {MaxRate: 5_000_000}, "has no converter": {MaxRate: 5_000_000, Convert: true, NoConverter: true}, "too slow": tooSlow} {
 		if p = DecideFor(m, dev, want, l); p.Method != Direct || len(p.Reasons) != 0 {
 			t.Errorf("a slow connection and a PC that %s: %+v; want the original", name, p)
 		}
@@ -1288,6 +1288,7 @@ func TestALighterPictureIsAWish(t *testing.T) {
 		// Where this PC cannot make what was wished for, the film plays as
 		// it would have without the wish.
 		{"a film that plays as it is, on a PC that cannot convert", mp4, 3, Limits{}, Direct, 0},
+		{"a film that plays as it is, on a PC without a converter", mp4, 3, Limits{Convert: true, NoConverter: true}, Direct, 0},
 		{"a film that plays as it is, on a PC too slow to convert", mp4, 3, tooSlow, Direct, 0},
 		{"a film that plays as it is, on a device that takes no chunks", mp4, 3, able, Direct, 0},
 	} {

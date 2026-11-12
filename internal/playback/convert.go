@@ -54,6 +54,12 @@ const (
 type Limits struct {
 	// Convert says this PC can convert pictures at all.
 	Convert bool `json:"convert"`
+	// NoConverter says this PC has no converter program at all, so it can
+	// neither repackage a film nor convert anything in it, whatever the
+	// device takes and whatever Convert says. It is told apart from a
+	// device that takes no repackaged video (Caps.HLS) so that the answer
+	// names the PC, not the browser.
+	NoConverter bool `json:"noConverter"`
 	// ToneMap says its converter can turn HDR into normal colour, and
 	// DoViTone that it can do so for Dolby Vision profile 5, which needs a
 	// filter of its own (tonemapx).
@@ -325,7 +331,7 @@ func advised(p Plan, other []string, m Media, a *Track, c *Caps, w Want, l Limit
 		// smaller picture named among what is lost.
 		why = append(why, "You asked for a lighter picture.")
 	}
-	if len(why) == 0 || !l.Convert {
+	if len(why) == 0 || !l.Convert || l.NoConverter {
 		return p
 	}
 	if q := converted(p, append(why, other...), m, a, c, w, l); q.Playable != No {
