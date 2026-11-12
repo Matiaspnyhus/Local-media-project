@@ -472,7 +472,16 @@ try {
     await waitPlaying(page, 0.1)
     const from = await page.evaluate(() => document.querySelector('video').currentTime)
     await playsBeyond(page, from + 0.5, 'the film whose picture size is not known yet')
-    assert.equal(await alarm(), '', 'no alarm while the film has only just begun to play')
+    const early = await page.evaluate(() => {
+      const v = document.querySelector('video')
+      let played = 0
+      for (let i = 0; i < v.played.length; i++) played += v.played.end(i) - v.played.start(i)
+      return { played, alarm: document.querySelector('[data-testid=play-problem]')?.textContent || '' }
+    })
+    // (On a machine so slow that seconds of film went by before this look,
+    // the alarm may rightly be there already.)
+    if (early.played < 2.5) assert.equal(early.alarm, '', 'no alarm while the film has only just begun to play')
+    else console.log(`      (looked ${early.played.toFixed(1)} s into playing: too late to tell whether the alarm came too early)`)
     // If the size never comes, there really is no picture this browser can
     // show, and the viewer is told after a few seconds of playing.
     await page.waitForSelector('[data-testid=play-problem]', { timeout: 15000 }).catch(() => assert.fail('a film that plays on with no picture must be reported'))
