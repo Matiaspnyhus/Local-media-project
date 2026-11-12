@@ -558,3 +558,31 @@ func TestInstallingNowNamesWhoIsWatching(t *testing.T) {
 		t.Errorf("the updater was told %+v; want the same sign-in and the owner's \"anyway\"", told)
 	}
 }
+
+// How many sign-ins showed a sign of watching within a given time: what
+// the program asks before it asks the PC to stay awake. A film that was
+// paused and left does not count for it, however long the film is kept
+// open for the update's sake.
+func TestActiveViewersCountsRecentSignsOnly(t *testing.T) {
+	e := newEnv(t)
+	now := time.Unix(1_800_000_000, 0)
+	e.s.watch.now = func() time.Time { return now }
+	if n := e.s.ActiveViewers(5 * time.Minute); n != 0 {
+		t.Fatalf("%d viewers before anyone watched", n)
+	}
+	e.s.watch.sign("one", "")
+	e.s.watch.sign("two", "a-film-that-stays-open")
+	if n := e.s.ActiveViewers(5 * time.Minute); n != 2 {
+		t.Errorf("%d viewers right after two signs, want 2", n)
+	}
+	now = now.Add(4 * time.Minute)
+	e.s.watch.sign("one", "")
+	now = now.Add(2 * time.Minute)
+	if n := e.s.ActiveViewers(5 * time.Minute); n != 1 {
+		t.Errorf("%d viewers when one of the two has been quiet for six minutes, want 1", n)
+	}
+	now = now.Add(10 * time.Minute)
+	if n := e.s.ActiveViewers(5 * time.Minute); n != 0 {
+		t.Errorf("%d viewers after everyone has been quiet, want 0 (a film left open does not count here)", n)
+	}
+}

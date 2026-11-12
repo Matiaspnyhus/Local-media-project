@@ -138,6 +138,15 @@ func (a *app) run() (err error) {
 	}
 	defer srv.Close()
 	a.srv = srv
+	// While someone is watching, the PC is asked not to go to sleep (see
+	// awake.go). Stopped, and waited for, before the server closes.
+	awakeCtx, stopAwake := context.WithCancel(context.Background())
+	awakeDone := make(chan struct{})
+	go func() {
+		defer close(awakeDone)
+		stayAwakeWhileWatched(awakeCtx, func() int { return srv.ActiveViewers(awakeFor) }, newAwakeHolder(), srv.Note, awakeLook, time.Now)
+	}()
+	defer func() { stopAwake(); <-awakeDone }()
 
 	httpSrv := &http.Server{Handler: srv, ReadHeaderTimeout: 10 * time.Second}
 
