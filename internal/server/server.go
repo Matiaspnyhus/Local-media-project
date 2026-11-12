@@ -111,7 +111,8 @@ type Server struct {
 	// says about it before that is logged (see pathless).
 	convMu     sync.Mutex
 	converting map[string]string
-	helpers    *helpers // shared and limited runs of ffmpeg and ffprobe, see helpers.go
+	helpers    *helpers  // shared and limited runs of ffmpeg and ffprobe, see helpers.go
+	watch      *watchers // who is watching right now, see watching.go
 	ctx        context.Context
 	stop       context.CancelFunc
 	handler    http.Handler
@@ -141,7 +142,7 @@ func New(cfg Config) (*Server, error) {
 	s := &Server{
 		db: cfg.DB, dataDir: cfg.DataDir, version: cfg.Version, port: cfg.Port, assets: cfg.Assets,
 		limiter: newLoginLimiter(), events: &eventLog{}, update: cfg.Update, ffprobe: cfg.FFprobe, caps: map[string]*playback.Caps{},
-		helpers: newHelpers(),
+		helpers: newHelpers(), watch: newWatchers(),
 	}
 	s.ctx, s.stop = context.WithCancel(context.Background())
 	s.newTMDB = metadata.New
@@ -358,7 +359,7 @@ func (s *Server) guard(rt Route) http.HandlerFunc {
 			writeErr(w, http.StatusInternalServerError, "Route has no policy.")
 			return
 		}
-		rt.Handler(w, r)
+		rt.Handler(s.watched(w, r, rt), r)
 	}
 }
 
