@@ -255,3 +255,32 @@ The design is `docs/design/M4.md` (three independent designs, three judges, one 
 - *Open in another player* (`internal/server`, the page, the browser test; routes `open-local`, `handoff`, `handoff.xspf`). It is reachable, starts a program on the PC, and has **not been independently checked**: do that (security first) before any release that contains it. The Windows launcher has never run outside the test machine.
 
 Next for M4, in the design's order: repair and check the three parts above; wire the planner and converter into Play and the page (slice 2); sizes, HDR, deinterlacing (3); speed table and benchmark (4); burned-in subtitles (5); devices, lessons and stepping down (6); the hardware test (7); drawn subtitles (8); checklist and status (10).
+
+## 2026-11-12: M4 — Play converts pictures (slice 2); what the checks of the first three parts found
+
+Work was taken up again the same day (the owner: "as many helpers as before"; the shipped converter may be run in the cloud container; versions are published by commit message, see the entry on v0.3.0).
+
+**Merged since the entry above**
+- *The decision rules, repaired* (`m4/planner-2`): a wish for a lighter picture is a wish, not a demand; a setting is never trusted as faster than a lighter one was measured; the cap after a slow connection is read off the ladder so that a setting always meets it; the sentence for the viewer is written from what really changed (`Replan`, `Outcome.Notice`). A second check of these repairs is running.
+- *Four server faults from the M3 review* (`fix/server-gaps`): old-encoding `.ass`/`.ssa`/`.sub` files keep every line; a subtitle that cannot be made is an error, not an empty success; a film kept as several files is judged and played from the same copy; the place a viewer stopped is saved in the film's own time. Eight small further points from its check are being repaired.
+
+**Slice 2: Play is joined to the picture converter** (`internal/server/convert.go`, `handlePlay`, `judge`, the page)
+- What the converter can do is asked of ffmpeg once, in the background, when the program starts. A request that needs the answer waits for it; if asking fails it is asked again after a minute.
+- Play decides with how many pictures the PC is converting *for other sign-ins* (`hls.Manager.Converting`): a viewer's own earlier film is about to be closed and must not push their next play a setting down. The lists decide as if the PC were idle, so a film is not marked unplayable because someone else is watching.
+- The facts about a film's picture are kept in memory for now, one look shared by simultaneous Plays. They move to a table with the rest of schema 7 (slice 6).
+- A film faster than 30 pictures a second is converted at half its rate on the one setting that says so (rung 4), and cut by the halved rate's clock.
+- A capability report without a word about sizes above 1080p comes from the released page and is read as that version read it (what the device plays, it plays at any size). The new page asks the device (`mediaCapabilities`, 4 seconds at most; no answer means the field is left out, not "nothing").
+- The server no longer hides "plays chunks" from a device's report when the PC has no converter; the decision is told the PC has none and names the PC in its reasons.
+- The Play answer carries the whole decision. `TestThePageKnowsEveryFieldOfTheDecision` holds its field names against `PlayPlan` in `web/src/api.ts`.
+- Not yet, and said plainly to the viewer where it bites: HDR is not turned into normal colour (an HDR film that needs converting is refused with that reason until slice 3); nothing is measured, so the safe settings are used (slice 4); subtitles are not put into the picture (slice 5).
+
+**What the two independent checks of the picture converter found** (being repaired on `m4/hls-2`; nothing here is in v0.3.0 except where said)
+- With the shipped converter, sound passed through beside a converted picture lands in the wrong chunk where the picture stands still for seconds; the acceptance test for it fails on 8.1.3 every time. A picture that stands still for more than about ten seconds loses or misplaces its sound on both converters.
+- The shipped converter reads far slower than asked when frames are far apart (`-readrate` behaves differently in 8.1.3).
+- Sound that runs on a minute and a half or more after the picture: the last chunk cannot be made.
+- **Also in v0.3.0:** a film whose key frames are very far apart (one key frame in 90 seconds in the test) cannot be repackaged at all; the converter stops with an answer that says nothing. Such files are rare (screen recordings, some camera files).
+- Smaller: a jump that was given up still moves what the converter goes by; a run the cutter ends gives no reason; `PictureFacts` misreads where a Matroska file ends when its clock starts late.
+
+**What the check of "Open in another player" found** (being repaired on `m4/handoff-2`): the request's Host is not checked, so a page under a foreign name that resolves to the PC could start the PC's player (and, before setup, claim the server: that part is older than this slice); nothing limits how often the player is started. The Windows and macOS launchers have still never run outside a test.
+
+**Decisions waiting on the lead** (from the planner's repair): one speed row serves every film up to 1080p, so a small film is judged by a full-HD figure; for a film that already fits 720p the ladder's order is not the order of work. Both go to slice 4, where the speeds are measured.
