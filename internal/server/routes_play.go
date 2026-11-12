@@ -479,6 +479,7 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	path := filepath.Join(libPath, filepath.FromSlash(rel))
 	var grid hls.Grid
 	var convert *hls.Convert
+	var sizeNow, dateNow int64 // the file's own, at this moment
 	if plan.Method == playback.Remux || plan.Method == playback.Audio || plan.Method == playback.Convert {
 		// Before any helper program is pointed at the file: it must be a
 		// real file inside its library, and be there. (A drive that was
@@ -489,38 +490,39 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.Close()
-		if plan.Method == playback.Convert {
-			// Converting starts from a few facts about the picture (where
-			// its clock stands, how fast its frames come, what shape they
-			// are), found by a short look at the file the first time. They
-			// are kept for the file as it is at this moment, by its own
-			// size and date, not the ones the library last noted.
-			facts, err := s.pictureFacts(r.Context(), fileID, path, now.Size(), now.ModTime().UnixNano())
-			if err == nil {
-				// The decision went by the frame rate the library noted. The
-				// converter goes by the one the look found, which is the
-				// truer. Where they differ the decision is made again, so
-				// that what the answer says is lost is what is left out.
-				if rate := float64(facts.RateNum) / float64(max(facts.RateDen, 1)); rate != ft.media.Video[0].FrameRate {
-					ft.media.Video[0].FrameRate = rate
-					if again := s.decide(ft.media, caps, want, limits); again.Method == playback.Convert {
-						plan = again
-					}
+		sizeNow, dateNow = now.Size(), now.ModTime().UnixNano()
+	}
+	if plan.Method == playback.Convert {
+		// Converting starts from a few facts about the picture (where its
+		// clock stands, how fast its frames come, what shape they are),
+		// found by a short look at the file the first time. They are kept
+		// for the file as it is now, by its own size and date: the library
+		// may have noted those before the file was replaced.
+		facts, err := s.pictureFacts(r.Context(), fileID, path, sizeNow, dateNow)
+		if err == nil {
+			// The decision went by the frame rate the library noted. The
+			// converter goes by the one the look found, which is the truer.
+			// Where they differ the decision is made again, so that what
+			// the answer says is lost is what is left out.
+			if rate := float64(facts.RateNum) / float64(max(facts.RateDen, 1)); rate != ft.media.Video[0].FrameRate {
+				ft.media.Video[0].FrameRate = rate
+				if again := s.decide(ft.media, caps, want, limits); again.Method == playback.Convert {
+					plan = again
 				}
-				grid, convert, err = convertSpec(facts, plan.Video)
 			}
-			if err != nil {
-				if r.Context().Err() != nil {
-					return // the viewer has gone
-				}
-				s.log.Printf("%s cannot be converted: %s", filepath.Base(path), s.pathless(strings.ReplaceAll(err.Error(), path, filepath.Base(path))))
-				reason := "This PC could not work out how to convert this film's picture."
-				if errors.Is(err, errLookSlow) {
-					reason = "This PC could not read the film in time to convert its picture. The disk it is on may have been asleep: try again in a moment."
-				}
-				plan = unplayable(plan, reason)
-				plan.PCCannot = true
+			grid, convert, err = convertSpec(facts, plan.Video)
+		}
+		if err != nil {
+			if r.Context().Err() != nil {
+				return // the viewer has gone
 			}
+			s.log.Printf("%s cannot be converted: %s", filepath.Base(path), s.pathless(strings.ReplaceAll(err.Error(), path, filepath.Base(path))))
+			reason := "This PC could not work out how to convert this film's picture."
+			if errors.Is(err, errLookSlow) {
+				reason = "This PC could not read the film in time to convert its picture. The disk it is on may have been asleep: try again in a moment."
+			}
+			plan = unplayable(plan, reason)
+			plan.PCCannot = true
 		}
 	}
 

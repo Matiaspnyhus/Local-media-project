@@ -165,10 +165,18 @@ func TestAFilmNoBrowserPlaysIsConverted(t *testing.T) {
 		t.Errorf("while one film is being converted: the same viewer's next Play is at setting %d (want 1), another sign-in's at setting %d (want 2)",
 			again.Plan.Video.Rung, other.Plan.Video.Rung)
 	}
-	// The lists go by an idle PC: a film is not marked by what the PC
-	// happens to be doing this minute.
-	if l := e.s.limits(nil); l.Busy != 0 {
-		t.Errorf("the lists count %d conversions against a film", l.Busy)
+	// The lists go by an idle PC: a film is not judged by what the PC
+	// happens to be doing this minute. Asked as the other sign-in, for
+	// whom one conversion is under way, the film is still judged at the
+	// best setting.
+	var guestSession, owner string
+	e.s.db.QueryRow(`SELECT id, user_id FROM sessions WHERE id <> ?`, sessionID).Scan(&guestSession, &owner)
+	copies, err := e.s.copiesOf(film)
+	if err == nil {
+		err = e.s.judge(&User{ID: owner, SessionID: guestSession}, copies)
+	}
+	if err != nil || len(copies) != 1 || copies[0].plan.Method != playback.Convert || copies[0].plan.Video.Rung != 1 {
+		t.Errorf("the lists judge the film for a second viewer as %+v (%v), want converted at setting 1", copies, err)
 	}
 	e.do("POST", "/api/hls/"+again.HLS+"/stop", remote, c, nil)
 	e.do("POST", "/api/hls/"+other.HLS+"/stop", remote, guest, nil)
@@ -653,9 +661,18 @@ func TestNoListWaitsWhileTheConverterIsAsked(t *testing.T) {
 	slow := newHeldProgram(t, real)
 	slow.set(t, "hold", true) // ffmpeg does not answer until the test lets it
 	usual := abilityWait
-	abilityWait = 50 * time.Millisecond
+	abilityWait = time.Second
 	t.Cleanup(func() { abilityWait = usual })
 	e := newEnvWith(t, slow.Path, ffprobe)
+	// Whoever asks in the program's first moments waits a little for the
+	// answer, and stops waiting while ffmpeg is still being asked.
+	_, known := e.s.abilities()
+	e.s.helpers.convert.mu.Lock()
+	stillAsking := e.s.helpers.convert.asking != nil
+	e.s.helpers.convert.mu.Unlock()
+	if known || !stillAsking {
+		t.Fatalf("asking in the first moments waited until ffmpeg was given up on (answered: %v)", known)
+	}
 	oldFilm(t, e, "Old Film (1999).mkv", "25")
 	c := e.setup()
 	e.s.InspectNow()
@@ -1229,7 +1246,7 @@ func TestOnlyAFewFilmsAreLookedAtAtOnce(t *testing.T) {
 			t.Errorf("play: %s", w.Body)
 		}
 	}
-	if most := ffprobe.atOnce(); most == 0 || most > maxFactLooks {
-		t.Errorf("%d looks ran at the same time, and the most allowed is %d", most, maxFactLooks)
+	if most := ffprobe.atOnce(); most == 0 || most > 2 {
+		t.Errorf("%d looks ran at the same time, and the most allowed is 2", most)
 	}
 }
