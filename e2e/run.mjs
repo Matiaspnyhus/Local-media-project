@@ -360,7 +360,31 @@ try {
     // are switched back on once it plays.
     assert.equal(await page.inputValue('[data-testid=pick-subtitles]'), subtitles, 'the same subtitles are still chosen')
     await subtitleShows('Said in the second half')
-    await page.evaluate(() => document.querySelector('video').pause())
+  })
+
+  await step('a page the browser puts aside and brings back goes on playing', async () => {
+    // When the viewer goes to another page in the same tab, a browser may
+    // keep this one exactly as it is and bring it back on Back. It says so
+    // with these two events. (The test browsers have that habit switched
+    // off, so the events are sent by hand.)
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })))
+    await page.waitForTimeout(500) // time for a request to stop converting, had one been sent, to arrive
+    assert.equal(await converters(), 1, 'the film is still open on the PC for the page that may come back')
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true })))
+    // A part of the film the player does not hold has to come from the PC.
+    await page.evaluate(() => (document.querySelector('video').currentTime = 10))
+    await playsBeyond(page, 10.5, 'the page came back and jumped to a part it had not fetched')
+    const at = await page.evaluate(() => document.querySelector('video').currentTime)
+    assert.ok(at < 20, `jumped to 10 s, now at ${at} s`)
+    // A page that is closed for good still stops the conversion at once.
+    await page.evaluate(() => {
+      document.querySelector('video').pause()
+      window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: false }))
+    })
+    for (let i = 0; (await converters()) > 0; i++) {
+      assert.ok(i < 50, 'the film is still held open for conversion 5 seconds after its page was closed')
+      await new Promise((r) => setTimeout(r, 100))
+    }
     await focusByText(page, '← Back')
     await page.keyboard.press('Enter')
     await page.waitForSelector('text=Continue watching')

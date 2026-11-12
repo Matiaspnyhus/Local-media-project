@@ -859,13 +859,23 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     if (!info || !showPlayer || !v) return
     const token = info.hls
     const stop = () => token && api.hlsStop(token)
-    window.addEventListener('pagehide', stop)
+    // Leaving the page for good stops the conversion at once. But a browser
+    // may only put the page aside, to bring it back exactly as it was when
+    // the viewer returns to it (Back after a visit to another page; Safari
+    // on an iPhone does this readily). The film must then still be open on
+    // the PC, or the player that comes back holds addresses that no longer
+    // work. If the page never comes back, the PC stops converting by itself
+    // after a little over a minute without requests.
+    const onHide = (e: PageTransitionEvent) => {
+      if (!e.persisted) stop()
+    }
+    window.addEventListener('pagehide', onHide)
     chunkPlayer.current = false
     subsOff()
     if (!token || builtInChunks()) {
       v.src = info.url
       return () => {
-        window.removeEventListener('pagehide', stop)
+        window.removeEventListener('pagehide', onHide)
         stop()
         v.removeAttribute('src')
         v.load()
@@ -902,7 +912,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       .catch(() => setProblem('The part of the app that plays repackaged video could not be loaded. Reload the page and try again.'))
     return () => {
       gone = true
-      window.removeEventListener('pagehide', stop)
+      window.removeEventListener('pagehide', onHide)
       if (player) player.destroy()
       stop()
     }
