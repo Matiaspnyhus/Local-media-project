@@ -177,13 +177,18 @@ func checkMake(t *testing.T, ffmpeg, path string, recipe ...string) {
 
 // checkAgainst runs the film from the top and from every chunk in "jumps",
 // and reports where ffmpeg's fragments are not where the list says.
+//
+// ffmpeg is not told how fast to read here ("-readrate 0"). A rate above
+// the manager's own, to save time, is not safe: the converter that is
+// shipped then reads at about twice the speed the film plays, whatever
+// rate it is given (measured with 16, 32, 100 and 1000).
 func checkAgainst(t *testing.T, ffmpeg string, spec Spec, what string, jumps []int, whole bool, limit int) (worst float64) {
 	t.Helper()
 	g := spec.Grid
 	var through []checkFrag
 	if whole {
 		var said string
-		through, _, said = checkRun(t, ffmpeg, args(spec, 0, 1000, 60), g, 0)
+		through, _, said = checkRun(t, ffmpeg, args(spec, 0, 0, 60), g, 0)
 		if len(through) != len(g.Cuts) {
 			t.Errorf("%s: played through: %d fragments for %d cuts (%s)", what, len(through), len(g.Cuts), said)
 		}
@@ -204,7 +209,7 @@ func checkAgainst(t *testing.T, ffmpeg string, spec Spec, what string, jumps []i
 		if lim > 0 {
 			lim += 2
 		}
-		frags, _, said := checkRun(t, ffmpeg, args(spec, n, 1000, 60), g, lim)
+		frags, _, said := checkRun(t, ffmpeg, args(spec, n, 0, 60), g, lim)
 		cur := -1
 		kept := 0
 		for i, fr := range frags {

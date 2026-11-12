@@ -102,7 +102,7 @@ func TestCheckChangesOfScene(t *testing.T) {
 		c.Preset = preset
 		s := spec
 		s.Convert = &c
-		frags, _, said := checkRun(t, ffmpeg, args(s, 0, 1000, 60), s.Grid, 0)
+		frags, _, said := checkRun(t, ffmpeg, args(s, 0, 0, 60), s.Grid, 0)
 		var at []string
 		for _, fr := range frags {
 			at = append(at, fmt.Sprintf("%.0f", fr.ms))
@@ -123,7 +123,7 @@ func TestCheckConvertedShowsTheSourceAtTheSameTime(t *testing.T) {
 	for _, name := range []string{"film24", "tv25", "phone", "frozen", "longsound", "longgop", "midstream"} {
 		src := convertFilm(t, ffmpeg, name)
 		spec, facts := convertSpec(t, ffprobe, src)
-		a := args(spec, 0, 1000, 60)
+		a := args(spec, 0, 0, 60)
 		whole := filepath.Join(dir, "whole-"+name+".mp4")
 		a[len(a)-1] = whole
 		a = append([]string{"-y"}, a...)

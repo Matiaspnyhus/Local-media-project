@@ -60,7 +60,7 @@ func checkShape(t *testing.T, ffmpeg, ffprobe, dir, src string) {
 			t.Errorf("%s for %dp: %v", filepath.Base(src), height, err)
 			continue
 		}
-		a := args(Spec{Path: src, Grid: g, AudioTrack: -1, Convert: &c}, 0, 1000, 60)
+		a := args(Spec{Path: src, Grid: g, AudioTrack: -1, Convert: &c}, 0, 0, 60)
 		out := filepath.Join(dir, "shaped.mp4")
 		a[len(a)-1] = out
 		if said, err := exec.Command(ffmpeg, append([]string{"-y"}, a...)...).CombinedOutput(); err != nil {
