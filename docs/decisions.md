@@ -177,5 +177,40 @@ Until both are settled the updater has nothing to fetch; the settings screen say
 - *No second player (mpv) in the tests.* The plan asks for headless mpv to play every test stream. mpv is not available in the build environment. In its place every produced stream is decoded from end to end by ffmpeg with errors fatal, which catches a broken stream but is not an independent player.
 - *The stricter numbers are checked on made-up films, not a library of real ones.* Picture and sound start within 50 ms at the beginning of a stream and within 100 ms at the start of any single chunk (sound comes in frames of about 23 ms and is not cut at exactly the same instant as the picture). Frame counts are compared exactly, which is stricter than the plan's "duration within 0.1 s".
 - *Built with a different ffmpeg than is shipped.* The build environment has ffmpeg 6.1; what ships is jellyfin-ffmpeg 8.1.3. The tests at GitHub run on the shipped version on all three systems.
-- *Files that start far from zero* (some TV recordings) are handled by design but not tested.
 - Still open from M1: the Chromium 87 check, and Huma/sqlc.
+
+## 2026-11-12: M3 — what an independent review changed
+
+Before the first release, the M3 code was read by seven independent reviewers, each looking at one area, and every finding was then tested by a second reviewer who tried to disprove it. 31 findings held. Three fixers, each owning separate files, repaired them, and their work was checked again. This entry records the decisions those repairs brought with them.
+
+**The converter (`internal/hls`).**
+- *A chunk is filed by when its first picture is shown, not by when it is decoded.* In films whose frames are stored out of order (x265's usual output, many Blu-ray copies) or unevenly timed, the two differ, and every chunk was filed one key frame late.
+- *TV recordings (MPEG-TS) are read through once for their key frames.* They carry no list of key frames and jumping in them does not land on one, so the quick search found nothing and such files did not start. Reading through is as slow as the disk (a minute or more for a long recording on a hard disk), happens once, and is kept. Their clock starting hours in is now tested.
+- *No chunk may be longer than a minute.* A list with one in it means the key frames were not found; the film is then cut every few seconds on its own clock instead, which plays but is less exact after a jump. Such a list is never kept.
+- *A film does not wait for a long search.* Play waits at most 20 seconds for the cuts, then starts with the plain list. The search carries on for up to 20 minutes and the next Play uses what it found. A search that fails is not tried again for 30 minutes.
+- *AAC sound passed on from a TV recording is rewrapped* (`-bsf:a aac_adtstoasc`); without that the converter stopped at the first chunk.
+- *A jump to where the sound has already ended* (sound shorter than picture) restarts with the picture only, and the player keeps the header that has sound.
+- *A clip cut out of a longer film without re-encoding* keeps frames from before its start that must be sent but not shown. Every time is moved later by that much (`Grid.LeadMs`) so none is below zero, the player is told to begin after them, and the server moves the subtitles by the same amount (`?shift=` on the subtitle address).
+- *Every run of a film is made to agree with the header the player already has*, since a player keeps the first header it was given.
+- *Restarts, closing and the idle check no longer trip over each other.* A second jump during a restart waits for it; a session closed during a restart leaves no converter running; a request the viewer has given up never moves the converter. A request that was overtaken is answered "try again in a second" (503), which players do, rather than a refusal (409).
+- *Folder names stay out of what the converter says.* Its error text names the film's file, never the folder, in the log and in the support bundle.
+
+**The server and the decisions (`internal/server`, `internal/playback`).**
+- *Database schema 6*: what each signed-in device says it can play is kept (`device_reports`), so a page left open across a restart or an update still gets files converted for it; the pick of sound track and subtitles is kept as a pick, not only as two languages; each track's four-letter codec label is kept (`streams.codec_tag`).
+- *Remembered choices.* Within a show the remembered track is used where an episode has the same layout; otherwise the language and kind (commentary, forced, for the hard of hearing) decide. Forced subtitles no longer count as "subtitles on".
+- *A file with several sound tracks is sent as it is only when there is no doubt which one the browser will play* (one track, or the wanted track is first and is the one browsers pick). Chromium ignores the "main track" mark in MKV files, which had played the wrong language.
+- *10-bit H.264* plays as it is where the browser says it can (Chromium does; Safari and Firefox do not). *WebM* is told apart from MKV and sent with its own type. *HEVC labelled "hev1"* in an MP4, which Apple devices refuse, is repackaged for them (the label is corrected on the way).
+- *A file that does not say how long it is* is answered "cannot be repackaged", with that reason, instead of being given a list one second long.
+- *Subtitle files beside a film have an address that survives a scan* (derived from the file's name, not from a counter).
+- *Helper programs are shared and limited.* However many requests ask for one subtitle track, ffmpeg reads the film once; at most two subtitle jobs and two key-frame searches run at a time. A subtitle taken out of a film is kept only if the whole copy was written (a full disk used to leave half of one, served from then on).
+- *Chunk addresses and stream links end when their sign-in runs out*, not only when it is signed out.
+- *A second copy of the program stops before it touches anything.* It used to delete the running copy's chunks before noticing the port was taken.
+
+**The web player.**
+- *A film starts without waiting for its subtitles*: tracks are switched on once the film is playing. A subtitle track still being taken out of a long film used to hold the first frame.
+- *"This device cannot show the picture" is judged after three seconds of playing* for repackaged films, since an iPhone reports the picture's size late; the false warning there is gone.
+- *Changing the sound twice in a row keeps the place*: requests are numbered and only the newest answer is used; the session opened for an answer that is not used is stopped.
+- *A page the browser only puts aside* (the back/forward cache, or leaving Safari and coming back) keeps its film open; pages that never return are covered by the 75-second idle stop.
+- The browser test grew from 15 steps to 20 and now covers each of these.
+
+**Not done.** Nothing here has run on a real iPhone or in Safari itself, only in Safari's engine on the macOS test machine; the owner's checklist is the first real test. Two copies started on purpose with different ports on the same data folder are still not caught.

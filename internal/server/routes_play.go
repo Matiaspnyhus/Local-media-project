@@ -396,6 +396,14 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	if (plan.Method == playback.Remux || plan.Method == playback.Audio) && durationMs <= 0 {
+		// The list of chunks a player is given covers the whole film, so
+		// its length has to be known.
+		plan.Playable, plan.Method = playback.No, playback.None
+		plan.Reasons = append(plan.Reasons, "The file does not say how long it is, so it cannot be repackaged for this device.")
+	}
+
+	var subtitleShift int64
 	ext := strings.ToLower(filepath.Ext(rel))
 	out := map[string]any{
 		"title":      title,
@@ -412,11 +420,20 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		}
 		f.Close()
 		path := filepath.Join(libPath, filepath.FromSlash(rel))
-		token := s.hls.Open(hls.Spec{
-			Path: path, Grid: s.grid(r.Context(), fileID, path, size, mtime, durationMs),
-			VideoCodec: ft.media.Video[0].Codec, AudioTrack: plan.AudioTrack, AudioCopy: plan.AudioCopy, Owner: u.SessionID,
-		})
+		grid := s.grid(r.Context(), fileID, path, size, mtime, durationMs)
+		spec := hls.Spec{Path: path, Grid: grid, VideoCodec: ft.media.Video[0].Codec,
+			AudioTrack: plan.AudioTrack, AudioCopy: plan.AudioCopy, Owner: u.SessionID}
+		if plan.AudioTrack >= 0 && plan.AudioTrack < len(ft.media.Audio) {
+			// The converter treats some sound differently when it is passed
+			// on untouched (AAC out of a TV recording needs rewrapping).
+			spec.AudioCodec = ft.media.Audio[plan.AudioTrack].Codec
+		}
+		token := s.hls.Open(spec)
 		s.noteConversion(token, path)
+		// A clip cut out of a longer film without re-encoding plays with its
+		// clock a little ahead (see hls.Grid.LeadMs); its subtitles are
+		// moved by the same amount.
+		subtitleShift = grid.LeadMs
 		out["url"] = "/hls/" + token + "/index.m3u8"
 		out["mimeType"] = "application/vnd.apple.mpegurl"
 		out["hls"] = token
@@ -438,9 +455,13 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		audio = append(audio, audioView{Index: i, Label: audioLabel(t), Language: playback.Lang(t.Language), Selected: i == plan.AudioTrack})
 	}
 	subs := []subtitleView{}
+	shift := ""
+	if subtitleShift > 0 {
+		shift = "?shift=" + strconv.FormatInt(subtitleShift, 10)
+	}
 	for i, t := range ft.subs {
 		subs = append(subs, subtitleView{Key: t.Key, Label: subtitleLabel(t, strings.HasPrefix(t.Key, "x")), Language: playback.Lang(t.Language),
-			Forced: t.Forced, Selected: i == choice.Subtitle, URL: "/api/files/" + fileID + "/subtitles/" + t.Key})
+			Forced: t.Forced, Selected: i == choice.Subtitle, URL: "/api/files/" + fileID + "/subtitles/" + t.Key + shift})
 	}
 	out["audio"], out["subtitles"], out["pictureSubtitles"] = audio, subs, ft.pictures
 	writeJSON(w, http.StatusOK, out)
@@ -631,6 +652,11 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, max-age=3600")
+	if ms, err := strconv.ParseInt(r.URL.Query().Get("shift"), 10, 64); err == nil && ms > 0 && ms <= maxSubtitleShiftMs {
+		later := &laterVTT{ResponseWriter: w, ms: ms}
+		defer later.finish()
+		w = later
+	}
 	if key[0] == 'x' {
 		subRel, format, ok := s.sidecar(fileID, key)
 		if !ok {

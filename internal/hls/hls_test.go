@@ -480,6 +480,25 @@ func TestCutsAreFoundInATVRecording(t *testing.T) {
 	}
 }
 
+// While a long recording is still being read through, a film is started
+// with a plain list of cuts. That list has to be on the recording's own
+// clock, or every chunk would be filed in the wrong place.
+func TestThePlainListForARecordingStartsWhereItsClockDoes(t *testing.T) {
+	ffmpeg, ffprobe := tools(t)
+	src := source(t, ffmpeg, "recording")
+	g := PlainCuts(context.Background(), ffprobe, src, 60000)
+	if !g.Valid() || g.From != "uniform" || g.StartMs < 36000000 || g.StartMs > 36003000 || g.EndMs != g.StartMs+60000 || len(g.Cuts) != 10 {
+		t.Errorf("the plain list: %+v", g)
+	}
+	if want := grid(t, ffprobe, src, 60000); g.StartMs != want.StartMs {
+		t.Errorf("the plain list starts at %d ms, the found one at %d", g.StartMs, want.StartMs)
+	}
+	// With nothing to look with, or no length, it is the plain list from 0.
+	if g := PlainCuts(context.Background(), "", src, 60000); !g.Valid() || g.StartMs != 0 {
+		t.Errorf("without ffprobe: %+v", g)
+	}
+}
+
 // A film with one key frame in a minute and a half cannot be cut into
 // chunks. That must be said, and not answered with a list of one chunk as
 // long as the film, which no player could ever be given in time.

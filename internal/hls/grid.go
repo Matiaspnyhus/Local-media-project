@@ -204,6 +204,19 @@ func FindCuts(ctx context.Context, ffprobe, path string, durationMs int64) (Grid
 	return g, nil
 }
 
+// PlainCuts is the list to play by when FindCuts is not to be waited for
+// (reading a long TV recording through can take minutes): a cut every few
+// seconds, on the film's own clock. It takes one quick look at the file.
+func PlainCuts(ctx context.Context, ffprobe, path string, durationMs int64) Grid {
+	if ffprobe == "" || durationMs <= 0 {
+		return Uniform(durationMs)
+	}
+	start, lead, _ := clockStart(ctx, ffprobe, path)
+	g := uniform(start, durationMs)
+	g.LeadMs = lead
+	return g
+}
+
 // clockStart asks where the picture's own clock starts, in milliseconds
 // (usually 0, but hours in for some TV recordings), how long before that
 // the file's first frame lies (see Grid.LeadMs), and how ffprobe names the

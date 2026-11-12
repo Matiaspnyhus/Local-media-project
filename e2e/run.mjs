@@ -20,7 +20,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const exe = process.platform === 'win32' ? 'localmedia.exe' : 'localmedia'
 const bin = resolve(process.env.LOCALMEDIA_BIN || join(here, '..', exe))
 const browserName = process.env.E2E_BROWSER || 'chromium'
-const port = 18177
+const port = Number(process.env.E2E_PORT) || 18177 // E2E_PORT lets two runs share a machine
 // Safari's engine on a Mac moves focus to buttons with Option+Tab, not Tab.
 const TAB = browserName === 'webkit' ? 'Alt+Tab' : 'Tab'
 

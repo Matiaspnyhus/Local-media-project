@@ -2,7 +2,10 @@ package server
 
 import (
 	"bytes"
+	"fmt"
+	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode/utf16"
 	"unicode/utf8"
@@ -96,4 +99,92 @@ func two(h string) string {
 		return "0" + h
 	}
 	return h
+}
+
+// maxSubtitleShiftMs is the most a subtitle may be asked to be moved. The
+// shift exists for one case (see laterVTT), where it is a few seconds.
+const maxSubtitleShiftMs = 60000
+
+// laterVTT passes WebVTT text through with every caption moved later by a
+// fixed time. It is used for a clip whose player clock runs ahead of the
+// film's own (hls.Grid.LeadMs): its captions have to run ahead with it.
+// The text may arrive in pieces of any size, so it is handled line by line.
+type laterVTT struct {
+	http.ResponseWriter
+	ms   int64
+	line []byte // a line that has not ended yet
+}
+
+func (l *laterVTT) Write(p []byte) (int, error) {
+	l.line = append(l.line, p...)
+	for {
+		i := bytes.IndexByte(l.line, '\n')
+		if i < 0 {
+			return len(p), nil
+		}
+		if _, err := l.ResponseWriter.Write(laterCue(l.line[:i+1], l.ms)); err != nil {
+			return 0, err
+		}
+		l.line = l.line[i+1:]
+	}
+}
+
+func (l *laterVTT) Flush() {
+	if f, ok := l.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// finish sends a last line that did not end with a line break.
+func (l *laterVTT) finish() {
+	if len(l.line) > 0 {
+		l.ResponseWriter.Write(laterCue(l.line, l.ms))
+		l.line = nil
+	}
+}
+
+var vttTiming = regexp.MustCompile(`^(\s*)((?:\d+:)?\d{2}:\d{2}\.\d{3})(\s+-->\s+)((?:\d+:)?\d{2}:\d{2}\.\d{3})`)
+
+// laterCue returns line with its two times moved later by ms if it is the
+// timing line of a caption ("00:01.000 --> 00:04.000"), and as it is
+// otherwise.
+func laterCue(line []byte, ms int64) []byte {
+	m := vttTiming.FindSubmatchIndex(line)
+	if m == nil {
+		return line
+	}
+	from, ok1 := vttMs(line[m[4]:m[5]])
+	to, ok2 := vttMs(line[m[8]:m[9]])
+	if !ok1 || !ok2 {
+		return line
+	}
+	out := append([]byte{}, line[m[2]:m[3]]...)
+	out = append(out, vttTime(from+ms)...)
+	out = append(out, line[m[6]:m[7]]...)
+	out = append(out, vttTime(to+ms)...)
+	return append(out, line[m[9]:]...)
+}
+
+// vttMs reads a WebVTT time ("01:02:03.456" or "02:03.456") as milliseconds.
+func vttMs(b []byte) (int64, bool) {
+	parts := strings.Split(string(b), ":")
+	sec, frac, _ := strings.Cut(parts[len(parts)-1], ".")
+	parts[len(parts)-1] = sec
+	var total int64
+	for _, p := range parts {
+		v, err := strconv.ParseInt(p, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		total = total*60 + v
+	}
+	f, err := strconv.ParseInt(frac, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return total*1000 + f, true
+}
+
+func vttTime(ms int64) string {
+	return fmt.Sprintf("%02d:%02d:%02d.%03d", ms/3600000, ms/60000%60, ms/1000%60, ms%1000)
 }

@@ -32,15 +32,22 @@ import (
 const (
 	maxSubtitleJobs = 2
 	maxCutSearches  = 2
-	// cutSearchLimit is how long one search may take, and how long a Play
-	// call waits for one before starting with the plain list of cuts.
-	cutSearchLimit = 2 * time.Minute
+	// cutSearchLimit is how long one search may take. Nearly every search
+	// takes a moment; a long TV recording on a slow disk has to be read
+	// through, which can take minutes.
+	cutSearchLimit = 20 * time.Minute
 	// cutRetryAfter is how long a failed search for a file is remembered.
 	cutRetryAfter = 30 * time.Minute
 	// maxSubtitleBytes bounds what one subtitle job may hold in memory. A
 	// film's subtitles as text are well under a megabyte.
 	maxSubtitleBytes = 32 << 20
 )
+
+// cutWait is how long a Play call waits for a search before starting the
+// film with the plain list of cuts. The search carries on, and the next
+// Play of the film finds its result. (A variable so that tests need not
+// wait as long.)
+var cutWait = 20 * time.Second
 
 // helpers is the state behind the sharing and the limits.
 type helpers struct {
@@ -270,7 +277,7 @@ var subtitleTemp = os.CreateTemp
 // for the file while it runs waits for the same one.
 type cutSearch struct {
 	done chan struct{} // closed when grid and ok are set
-	grid hls.Grid
+	grid hls.Grid      // the cuts found; when ok is false, the plain list to use instead
 	ok   bool
 }
 
@@ -278,6 +285,7 @@ type cutSearch struct {
 type cutFailure struct {
 	stamp string
 	at    time.Time
+	plain hls.Grid // the list to play by meanwhile
 }
 
 // longestChunk is the longest chunk a list of cuts may hold and still be
@@ -307,6 +315,17 @@ func usableGrid(g hls.Grid) bool {
 	return true
 }
 
+// plainGrid is the list of cuts used when a film's key frames could not be
+// found: a cut every few seconds. The failed search hands one back that is
+// on the film's own clock (a TV recording's clock can start hours in);
+// when it could not even tell that much, the clock is taken to start at 0.
+func plainGrid(fromSearch hls.Grid, durationMs int64) hls.Grid {
+	if fromSearch.Valid() {
+		return fromSearch
+	}
+	return hls.Uniform(durationMs)
+}
+
 // grid returns where a file is cut into chunks, working it out the first
 // time the file is played this way. When that cannot be done (or not in
 // time for this request) the answer is a cut every few seconds, with which
@@ -324,7 +343,7 @@ func (s *Server) grid(ctx context.Context, fileID, path string, size, mtime, dur
 	h.cutMu.Lock()
 	if f, ok := h.cutFails[fileID]; ok && f.stamp == stamp && time.Since(f.at) < cutRetryAfter {
 		h.cutMu.Unlock()
-		return hls.Uniform(durationMs) // it failed a moment ago; it would fail again
+		return plainGrid(f.plain, durationMs) // it failed a moment ago; it would fail again
 	}
 	key := fileID + " " + stamp
 	run := h.cutRuns[key]
@@ -341,17 +360,23 @@ func (s *Server) grid(ctx context.Context, fileID, path string, size, mtime, dur
 	h.cutMu.Unlock()
 	// The search belongs to no one request: if this viewer gives up, the
 	// next Play for the film finds it still running, or finished.
-	limit := time.NewTimer(cutSearchLimit)
+	limit := time.NewTimer(cutWait)
 	defer limit.Stop()
 	select {
 	case <-run.done:
 		if run.ok {
 			return run.grid
 		}
+		return plainGrid(run.grid, durationMs)
 	case <-ctx.Done():
+		return hls.Uniform(durationMs) // nobody is waiting for the answer
 	case <-limit.C:
 	}
-	return hls.Uniform(durationMs)
+	// Still searching. One quick look tells where the film's clock starts,
+	// which the plain list has to agree with.
+	quick, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	return plainGrid(hls.PlainCuts(quick, s.ffprobe, path, durationMs), durationMs)
 }
 
 // findCuts runs one search, when its turn comes, and stores what it finds.
@@ -394,7 +419,7 @@ func (s *Server) findCuts(run *cutSearch, key, fileID, stamp, path string, durat
 				delete(h.cutFails, id)
 			}
 		}
-		h.cutFails[fileID] = cutFailure{stamp: stamp, at: time.Now()}
+		h.cutFails[fileID] = cutFailure{stamp: stamp, at: time.Now(), plain: g}
 	}
 	run.grid, run.ok = g, err == nil
 	h.cutMu.Unlock()
