@@ -266,18 +266,46 @@ jobs:
           if ($p.HasExited) { throw "the installed program stopped by itself" }
           if (-not (Test-Path (Join-Path $data "localmedia.db"))) { throw "the installed program did not use the existing data folder" }
 
+          # A helper program still busy when the installer or the uninstaller
+          # runs (the converter taking a subtitle out of a long film, say)
+          # must be stopped by it, or its file cannot be replaced or removed.
+          # A converter that plays an endless test picture stands in for one.
+          function Helper {
+            $h = Start-Process (Join-Path $app "ffmpeg.exe") -ArgumentList "-hide_banner", "-nostdin", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=5", "-f", "null", "-" -PassThru -WindowStyle Hidden
+            Start-Sleep -Seconds 2
+            if ($h.HasExited) { throw "the stand-in helper did not keep running" }
+            $h
+          }
+          function HelperWasStopped($h, $log, $when) {
+            if (-not $h.WaitForExit(10000)) { throw "$when left a helper running from the install folder" }
+            $text = Get-Content $log -Raw
+            if ($text -notmatch "Stopping a helper program that was still running") { throw "$when did not say that it stopped the helper. Its log: $text" }
+            foreach ($bad in "Could not look for helper programs", "Could not stop the helper program", "Could not tell where a helper program") {
+              if ($text -match $bad) { throw "$when said: $bad. Its log: $text" }
+            }
+          }
+
           # Installing again over a running copy (what a manual update is).
-          $i = Start-Process installer\LocalMedia-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/TASKS=autostart,firewall" -Wait -PassThru
+          $helper = Helper
+          $log = Join-Path $env:RUNNER_TEMP "setup-over.log"
+          $i = Start-Process installer\LocalMedia-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/TASKS=autostart,firewall", "/LOG=$log" -Wait -PassThru
           if ($i.ExitCode -ne 0) { throw "installing over a running copy failed with $($i.ExitCode)" }
+          HelperWasStopped $helper $log "installing over the top"
           if (-not (Test-Path (Join-Path $data "kept-from-before.txt"))) { throw "installing again touched the data folder" }
 
-          $u = Start-Process (Join-Path $app "unins000.exe") -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+          $helper = Helper
+          $log = Join-Path $env:RUNNER_TEMP "uninstall.log"
+          $u = Start-Process (Join-Path $app "unins000.exe") -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$log" -Wait -PassThru
           Start-Sleep -Seconds 2
+          HelperWasStopped $helper $log "uninstalling"
+          foreach ($f in "ffmpeg.exe", "ffprobe.exe") {
+            if (Test-Path (Join-Path $app $f)) { throw "uninstalling left $f behind" }
+          }
           if (Test-Path (Join-Path $app "localmedia.exe")) { throw "uninstalling left the program behind" }
           if (Rule) { throw "uninstalling left the firewall rule behind" }
           if ((Get-ItemProperty $run -ErrorAction SilentlyContinue).LocalMedia) { throw "uninstalling left start-with-Windows behind" }
           if (-not (Test-Path (Join-Path $data "kept-from-before.txt")) -or -not (Test-Path (Join-Path $data "localmedia.db"))) { throw "uninstalling removed the owner's data" }
-          Write-Host "Installed, started, installed again over a running copy, and uninstalled. The data folder was never touched."
+          Write-Host "Installed, started, installed again over a running copy with a helper still busy, and uninstalled with a helper still busy. The data folder was never touched."
           # "Rule not found" is the answer wanted above, but netsh reports it
           # as an error code, which would otherwise fail this step.
           exit 0

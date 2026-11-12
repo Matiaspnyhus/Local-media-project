@@ -111,7 +111,8 @@ type Server struct {
 	// says about it before that is logged (see pathless).
 	convMu     sync.Mutex
 	converting map[string]string
-	helpers    *helpers // shared and limited runs of ffmpeg and ffprobe, see helpers.go
+	helpers    *helpers  // shared and limited runs of ffmpeg and ffprobe, see helpers.go
+	watch      *watchers // who is watching right now, see watching.go
 	ctx        context.Context
 	stop       context.CancelFunc
 	handler    http.Handler
@@ -141,7 +142,7 @@ func New(cfg Config) (*Server, error) {
 	s := &Server{
 		db: cfg.DB, dataDir: cfg.DataDir, version: cfg.Version, port: cfg.Port, assets: cfg.Assets,
 		limiter: newLoginLimiter(), events: &eventLog{}, update: cfg.Update, ffprobe: cfg.FFprobe, caps: map[string]*playback.Caps{},
-		helpers: newHelpers(),
+		helpers: newHelpers(), watch: newWatchers(),
 	}
 	s.ctx, s.stop = context.WithCancel(context.Background())
 	s.newTMDB = metadata.New
@@ -153,6 +154,14 @@ func New(cfg Config) (*Server, error) {
 	if s.linkKey, err = s.loadOrCreateKey("link_key"); err != nil {
 		return nil, err
 	}
+	// Before anything can be written to the cache. The program takes its
+	// port before it comes here, which stops the usual second copy (the
+	// Start-menu entry pressed while a copy is running) before it can
+	// remove that copy's chunks. Nothing stops a copy started on purpose
+	// with another port on the same data folder: it removes them here,
+	// whether or not it finds a converter, as the converter's own start
+	// below always has when there is one.
+	removeLeftovers(cfg.DataDir)
 	if cfg.FFmpeg != "" {
 		s.ffmpeg = cfg.FFmpeg
 		if s.hls, err = hls.New(cfg.FFmpeg, filepath.Join(cfg.DataDir, "cache", "chunks")); err != nil {
@@ -356,7 +365,7 @@ func (s *Server) guard(rt Route) http.HandlerFunc {
 			writeErr(w, http.StatusInternalServerError, "Route has no policy.")
 			return
 		}
-		rt.Handler(w, r)
+		rt.Handler(s.watched(w, r, rt), r)
 	}
 }
 

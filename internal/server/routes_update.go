@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"net/http"
-	"time"
 )
 
 // UpdateStatus is what the settings screen shows about updates.
@@ -18,6 +17,12 @@ type UpdateStatus struct {
 	Problem     string `json:"problem,omitempty"`
 	Auto        bool   `json:"auto"`
 	CanUndo     bool   `json:"canUndo"`
+	// Waiting says that the new version would have been installed by now,
+	// had nobody been watching: it goes in at the next quiet moment.
+	Waiting bool `json:"waiting"`
+	// Watching lists who is watching right now, in words for the owner
+	// ("Anna on an iPhone"). The server fills it in.
+	Watching []string `json:"watching"`
 	// The last update that was tried, and how it went.
 	LastFrom    string `json:"lastFrom,omitempty"`
 	LastTo      string `json:"lastTo,omitempty"`
@@ -31,27 +36,27 @@ type UpdateStatus struct {
 type Updater interface {
 	Status() UpdateStatus
 	Check(ctx context.Context) UpdateStatus
-	Install() error
+	// Install installs the newer version because the owner asked for it.
+	// from is the sign-in the owner asked on. whoever says that the owner
+	// was told who is watching and said to install all the same; without
+	// it, the install is put off if someone else has begun to watch by the
+	// time it would restart the program. (An update that installs by itself
+	// waits for a moment when Watching reports nobody.)
+	Install(from string, whoever bool) error
 	Undo() error
 }
 
 // AutoUpdate reports whether the owner lets updates install by themselves.
 func (s *Server) AutoUpdate() bool { return s.setting("auto_update") != "off" }
 
-// IdleFor reports how long it has been since anything was streamed, so an
-// update never interrupts someone who is watching.
-func (s *Server) IdleFor() time.Duration {
-	last := s.lastStream.Load()
-	if last == 0 {
-		return 24 * time.Hour
-	}
-	return time.Since(time.Unix(last, 0))
-}
-
 func (s *Server) updateStatus(st UpdateStatus) UpdateStatus {
 	st.Auto = s.AutoUpdate()
 	if st.Current == "" {
 		st.Current = s.version
+	}
+	st.Watching = []string{}
+	for _, w := range s.Watching() {
+		st.Watching = append(st.Watching, w.Who)
 	}
 	return st
 }
@@ -77,10 +82,25 @@ func (s *Server) handleUpdateInstall(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "This copy cannot update itself.")
 		return
 	}
+	// The owner may update whenever they like, but not without knowing
+	// whose film it can stop. Asked plainly, the answer names who is
+	// watching (apart from the device the owner is pressing the button
+	// on); asked again with "anyway", it goes ahead.
+	from, anyway := currentUser(r).SessionID, r.URL.Query().Get("anyway") != ""
+	if !anyway {
+		if who := s.watchingBesides(from); len(who) > 0 {
+			verb := "is"
+			if len(who) > 1 {
+				verb = "are"
+			}
+			writeErr(w, http.StatusConflict, inWords(who)+" "+verb+" watching right now. Installing restarts Local Media, which can stop what they are watching.")
+			return
+		}
+	}
 	s.log.Printf("the owner asked to install an update")
 	// Answer first: installing ends with this program stopping.
 	go func() {
-		if err := s.update.Install(); err != nil {
+		if err := s.update.Install(from, anyway); err != nil {
 			s.log.Printf("update not installed: %v", err)
 		}
 	}()

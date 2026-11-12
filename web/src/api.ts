@@ -95,6 +95,8 @@ export interface UpdateStatus {
   problem?: string
   auto: boolean
   canUndo: boolean
+  waiting: boolean // the new version is waiting for a moment when nobody is watching
+  watching: string[] // who is watching right now: "Anna on an iPhone"
   lastFrom?: string
   lastTo?: string
   lastResult?: string
@@ -235,7 +237,8 @@ export const api = {
   setOnline: (on: boolean) => call<{ ok: boolean }>('PUT', '/api/settings/online', { on }),
   update: () => call<UpdateStatus>('GET', '/api/update'),
   updateCheck: () => call<UpdateStatus>('POST', '/api/update/check'),
-  updateInstall: () => call<{ ok: boolean }>('POST', '/api/update/install'),
+  // Answers 409, naming who is watching, unless nobody else is or anyway is set.
+  updateInstall: (anyway = false) => call<{ ok: boolean }>('POST', '/api/update/install' + (anyway ? '?anyway=1' : '')),
   updateUndo: () => call<{ ok: boolean }>('POST', '/api/update/undo'),
   setAutoUpdate: (on: boolean) => call<{ ok: boolean }>('PUT', '/api/settings/auto-update', { on }),
   health: () => call<{ status: string; version: string }>('GET', '/health'),
