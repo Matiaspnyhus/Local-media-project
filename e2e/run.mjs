@@ -91,6 +91,87 @@ async function playsBeyond(page, beyond, why) {
   })
 }
 
+// Keeps a record of what the player goes through and what is asked of the
+// PC, from now until the function it returns is called; that function gives
+// the record back, ready to print. It is for a step that took far longer in
+// one run than in another, with nothing to say where the time went. Every
+// time in it is in milliseconds since the record was started.
+//
+// The player's part reads "seeking+12 seeked+40": the events of the video
+// element and when they came. The PC's part reads "new2/seg-10.m4s+659..1155":
+// what was asked for, when, and when the answer was complete ("..?" if it
+// never was, "(given up)" if the player dropped the request, "(409)" for an
+// answer other than a plain yes). "open" is the request a pick of sound
+// sends. "stop" is the request to stop converting a film, with only the
+// time it was sent: it is sent so as to outlive the page, and a test is not
+// told when such a request is answered. "old" is the film that was already
+// playing, "new1", "new2" and so on the films the PC opened for the first
+// "open", the second and so on.
+async function record(page) {
+  const t0 = Date.now()
+  const asked = []
+  const answers = []
+  const onRequest = (r) => {
+    const m = /\/hls\/([0-9a-f]+)\/([^/]+)$/.exec(r.url())
+    if (m) asked.push({ r, at: Date.now() - t0, film: m[1], what: m[2] })
+    else if (/\/api\/items\/[^/]+\/play$/.test(r.url())) asked.push({ r, at: Date.now() - t0, film: '', what: 'open' })
+  }
+  const answered = async (r, givenUp) => {
+    const e = asked.find((x) => x.r === r)
+    if (!e) return
+    e.ms = Date.now() - t0 - e.at
+    e.givenUp = givenUp
+    const res = givenUp ? null : await r.response().catch(() => null)
+    e.status = res ? res.status() : 0
+    if (e.what === 'open' && res) e.opened = (await res.json().catch(() => null))?.hls
+  }
+  const onFinished = (r) => answers.push(answered(r, false).catch(() => {}))
+  const onFailed = (r) => answers.push(answered(r, true).catch(() => {}))
+  page.on('request', onRequest)
+  page.on('requestfinished', onFinished)
+  page.on('requestfailed', onFailed)
+  await page.evaluate(() => {
+    const from = performance.now()
+    const went = []
+    const stop = new AbortController()
+    for (const name of ['emptied', 'loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'seeking', 'seeked', 'waiting', 'stalled', 'playing', 'pause', 'error'])
+      document.querySelector('video').addEventListener(name, () => went.push(`${name}+${Math.round(performance.now() - from)}`), { signal: stop.signal })
+    window.playerRecord = () => {
+      stop.abort()
+      return went
+    }
+  })
+  return async () => {
+    page.off('request', onRequest)
+    page.off('requestfinished', onFinished)
+    page.off('requestfailed', onFailed)
+    // The record is asked for when a step has failed, too, and the page may
+    // then be past answering: nothing here may wait for it without end, or
+    // fail in the place of what really went wrong.
+    const within = (ms, promise, otherwise) => Promise.race([promise.catch(() => otherwise), new Promise((r) => setTimeout(() => r(otherwise), ms))])
+    await within(3000, Promise.all(answers))
+    const went = await within(5000, page.evaluate(() => window.playerRecord()), ['(the page did not answer)'])
+    const opens = asked.filter((e) => e.what === 'open')
+    const film = (e) => {
+      const n = opens.findIndex((o) => o.opened === e.film)
+      return n < 0 ? 'old' : `new${n + 1}`
+    }
+    const one = (e) => {
+      if (e.what === 'stop') return `stop:${film(e)}+${e.at}`
+      const what = e.what === 'open' ? 'open' : `${film(e)}/${e.what}`
+      const until = e.ms === undefined ? '..?' : `..${e.at + e.ms}`
+      return `${what}+${e.at}${until}${e.givenUp ? '(given up)' : e.status && e.status !== 200 ? `(${e.status})` : ''}`
+    }
+    const lists = asked.filter((e) => e.what === 'index.m3u8')
+    return {
+      lists: lists.length,
+      films: new Set(lists.map((e) => e.film)).size,
+      player: went.slice(0, 90).join(' ') || '(nothing)',
+      asked: asked.slice(0, 90).map(one).join(' ') || '(nothing)',
+    }
+  }
+}
+
 assert.ok(existsSync(bin), `program not found at ${bin}; build it first`)
 const data = mkdtempSync(join(tmpdir(), 'lm-data-'))
 const media = mkdtempSync(join(tmpdir(), 'lm-media-'))
@@ -218,15 +299,40 @@ try {
         h264in10bit: can('video/mp4; codecs="avc1.6E0033"'),
         hevc: can('video/mp4; codecs="hvc1.1.6.L120.90"', 'video/mp4; codecs="hev1.1.6.L120.90"'),
         hev1: can('video/mp4; codecs="hev1.1.6.L120.90"', 'video/mp4; codecs="hev1.2.4.L120.90"'),
+        apple: /Apple/.test(navigator.vendor || ''),
       }
     })
     console.log(`      (told the PC: ${Object.keys(r.told).filter((k) => r.told[k]).join(', ')})`)
     // The PC looks these up by name when it decides how to play a file. A
     // name the page never sends counts as "cannot play".
-    assert.equal(r.told['h264-10'], r.h264in10bit, '10-bit H.264: what the page told the PC against what the browser says')
     assert.equal(r.told['hevc-hev1'], r.hev1, 'HEVC labelled hev1: what the page told the PC against what the browser says')
     assert.equal(r.told.hevc, r.hevc, 'HEVC is still reported when either labelling plays')
+    // Apple's browsers say they play 10-bit H.264 but are not known to show
+    // its picture, so from them the page must not pass that answer on.
+    if (r.apple) {
+      assert.equal(r.told['h264-10'], false, `10-bit H.264 in an Apple browser (which itself says: ${r.h264in10bit}) must be reported as not playing`)
+      return
+    }
+    assert.equal(r.told['h264-10'], r.h264in10bit, '10-bit H.264: what the page told the PC against what the browser says')
     if (browserName === 'chromium') assert.equal(r.told['h264-10'], true, 'Chromium plays 10-bit H.264, and must not be told it cannot')
+    // The same rule where this test runs in another engine: a device that
+    // differs from this one only in calling itself Apple's.
+    const apple = await browser.newContext()
+    await apple.addInitScript(() => Object.defineProperty(Navigator.prototype, 'vendor', { configurable: true, get: () => 'Apple Computer, Inc.' }))
+    const iphone = await apple.newPage()
+    await iphone.goto(base)
+    await iphone.fill('#name', 'owner')
+    await iphone.fill('#password', 'a good password')
+    const reported = iphone.waitForResponse((res) => /\/api\/capabilities$/.test(res.url()))
+    await iphone.press('#password', 'Enter')
+    assert.equal((await reported).status(), 200, 'the device calling itself Apple\'s reported what it plays')
+    const a = await iphone.evaluate(async () => ({
+      told: (await (await fetch('/api/diagnostics')).json()).device.video,
+      itself: document.createElement('video').canPlayType('video/mp4; codecs="avc1.6E0033"') !== '',
+    }))
+    await apple.close()
+    assert.equal(a.told['h264-10'], false, `10-bit H.264 on a device calling itself Apple's (its browser itself says: ${a.itself}) must be reported as not playing`)
+    assert.equal(a.told.h264, true, 'ordinary H.264 is still reported from that device')
   })
 
   await step('play a file, keyboard only', async () => {
@@ -392,29 +498,78 @@ try {
 
   await step('changing the sound twice in a row keeps the place in the film, and the subtitles', async () => {
     const subtitles = await page.inputValue('[data-testid=pick-subtitles]')
-    await page.evaluate(() => (document.querySelector('video').currentTime = 60))
-    await playsBeyond(page, 60.5, 'a jump to one minute')
-    const place = await page.evaluate(() => document.querySelector('video').currentTime)
-    // Not with the keyboard for once: until the PC answers, the list goes
-    // back to the track that is playing, so two key presses cannot be aimed
-    // at the third track. The second pick is made before the first has
-    // taken effect.
-    await page.selectOption('[data-testid=pick-sound]', '1')
-    await page.selectOption('[data-testid=pick-sound]', '2')
-    await playsBeyond(page, place + 0.5, 'after two changes of sound')
-    const v = await page.evaluate(() => {
-      const el = document.querySelector('video')
-      return { at: el.currentTime, sound: document.querySelector('[data-testid=pick-sound]').value, method: el.dataset.method }
-    })
-    assert.ok(v.at < place + 15, `the film was at ${place} s and is now at ${v.at} s`)
-    assert.equal(v.sound, '2', 'the list shows the sound track picked last')
-    // The PC opened the film once for each pick. The one that was not used
-    // must be closed again, leaving the one that is playing.
-    for (let i = 0; (await converters()) !== 1; i++) {
-      assert.ok(i < 50, `${await converters()} films are held open for conversion 5 seconds after changing the sound; one is playing`)
-      await new Promise((r) => setTimeout(r, 100))
+    // In Safari's engine this step once took 15 seconds where 4 are usual,
+    // and nothing said which of its waits that was, or why. Until that is
+    // known a record is kept and printed, whether the step passes or fails:
+    // how long each wait took, what the player went through and what it
+    // fetched.
+    const waits = []
+    let since = Date.now()
+    const waited = (what) => {
+      waits.push(`${what} ${Date.now() - since} ms`)
+      since = Date.now()
     }
-    console.log(`      (was at ${place.toFixed(2)} s, plays on at ${v.at.toFixed(2)} s by method ${v.method})`)
+    const recorded = await record(page)
+    // Picks twice and checks the film plays on from where it was, with the
+    // sound picked last.
+    const twice = async (how, last, pick) => {
+      const place = await page.evaluate(() => document.querySelector('video').currentTime)
+      since = Date.now()
+      await pick()
+      await playsBeyond(page, place + 0.5, `after two changes of sound, ${how}`)
+      waited(`to play on with ${how}`)
+      const v = await page.evaluate(() => {
+        const el = document.querySelector('video')
+        return { at: el.currentTime, sound: document.querySelector('[data-testid=pick-sound]').value, method: el.dataset.method }
+      })
+      assert.ok(v.at < place + 15, `${how}: the film was at ${place} s and is now at ${v.at} s`)
+      assert.equal(v.sound, last, `${how}: the list shows the sound track picked last`)
+      // The PC opened the film once for each pick. The one that was not used
+      // must be closed again, leaving the one that is playing.
+      for (let i = 0; (await converters()) !== 1; i++) {
+        assert.ok(i < 50, `${how}: ${await converters()} films are held open for conversion 5 seconds after changing the sound; one is playing`)
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      waited('for the film not used to be closed')
+      console.log(`      (${how}: was at ${place.toFixed(2)} s, plays on at ${v.at.toFixed(2)} s by method ${v.method})`)
+    }
+    try {
+      await page.evaluate(() => (document.querySelector('video').currentTime = 60))
+      await playsBeyond(page, 60.5, 'a jump to one minute')
+      waited('for the jump')
+      // The PC answers each pick by opening the film afresh. Its answer to
+      // the first pick can come after the second pick or before it, and the
+      // page has a different job in each case, so both are tried. Left to
+      // chance, the same one came up nearly every time.
+      //
+      // First the second pick before the PC can have answered: the first
+      // answer must then be left unused, and the film it opened closed. Not
+      // with the keyboard for once: until the PC answers, the list goes
+      // back to the track that is playing, so two key presses cannot be
+      // aimed at the third track, nor be sure to beat the answer.
+      await twice('the second pick ahead of the first answer', '2', () => page.evaluate(() => {
+        const list = document.querySelector('[data-testid=pick-sound]')
+        for (const track of ['1', '2']) {
+          list.value = track
+          list.dispatchEvent(new Event('change', { bubbles: true }))
+        }
+      }))
+      // Then the second pick as soon as the first answer is in use (the list
+      // then shows the first pick): the player is starting afresh at that
+      // moment and its clock reads nothing.
+      await twice('the second pick just after the first answer', '0', async () => {
+        const answer = page.waitForResponse((res) => /\/api\/items\/[^/]+\/play$/.test(res.url()))
+        await page.selectOption('[data-testid=pick-sound]', '1')
+        await answer
+        await page.waitForFunction(() => document.querySelector('[data-testid=pick-sound]').value === '1', null, { timeout: 10000 })
+        await page.selectOption('[data-testid=pick-sound]', '0')
+      })
+    } finally {
+      const r = await recorded()
+      console.log(`      (waited ${waits.join(', ') || 'for nothing yet'}; lists of chunks asked for: ${r.lists}, for ${r.films} ${r.films === 1 ? 'film' : 'films'})`)
+      console.log(`      (the player, with milliseconds since the step began: ${r.player})`)
+      console.log(`      (asked of the PC, from when to when: ${r.asked})`)
+    }
     // Changing the sound hands the film to the player afresh. The subtitles
     // are switched back on once it plays.
     assert.equal(await page.inputValue('[data-testid=pick-subtitles]'), subtitles, 'the same subtitles are still chosen')

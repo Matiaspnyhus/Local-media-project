@@ -1,8 +1,9 @@
 import type { Caps } from './api'
 
 // What this browser says it can play. It is asked directly rather than
-// guessed from the browser's name; the server corrects the known cases
-// where a browser claims more than it delivers.
+// guessed from the browser's name. The known cases where a browser claims
+// more than it delivers are corrected afterwards: most by the server, and
+// one here, where the page already knows whose browser it is running in.
 export function measureCaps(): Caps {
   const v = document.createElement('video')
   const can = (...types: string[]) => types.some((t) => v.canPlayType(t) !== '')
@@ -18,8 +19,13 @@ export function measureCaps(): Caps {
     video: {
       h264: can('video/mp4; codecs="avc1.640028"'),
       // H.264 with 10-bit colour is asked about separately: a browser that
-      // plays ordinary H.264 may or may not play it (Chrome does).
-      'h264-10': can('video/mp4; codecs="avc1.6E0033"'),
+      // plays ordinary H.264 may or may not play it (Chrome does). Apple's
+      // browsers answer yes, but are widely reported to show no picture for
+      // such a file, and this has not been tried on a real iPhone. Until
+      // it has, their answer is not passed on: the PC then says plainly
+      // that this device cannot play the file, with "Try anyway" beside
+      // it, where otherwise the film might open to sound and no picture.
+      'h264-10': !appleBrowser() && can('video/mp4; codecs="avc1.6E0033"'),
       // HEVC is labelled in a file in one of two ways, "hvc1" or "hev1".
       // "hevc" and "hevc10" (10-bit colour) say the browser plays HEVC in
       // at least one of them. "hevc-hev1" says it plays the hev1 labelling
@@ -65,5 +71,11 @@ export function canUseChunkPlayer(): boolean {
 // that is newer and less proven than the player this app is tested with.
 export function builtInChunks(): boolean {
   if (!nativeHLS()) return false
-  return /Apple/.test(navigator.vendor || '') || !canUseChunkPlayer()
+  return appleBrowser() || !canUseChunkPlayer()
+}
+
+// appleBrowser: Safari on a Mac, or any browser on an iPhone or iPad (they
+// are all Safari underneath, whatever their name).
+function appleBrowser(): boolean {
+  return /Apple/.test(navigator.vendor || '')
 }
