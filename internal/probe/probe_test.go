@@ -91,6 +91,24 @@ func TestWebMIsToldApartFromMKV(t *testing.T) {
 	}
 }
 
+// The label a file gives its picture format matters for HEVC in MP4:
+// "hvc1" plays on Apple devices, "hev1" does not.
+func TestTheCodecLabelIsKept(t *testing.T) {
+	r, err := Parse([]byte(`{"streams":[
+	 {"index":0,"codec_name":"hevc","codec_type":"video","codec_tag_string":"hev1","pix_fmt":"yuv420p"},
+	 {"index":1,"codec_name":"aac","codec_type":"audio","codec_tag_string":"mp4a"},
+	 {"index":2,"codec_name":"subrip","codec_type":"subtitle","codec_tag_string":"[0][0][0][0]"},
+	 {"index":3,"codec_name":"h264","codec_type":"video","codec_tag_string":"[27][0][0][0]"}
+	],"format":{"filename":"a.mp4","format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := []string{r.Streams[0].CodecTag, r.Streams[1].CodecTag, r.Streams[2].CodecTag, r.Streams[3].CodecTag}
+	if got[0] != "hev1" || got[1] != "mp4a" || got[2] != "" || got[3] != "" {
+		t.Errorf("labels %q, want hev1, mp4a and two without", got)
+	}
+}
+
 func TestRunOnRealFiles(t *testing.T) {
 	ff := Find()
 	if ff == "" {

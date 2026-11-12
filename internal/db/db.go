@@ -225,12 +225,20 @@ ALTER TABLE track_memory ADD COLUMN audio_kind TEXT NOT NULL DEFAULT '';      --
 ALTER TABLE track_memory ADD COLUMN sub_key TEXT NOT NULL DEFAULT '';         -- the subtitle as the page names it, '' for none
 ALTER TABLE track_memory ADD COLUMN sub_kind TEXT NOT NULL DEFAULT '';        -- 'full', 'described', 'forced' or 'off'
 
--- WebM files used to be stored as MKV, which Firefox and Safari do not
--- open although they play WebM. Files that may be WebM are inspected again:
--- an inspected size that cannot match marks them for the next round (see
--- library.ProbePending). Until then they keep what was stored.
-UPDATE files SET probed_size = -1 WHERE probed = 1 AND container = 'matroska' AND (rel_path LIKE '%.webm'
-  OR id IN (SELECT file_id FROM streams WHERE kind = 'video' AND codec IN ('vp8','vp9','av1')));
+-- The four-letter label a file gives each codec ("hvc1", "hev1"). HEVC in
+-- an MP4 plays on Apple devices under the first label and not the second.
+ALTER TABLE streams ADD COLUMN codec_tag TEXT NOT NULL DEFAULT '';
+
+-- Two kinds of file are inspected again, because what was stored about
+-- them is wrong or lacks something now needed: files that may be WebM,
+-- which used to be stored as MKV (Firefox and Safari play WebM and not
+-- MKV), and MP4 or MOV files with an HEVC picture, whose label was not
+-- kept. An inspected size that cannot match marks them for the next round
+-- (see library.ProbePending). Until then they keep what was stored.
+UPDATE files SET probed_size = -1 WHERE probed = 1 AND (
+  (container = 'matroska' AND (rel_path LIKE '%.webm'
+    OR id IN (SELECT file_id FROM streams WHERE kind = 'video' AND codec IN ('vp8','vp9','av1'))))
+  OR (container IN ('mp4','mov') AND id IN (SELECT file_id FROM streams WHERE kind = 'video' AND codec = 'hevc')));
 `,
 }
 

@@ -114,10 +114,10 @@ func TestUpgradeBacksUpFirstAndFailureChangesNothing(t *testing.T) {
 	}
 }
 
-// Schema 6 changes what is stored about some files (WebM is no longer
-// called MKV). Files inspected before it that may be affected must be
-// marked for another inspection, and no others: inspecting a big library
-// again takes a while.
+// Schema 6 changes what is stored about some files: WebM is no longer
+// called MKV, and the label on an HEVC picture in an MP4 is kept. Files
+// inspected before it that may be affected must be marked for another
+// inspection, and no others: inspecting a big library again takes a while.
 func TestUpgradeToSchema6MarksFilesToInspectAgain(t *testing.T) {
 	dir := t.TempDir()
 	orig := migrations
@@ -147,6 +147,9 @@ func TestUpgradeToSchema6MarksFilesToInspectAgain(t *testing.T) {
 		{"Web Video.mkv", "matroska", 1, []string{"av1", "opus"}, true},
 		{"Film.mkv", "matroska", 1, []string{"h264", "ac3"}, false},
 		{"Clip.mp4", "mp4", 1, []string{"av1", "aac"}, false},
+		{"Phone Video.mp4", "mp4", 1, []string{"hevc", "aac"}, true},
+		{"Ordinary.mp4", "mp4", 1, []string{"h264", "aac"}, false},
+		{"Film in HEVC.mkv", "matroska", 1, []string{"hevc", "eac3"}, false},
 		{"Not Inspected Yet.webm", "", 0, nil, false},
 		{"Unreadable.webm", "", 2, nil, false},
 	}

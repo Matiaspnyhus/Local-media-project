@@ -283,6 +283,16 @@ func TestProbePendingStoresTracksOnce(t *testing.T) {
 	if codec != "ac3" {
 		t.Errorf("audio codec %q, want ac3", codec)
 	}
+	// The label the MP4 gives its picture is kept; an MKV has none.
+	labels := map[string]string{}
+	for _, name := range []string{"Test Clip.mp4", "Dolby.Sound.Test.mkv"} {
+		var label string
+		d.QueryRow(`SELECT s.codec_tag FROM streams s JOIN files f ON f.id=s.file_id WHERE f.rel_path=? AND s.kind='video'`, name).Scan(&label)
+		labels[name] = label
+	}
+	if labels["Test Clip.mp4"] != "avc1" || labels["Dolby.Sound.Test.mkv"] != "" {
+		t.Errorf("picture labels %q, want avc1 for the MP4 and none for the MKV", labels)
+	}
 	if n := count(t, d, `SELECT duration_ms FROM files WHERE rel_path='Test Clip.mp4'`); n < 19000 || n > 21000 {
 		t.Errorf("duration %d ms", n)
 	}

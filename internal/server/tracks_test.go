@@ -265,6 +265,38 @@ func TestAWebMFilePlaysWhereMKVDoesNot(t *testing.T) {
 	}
 }
 
+// An MP4 with an HEVC picture labelled "hev1" (what ffmpeg writes unless
+// told otherwise) does not play on an iPhone as it is. Both the list and
+// the player must send it the repackaging way, which relabels it.
+func TestHEVCLabelledHev1IsRepackagedForAnIPhone(t *testing.T) {
+	e := filmWith(t, []string{`0,'video','hevc',1,0,0,0,'',''`, `1,'audio','aac',1,0,0,0,'eng',''`}, nil)
+	e.pretendConverter(t)
+	e.s.db.Exec(`UPDATE files SET container='mp4' WHERE id=?`, e.fileID)
+	e.do("POST", "/api/capabilities", remote, e.c, map[string]any{"containers": map[string]bool{"mp4": true, "mov": true},
+		"video": map[string]bool{"h264": true, "hevc": true, "hevc10": true, "hevc-hev1": false}, "audio": map[string]bool{"aac": true}, "hls": true})
+	answers := func() (list, play string, reasons []string) {
+		var l struct{ Items []itemView }
+		decode(t, e.do("GET", "/api/movies", remote, e.c, nil), &l)
+		for _, it := range l.Items {
+			if it.ID == e.film {
+				list = it.Method
+			}
+		}
+		p := e.play(t)
+		return list, p.Plan.Method, p.Plan.Reasons
+	}
+	for label, want := range map[string]string{"hev1": "remux", "hvc1": "direct", "": "direct"} {
+		e.s.db.Exec(`UPDATE streams SET codec_tag=? WHERE file_id=? AND kind='video'`, label, e.fileID)
+		list, play, reasons := answers()
+		if list != want || play != want {
+			t.Errorf("label %q: the list says %s and the player %s, want %s (%v)", label, list, play, want, reasons)
+		}
+		if label == "hev1" && !strings.Contains(strings.Join(reasons, " "), "hev1") {
+			t.Errorf("the reason does not name the label: %v", reasons)
+		}
+	}
+}
+
 // needFFmpeg returns the converter, or skips the test where there is none
 // (unless LM_REQUIRE_FFMPEG says there must be).
 func needFFmpeg(t *testing.T) string {

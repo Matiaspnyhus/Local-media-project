@@ -233,7 +233,7 @@ func (s *Server) decide(u *User, items []itemView) error {
 	}
 	for start := 0; start < len(fileIDs); start += 400 {
 		end := min(start+400, len(fileIDs))
-		q := `SELECT s.file_id, s.kind, s.codec, s.bit_depth, s.is_default, s.is_commentary, s.language, f.container FROM streams s
+		q := `SELECT s.file_id, s.kind, s.codec, s.codec_tag, s.bit_depth, s.is_default, s.is_commentary, s.language, f.container FROM streams s
 			JOIN files f ON f.id = s.file_id WHERE s.kind IN ('video','audio') AND s.file_id IN (?` + strings.Repeat(",?", end-start-1) + `) ORDER BY s.file_id, s.idx`
 		rows, err := s.db.Query(q, fileIDs[start:end]...)
 		if err != nil {
@@ -243,7 +243,7 @@ func (s *Server) decide(u *User, items []itemView) error {
 			var fileID, kind, container string
 			var t playback.Track
 			var def, com int
-			rows.Scan(&fileID, &kind, &t.Codec, &t.BitDepth, &def, &com, &t.Language, &container)
+			rows.Scan(&fileID, &kind, &t.Codec, &t.Tag, &t.BitDepth, &def, &com, &t.Language, &container)
 			t.Default, t.Commentary = def != 0, com != 0
 			m := tracks[fileID]
 			m.Container = container

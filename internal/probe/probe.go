@@ -17,9 +17,13 @@ import (
 
 // Stream is one video, audio or subtitle track.
 type Stream struct {
-	Index           int
-	Kind            string // video, audio, subtitle
-	Codec           string
+	Index int
+	Kind  string // video, audio, subtitle
+	Codec string
+	// CodecTag is the four-letter label the file gives the codec, where it
+	// has one: "avc1", "hvc1", "hev1". Two labels can mean the same codec
+	// and still not play on the same devices.
+	CodecTag        string
 	Profile         string
 	Level           int
 	Width, Height   int
@@ -111,6 +115,7 @@ type rawProbe struct {
 		Index          int               `json:"index"`
 		CodecType      string            `json:"codec_type"`
 		CodecName      string            `json:"codec_name"`
+		CodecTag       string            `json:"codec_tag_string"`
 		Profile        string            `json:"profile"`
 		Level          int               `json:"level"`
 		Width          int               `json:"width"`
@@ -160,6 +165,11 @@ func Parse(out []byte) (Result, error) {
 			Language: lower(s.Tags, "language"), Title: tag(s.Tags, "title"),
 			Default: s.Disposition["default"] == 1, Forced: s.Disposition["forced"] == 1,
 			Commentary: s.Disposition["comment"] == 1, HearingImpaired: s.Disposition["hearing_impaired"] == 1,
+		}
+		// Where a file has no label ffprobe prints numbers in brackets,
+		// "[0][0][0][0]", which is of no use to anyone.
+		if !strings.Contains(s.CodecTag, "[") {
+			st.CodecTag = s.CodecTag
 		}
 		st.BitDepth = int(atoi64(s.BitsPerRaw))
 		if st.BitDepth == 0 && kind == "video" {

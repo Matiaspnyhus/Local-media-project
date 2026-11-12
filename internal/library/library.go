@@ -663,10 +663,10 @@ func storeProbe(d *sql.DB, fileID string, size, mtime int64, r probe.Result, pro
 		return err
 	}
 	for _, s := range r.Streams {
-		if _, err := tx.Exec(`INSERT INTO streams(file_id,idx,kind,codec,profile,level,width,height,pix_fmt,bit_depth,color_transfer,color_primaries,frame_rate,channels,channel_layout,sample_rate,bit_rate,language,title,is_default,is_forced,is_commentary,is_hearing_impaired,side_data)
-			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		if _, err := tx.Exec(`INSERT INTO streams(file_id,idx,kind,codec,profile,level,width,height,pix_fmt,bit_depth,color_transfer,color_primaries,frame_rate,channels,channel_layout,sample_rate,bit_rate,language,title,is_default,is_forced,is_commentary,is_hearing_impaired,side_data,codec_tag)
+			VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			fileID, s.Index, s.Kind, s.Codec, s.Profile, s.Level, s.Width, s.Height, s.PixFmt, s.BitDepth, s.ColorTransfer, s.ColorPrimaries,
-			s.FrameRate, s.Channels, s.ChannelLayout, s.SampleRate, s.BitRate, s.Language, s.Title, b(s.Default), b(s.Forced), b(s.Commentary), b(s.HearingImpaired), s.SideData); err != nil {
+			s.FrameRate, s.Channels, s.ChannelLayout, s.SampleRate, s.BitRate, s.Language, s.Title, b(s.Default), b(s.Forced), b(s.Commentary), b(s.HearingImpaired), s.SideData, s.CodecTag); err != nil {
 			return err
 		}
 	}

@@ -252,6 +252,48 @@ func TestChoosingAnotherSoundTrack(t *testing.T) {
 	}
 }
 
+// HEVC in an MP4 or MOV carries one of two labels. Apple devices play
+// "hvc1" and refuse "hev1", which is what ffmpeg and many encoders write.
+// Repackaging writes "hvc1", so a file labelled "hev1" goes that way unless
+// the device says it plays that label too (key "hevc-hev1").
+func TestHEVCLabelledHev1IsRepackaged(t *testing.T) {
+	file := func(container, label string, depth int) Media {
+		m := media(container, "hevc", depth, "aac")
+		m.Video[0].Tag = label
+		return m
+	}
+	both := caps(true, "mp4 mov matroska", "h264 hevc hevc10 hevc-hev1", "aac")
+	for _, c := range []struct {
+		name string
+		m    Media
+		dev  *Caps
+		want Method
+	}{
+		{"hev1 on an iPhone", file("mp4", "hev1", 8), devices["safari"], Remux},
+		{"10-bit hev1 on an iPhone", file("mp4", "hev1", 10), devices["safari"], Remux},
+		{"hev1 in a .mov", file("mov", "hev1", 8), devices["safari"], Remux},
+		{"hvc1 on an iPhone", file("mp4", "hvc1", 8), devices["safari"], Direct},
+		{"a label not yet read (inspected by an earlier version)", file("mp4", "", 8), devices["safari"], Direct},
+		{"hev1 on a device that says it plays it", file("mp4", "hev1", 8), both, Direct},
+		{"hev1 on a device that has not said", file("mp4", "hev1", 8), devices["chrome+hevc"], Remux},
+		{"hev1 where repackaging is not possible", file("mp4", "hev1", 8), caps(false, "mp4", "hevc", "aac"), None},
+		{"an MKV has no such label; only its packaging is in the way", file("matroska", "", 8), devices["safari"], Remux},
+	} {
+		p := Decide(c.m, c.dev, -1)
+		reasons := strings.Join(p.Reasons, " ")
+		if p.Method != c.want {
+			t.Errorf("%s: %s %v, want %s", c.name, p.Method, p.Reasons, c.want)
+			continue
+		}
+		if labelled := strings.Contains(reasons, "hev1"); labelled != (c.m.Video[0].Tag == "hev1" && c.want != Direct) {
+			t.Errorf("%s: reasons %v", c.name, p.Reasons)
+		}
+		if c.want == Remux && !p.AudioCopy {
+			t.Errorf("%s: relabelling converted the sound", c.name)
+		}
+	}
+}
+
 // Browsers do not agree on which sound track of a file they play by
 // themselves: Chrome plays the track an MP4 marks as main, but the first
 // track of an MKV whatever it marks. So the original is only sent when

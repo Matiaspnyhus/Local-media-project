@@ -59,7 +59,7 @@ type fileTracks struct {
 
 func (s *Server) loadTracks(fileID string, probed bool, container string) (fileTracks, error) {
 	ft := fileTracks{media: playback.Media{Probed: probed, Container: container}}
-	rows, err := s.db.Query(`SELECT kind, codec, bit_depth, channels, language, title, is_default, is_forced, is_commentary, is_hearing_impaired
+	rows, err := s.db.Query(`SELECT kind, codec, codec_tag, bit_depth, channels, language, title, is_default, is_forced, is_commentary, is_hearing_impaired
 		FROM streams WHERE file_id=? ORDER BY idx`, fileID)
 	if err != nil {
 		return ft, err
@@ -69,7 +69,7 @@ func (s *Server) loadTracks(fileID string, probed bool, container string) (fileT
 		var kind string
 		var t playback.Track
 		var def, forced, com, hi int
-		if err := rows.Scan(&kind, &t.Codec, &t.BitDepth, &t.Channels, &t.Language, &t.Title, &def, &forced, &com, &hi); err != nil {
+		if err := rows.Scan(&kind, &t.Codec, &t.Tag, &t.BitDepth, &t.Channels, &t.Language, &t.Title, &def, &forced, &com, &hi); err != nil {
 			rows.Close()
 			return ft, err
 		}

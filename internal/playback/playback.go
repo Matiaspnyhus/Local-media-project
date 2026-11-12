@@ -18,7 +18,9 @@ import "strings"
 
 // Caps is what a device reports it can play. Keys are ffprobe's names:
 // containers "mp4", "matroska", "webm", "mov"; codecs "h264", "hevc", "ac3".
-// "hevc10" stands for 10-bit HEVC, which many devices that play HEVC cannot.
+// "hevc10" stands for 10-bit HEVC, which many devices that play HEVC cannot,
+// and "h264-10" for 10-bit H.264. "hevc-hev1" says the device plays HEVC
+// under the label "hev1" as well as "hvc1" (see Decide).
 type Caps struct {
 	Containers map[string]bool `json:"containers"`
 	Video      map[string]bool `json:"video"`
@@ -30,7 +32,10 @@ type Caps struct {
 
 // Track is one video, audio or subtitle track of a file.
 type Track struct {
-	Codec           string
+	Codec string
+	// Tag is the four-letter label the file gives the codec, as ffprobe
+	// reports it ("hvc1", "hev1"); "" where there is none or it was not read.
+	Tag             string
 	BitDepth        int
 	Channels        int
 	Default         bool
@@ -136,6 +141,13 @@ func Decide(m Media, c *Caps, audioTrack int) Plan {
 	}
 	if a != nil && !c.Audio[a.Codec] {
 		p.Reasons = append(p.Reasons, "Its sound is "+AudioName(a.Codec)+", which this browser cannot play.")
+	}
+	// HEVC in an MP4 or MOV carries one of two labels. Apple devices play
+	// "hvc1" and refuse "hev1", which ffmpeg and many encoders write. The
+	// repackaged stream is always labelled "hvc1" (see package hls), so
+	// unless the device says it plays "hev1" too, that is the way to go.
+	if v.Codec == "hevc" && v.Tag == "hev1" && (m.Container == "mp4" || m.Container == "mov") && !c.Video["hevc-hev1"] {
+		p.Reasons = append(p.Reasons, `Its HEVC picture carries the label "hev1", which this device does not say it plays (Apple devices want "hvc1"). Repackaging puts the other label on it and leaves the picture itself untouched.`)
 	}
 	copyable := a == nil || (c.Audio[a.Codec] && packagedAudio[a.Codec])
 	// Which sound track a browser plays when simply handed a file is only
