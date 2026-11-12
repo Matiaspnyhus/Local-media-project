@@ -163,6 +163,37 @@ func TestPlayingBeforeTheDeviceHasReported(t *testing.T) {
 	}
 }
 
+// A sign-in lasts 180 days. When it runs out, everything handed out under
+// it must stop with it: the cookie, links to original files, and the
+// addresses of chunks, which need no cookie and used to go on working for
+// as long as something kept fetching them.
+func TestAnExpiredSignInEndsItsLinksAndChunkAddresses(t *testing.T) {
+	e := filmWith(t, []string{`0,'video','h264',1,0,0,0,'',''`, `1,'audio','dts',1,0,0,0,'eng',''`}, nil)
+	e.pretendConverter(t)
+	chunks := e.play(t).URL // the list of chunks: asking for it converts nothing
+	var original playOut
+	decode(t, e.do("POST", "/api/items/"+e.firstItem(e.c, "clip")+"/play", remote, e.c, nil), &original)
+	if !strings.HasPrefix(chunks, "/hls/") || !strings.HasPrefix(original.URL, "/stream/") {
+		t.Fatalf("addresses: %q %q", chunks, original.URL)
+	}
+	answers := func() (cookie, link, list int) {
+		return e.do("GET", "/api/movies", remote, e.c, nil).Code, e.do("GET", original.URL, remote, nil, nil).Code, e.do("GET", chunks, remote, nil, nil).Code
+	}
+	if cookie, link, list := answers(); cookie != 200 || link != 200 || list != 200 {
+		t.Fatalf("while signed in: cookie %d, link %d, chunk list %d", cookie, link, list)
+	}
+	// 181 days later.
+	if _, err := e.s.db.Exec(`UPDATE sessions SET created_at = created_at - 181*86400`); err != nil {
+		t.Fatal(err)
+	}
+	if cookie, link, list := answers(); cookie != 401 || link != 403 || list != 403 {
+		t.Errorf("after the sign-in ran out: cookie %d, link %d, chunk list %d; want 401, 403, 403", cookie, link, list)
+	}
+	if n := e.s.hls.Sessions(); n != 0 {
+		t.Errorf("%d films still open for conversion under a sign-in that has run out", n)
+	}
+}
+
 // bundleFiles opens a support bundle and returns what each file in it says.
 func bundleFiles(t *testing.T, w *httptest.ResponseRecorder) map[string]string {
 	t.Helper()

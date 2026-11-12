@@ -2,7 +2,6 @@ package server
 
 import (
 	"archive/zip"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -389,8 +388,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "This link is not valid any more.")
 		return
 	}
-	var revoked sql.NullInt64
-	if err := s.db.QueryRow(`SELECT revoked_at FROM sessions WHERE id=?`, sessionID).Scan(&revoked); err != nil || revoked.Valid {
+	if !s.signInAlive(sessionID) {
 		writeErr(w, http.StatusForbidden, "This link is not valid any more.")
 		return
 	}

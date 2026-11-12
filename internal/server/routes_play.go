@@ -447,7 +447,9 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 }
 
 // hlsOwner checks a chunk address: the token must be a live session's, and
-// the sign-in it belongs to must still be signed in.
+// the sign-in it belongs to must still be signed in and not have run out
+// (the same test as for the cookie, see signInAlive). When it is not,
+// everything being converted for that sign-in is stopped.
 func (s *Server) hlsOwner(w http.ResponseWriter, r *http.Request) (token string, ok bool) {
 	token = chi.URLParam(r, "token")
 	owner := ""
@@ -458,8 +460,7 @@ func (s *Server) hlsOwner(w http.ResponseWriter, r *http.Request) (token string,
 		writeErr(w, http.StatusForbidden, "This link is not valid any more.")
 		return "", false
 	}
-	var revoked sql.NullInt64
-	if err := s.db.QueryRow(`SELECT revoked_at FROM sessions WHERE id=?`, owner).Scan(&revoked); err != nil || revoked.Valid {
+	if !s.signInAlive(owner) {
 		s.hls.Drop(owner)
 		writeErr(w, http.StatusForbidden, "This link is not valid any more.")
 		return "", false

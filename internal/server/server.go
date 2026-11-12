@@ -376,10 +376,30 @@ func (s *Server) userFromRequest(r *http.Request) *User {
 	if err != nil {
 		return nil
 	}
-	if time.Since(time.Unix(created, 0)) > sessionLife {
+	if signInExpired(created) {
 		return nil
 	}
 	return &u
+}
+
+// signInExpired reports whether a sign-in made at created (in Unix
+// seconds) has run out.
+func signInExpired(created int64) bool {
+	return time.Since(time.Unix(created, 0)) > sessionLife
+}
+
+// signInAlive reports whether the sign-in with this id may still be used:
+// it exists, has not been signed out and has not run out. Everything
+// handed out under a sign-in ends with it, by this one test: links to
+// original files and the addresses of chunks, which work without the
+// cookie, as much as the cookie itself.
+func (s *Server) signInAlive(sessionID string) bool {
+	var created int64
+	var revoked sql.NullInt64
+	if err := s.db.QueryRow(`SELECT created_at, revoked_at FROM sessions WHERE id=?`, sessionID).Scan(&created, &revoked); err != nil || revoked.Valid {
+		return false
+	}
+	return !signInExpired(created)
 }
 
 func (s *Server) startSession(w http.ResponseWriter, r *http.Request, userID string) error {
