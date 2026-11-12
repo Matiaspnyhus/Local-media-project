@@ -209,6 +209,31 @@ func (s *Server) Watching() []Watcher {
 	return out
 }
 
+// ActiveViewers reports how many sign-ins showed a sign of watching within
+// the last while (the first of the two rules at the top of this file,
+// with a time of the caller's choosing). The program uses it to ask the
+// PC to stay awake, for which the second rule would be wrong: a film
+// paused and left for the night must not keep a PC awake until morning.
+func (s *Server) ActiveViewers(within time.Duration) int {
+	w := s.watch
+	now := w.clock()
+	n := 0
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, at := range w.seen {
+		// (A sign from "after now" means the clock was set back; Watching
+		// puts those right. Here it simply counts.)
+		if now.Sub(at) < within {
+			n++
+		}
+	}
+	return n
+}
+
+// Note writes a line into the program's log, for the parts of the program
+// outside the server (the log is what a support bundle carries).
+func (s *Server) Note(format string, args ...any) { s.log.Printf(format, args...) }
+
 // watchingBesides lists who is watching apart from one sign-in: the one
 // that is asking, which knows what it is doing itself.
 func (s *Server) watchingBesides(signIn string) []string {

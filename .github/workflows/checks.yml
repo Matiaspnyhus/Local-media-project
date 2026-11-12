@@ -183,6 +183,9 @@ jobs:
           $env:LOCALMEDIA_FFMPEG = (Resolve-Path "package\LocalMedia\ffmpeg.exe").Path
           $env:LOCALMEDIA_FFPROBE = (Resolve-Path "package\LocalMedia\ffprobe.exe").Path
           $env:LM_REQUIRE_FFMPEG = "1"
+          # This machine runs as an administrator, so Windows can be asked
+          # what is keeping it awake: the test of that must run, not skip.
+          $env:LM_REQUIRE_POWERCFG = "1"
           go test ./...
           if ($LASTEXITCODE -ne 0) { throw "tests failed" }
       - name: The Windows package starts, answers and has a working file inspector and converter
