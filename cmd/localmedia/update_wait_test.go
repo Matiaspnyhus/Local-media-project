@@ -13,10 +13,12 @@ import (
 	"net/http/cookiejar"
 	"net/http/httptest"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -172,6 +174,10 @@ func startQuiet(t *testing.T, before func(install string, pkg []byte)) *quiet {
 			t.Error("the program did not stop in 60 seconds")
 		}
 		version, firstCheck, retryEvery, executable = oldVersion, oldFirst, oldRetry, oldExe
+		// The program caught the signals that ask it to stop, and keeps
+		// them after it has stopped (see run). Here that would leave the
+		// test program deaf to an interrupt for the rest of the test run.
+		signal.Reset(os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	})
 	select {
 	case <-q.app.ready:

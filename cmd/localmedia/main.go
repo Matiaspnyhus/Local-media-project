@@ -183,6 +183,11 @@ func (a *app) run() (err error) {
 	if !signal.Ignored(syscall.SIGHUP) {
 		signal.Notify(stop, syscall.SIGHUP)
 	}
+	// Nothing gives these signals back when this function returns, and
+	// that is wanted. After it comes the hand-over to a new version, which
+	// can take a minute, and through that minute the program must not be
+	// ended by a polite request: it is still there to put the earlier
+	// version back if the new one does not start.
 	select {
 	case err := <-errc:
 		if !errors.Is(err, http.ErrServerClosed) {
