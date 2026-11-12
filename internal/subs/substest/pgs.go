@@ -135,6 +135,8 @@ func runs(w, h int) ([]byte, error) {
 		switch {
 		case n == 1:
 			line = append(line, 1) // a single pixel is just its colour
+		case n == 2:
+			line = append(line, 1, 1) // and so are two: a run is three or more
 		case n < 64:
 			line = append(line, 0, 0x80|byte(n), 1)
 		default:

@@ -278,3 +278,51 @@ func TestWhatCannotBeWrittenIsRefused(t *testing.T) {
 		t.Errorf("a caption that is in order: %v", err)
 	}
 }
+
+// A line of a caption's picture is written as runs of one colour, and the
+// format has its own way of writing each length of run: one pixel or two
+// as themselves, three to 63 in three bytes, more in four. ffmpeg shows a
+// rectangle one, two or three pixels wide exactly that wide.
+func TestNarrowRectanglesAreWrittenAsTheFormatSays(t *testing.T) {
+	for w, want := range map[int][]byte{
+		1: {1, 0, 0}, 2: {1, 1, 0, 0}, 3: {0, 0x83, 1, 0, 0}, 63: {0, 0xBF, 1, 0, 0},
+		64: {0, 0xC0, 0x40, 1, 0, 0}, 700: {0, 0xC2, 0xBC, 1, 0, 0}, 0x3FFF + 2: {0, 0xFF, 0xFF, 1, 1, 1, 0, 0},
+	} {
+		if got, err := runs(w, 1); err != nil || !bytes.Equal(got, want) {
+			t.Errorf("a line of %d pixels is written as % x (%v), want % x", w, got, err, want)
+		}
+	}
+	if got, _ := runs(2, 3); !bytes.Equal(got, []byte{1, 1, 0, 0, 1, 1, 0, 0, 1, 1, 0, 0}) {
+		t.Errorf("three lines of two pixels are written as % x", got)
+	}
+
+	ffmpeg, _ := tools(t)
+	// White on grey: the two differ in brightness alone, which a picture
+	// keeps for every pixel (colour it keeps for every second one).
+	white := color.NRGBA{255, 255, 255, 255}
+	var captions []Caption
+	for i, w := range []int{1, 2, 3, 4} {
+		captions = append(captions, Caption{StartMs: int64(1000 + 1000*i), EndMs: int64(2000 + 1000*i), X: 101, Y: 60, W: w, H: 9, Colour: white})
+	}
+	b, err := PGS(640, 360, captions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sup := filepath.Join(t.TempDir(), "narrow.sup")
+	if err := os.WriteFile(sup, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Pictures at 1.6, 2.6, 3.6 and 4.6 seconds: one in each caption's time.
+	for i, frame := range frames(t, ffmpeg, sup, 640, 360, false, []int{40, 65, 90, 115}) {
+		c := captions[i]
+		for x := c.X - 3; x < c.X+c.W+3; x++ {
+			want := grey
+			if x >= c.X && x < c.X+c.W {
+				want = white
+			}
+			if got, ok := near(frame, 640, x, c.Y+4, want, 12); !ok {
+				t.Errorf("a rectangle %d wide at %d: the pixel at %d is %v, want about %v", c.W, c.X, x, got, want)
+			}
+		}
+	}
+}
