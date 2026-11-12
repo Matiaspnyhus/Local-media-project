@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -59,6 +61,11 @@ type helpers struct {
 	cutRuns  map[string]*cutSearch // by file and stamp
 	cutFails map[string]cutFailure // by file
 	cutSlots chan struct{}
+
+	// clocks has nothing to do with helper programs. It is kept here with
+	// the rest of what the server holds in memory about films being played
+	// (see playerClocks).
+	clocks playerClocks
 }
 
 func newHelpers() *helpers {
@@ -76,6 +83,7 @@ type subtitleJob struct {
 
 	mu      sync.Mutex
 	text    []byte        // what ffmpeg has produced so far
+	caption bool          // text holds at least one caption, not just its first line
 	done    bool          // ffmpeg is gone; text will not grow
 	ok      bool          // text is the whole subtitle
 	more    chan struct{} // closed, and replaced, whenever text grows or the job ends
@@ -88,9 +96,28 @@ func (j *subtitleJob) grew() {
 	j.more = make(chan struct{})
 }
 
+// keptName is the name a subtitle made by ffmpeg is kept under: which file
+// it came from and which subtitle of that file, with the file's size and
+// date, so that a file that changes gets a fresh copy.
+//
+// The last part says how the copy was made. Copies kept by the first
+// version could lack lines (see runSubtitleJob) and do not carry it, so
+// none of them is used again.
+func keptName(fileID, key string, size, mtime int64) string {
+	return fmt.Sprintf("%s-%s-%d-%d-r2", fileID, key, size, mtime)
+}
+
 // subtitleByFFmpeg converts subtitle track n of path to WebVTT. The result
 // is sent while it is being made, since reading a long film through takes
 // a while, and kept under name for next time.
+//
+// The caller has said that a browser may keep the answer for a while. That
+// holds for the kept copy, which is whole. An answer that is still being
+// made may yet turn out cut short, so a browser is told not to keep it.
+//
+// When ffmpeg fails, the answer is an error if nothing has been sent yet,
+// and is cut off if captions have (see below). It is never a success with
+// nothing in it.
 func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path string, n int, name string) {
 	dir := filepath.Join(s.dataDir, "cache", "subtitles")
 	cached := filepath.Join(dir, name+".vtt")
@@ -102,6 +129,7 @@ func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path s
 		writeErr(w, http.StatusNotFound, "This subtitle needs the converter, which is not installed.")
 		return
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	job := s.joinSubtitleJob(name, func(ctx context.Context, job *subtitleJob) {
 		s.runSubtitleJob(ctx, job, path, n, dir, cached)
 	})
@@ -114,9 +142,24 @@ func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path s
 	sent := 0
 	for {
 		job.mu.Lock()
-		text, done, ok, more := job.text[sent:], job.done, job.ok, job.more
+		text, caption, done, ok, more := job.text[sent:], job.caption, job.done, job.ok, job.more
 		job.mu.Unlock()
-		if len(text) > 0 {
+		switch {
+		case done && !ok && sent == 0:
+			// Nothing has been sent, so the answer can still say that it
+			// failed. That is why nothing is sent before the first caption:
+			// ffmpeg writes the answer's first line ("WEBVTT") the moment it
+			// starts, also when it then gives up on the whole subtitle, and
+			// sent on at once that line made a success out of every failure.
+			writeErr(w, http.StatusInternalServerError, "Could not prepare the subtitle.")
+			return
+		case done && !ok:
+			// Captions have gone out under an answer that said "success",
+			// which cannot be taken back. Ending it here would look like a
+			// whole subtitle that simply stops. Cutting the connection tells
+			// the browser the truth: this did not arrive whole.
+			panic(http.ErrAbortHandler)
+		case len(text) > 0 && (caption || done):
 			if _, err := w.Write(text); err != nil {
 				return // this viewer went away
 			}
@@ -125,11 +168,7 @@ func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path s
 			}
 			sent += len(text)
 			continue
-		}
-		if done {
-			if !ok && sent == 0 {
-				writeErr(w, http.StatusInternalServerError, "Could not prepare the subtitle.")
-			}
+		case done:
 			return
 		}
 		select {
@@ -200,6 +239,19 @@ func (s *Server) leaveSubtitleJob(name string, job *subtitleJob) {
 // runSubtitleJob waits for its turn, runs ffmpeg, and collects what it
 // writes. A finished subtitle is kept before the viewers are told it is
 // finished, so whoever asks next finds the kept copy.
+//
+// ffmpeg is told not to check how the text is encoded (-sub_charenc_mode
+// ignore). Left to check, it throws away every line that is not UTF-8 and
+// still reports success: a subtitle saved in the old Western European
+// encoding lost each line with an accented letter. Unchecked, every line
+// comes out as it went in, and is put right here (see readable). Text in
+// two bytes a letter (UTF-16) ffmpeg reads properly by itself.
+//
+// Whatever ffmpeg says while it works means something went wrong, since it
+// is asked to report errors only. When it says something and still ends
+// well (a film that is cut short gives up only its first captions), the
+// viewers get what there is, but it is not kept: it may lack lines, and a
+// kept copy is served from then on.
 func (s *Server) runSubtitleJob(ctx context.Context, job *subtitleJob, path string, n int, dir, cached string) {
 	select {
 	case s.helpers.subSlots <- struct{}{}:
@@ -207,24 +259,39 @@ func (s *Server) runSubtitleJob(ctx context.Context, job *subtitleJob, path stri
 	case <-ctx.Done():
 		return
 	}
-	cmd := exec.CommandContext(ctx, s.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", path,
+	cmd := exec.CommandContext(ctx, s.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-sub_charenc_mode", "ignore", "-i", path,
 		"-map", "0:s:"+strconv.Itoa(n), "-f", "webvtt", "pipe:1")
 	hideWindow(cmd)
+	var said firstWords
+	cmd.Stderr = &said
 	out, err := cmd.StdoutPipe()
-	if err != nil || cmd.Start() != nil {
+	if err == nil {
+		err = cmd.Start()
+	}
+	if err != nil {
+		s.subtitleTrouble(path, "could not be prepared", err.Error())
 		return
 	}
 	buf := make([]byte, 32<<10)
+	var rest []byte // the start of a line whose end has not come yet
 	tooLong := false
 	for {
 		k, err := out.Read(buf)
-		if k > 0 {
-			job.mu.Lock()
-			job.text = append(job.text, buf[:k]...)
-			tooLong = len(job.text) > maxSubtitleBytes
-			job.grew()
-			job.mu.Unlock()
+		rest = append(rest, buf[:k]...)
+		whole := bytes.LastIndexByte(rest, '\n') + 1
+		if err != nil {
+			whole = len(rest) // the end: the last line is as whole as it will be
 		}
+		job.mu.Lock()
+		if whole > 0 {
+			// Every caption has a line with an arrow between its two times.
+			job.caption = job.caption || bytes.Contains(rest[:whole], []byte("-->"))
+			job.text = append(job.text, readable(rest[:whole])...)
+			rest = rest[whole:]
+			job.grew()
+		}
+		tooLong = len(job.text)+len(rest) > maxSubtitleBytes
+		job.mu.Unlock()
 		if tooLong {
 			cmd.Process.Kill()
 		}
@@ -232,16 +299,61 @@ func (s *Server) runSubtitleJob(ctx context.Context, job *subtitleJob, path stri
 			break
 		}
 	}
-	if cmd.Wait() != nil || tooLong || ctx.Err() != nil {
+	err = cmd.Wait()
+	switch {
+	case ctx.Err() != nil:
+		return // nobody is waiting for it any more, or the program is closing
+	case tooLong:
+		s.subtitleTrouble(path, "could not be prepared", "they are longer than subtitles can be")
+		return
+	case err != nil:
+		s.subtitleTrouble(path, "could not be prepared", said.orElse(err.Error()))
+		return
+	case len(job.text) == 0: // (only this function changes the text)
+		s.subtitleTrouble(path, "could not be prepared", said.orElse("ffmpeg ended without writing anything"))
 		return
 	}
-	job.mu.Lock()
-	text := job.text
-	job.mu.Unlock()
-	s.keepSubtitle(dir, cached, text)
+	if said.any() {
+		s.subtitleTrouble(path, "may lack lines, so they were not kept for next time", said.orElse(""))
+	} else {
+		job.mu.Lock()
+		text := job.text
+		job.mu.Unlock()
+		s.keepSubtitle(dir, cached, text)
+	}
 	job.mu.Lock()
 	job.ok = true
 	job.mu.Unlock()
+}
+
+// firstWords keeps the start of what a helper program says and lets the
+// rest go by.
+type firstWords struct{ b []byte }
+
+func (f *firstWords) Write(p []byte) (int, error) {
+	if room := 2048 - len(f.b); room > 0 {
+		f.b = append(f.b, p[:min(room, len(p))]...)
+	}
+	return len(p), nil
+}
+
+// any reports whether the program said anything.
+func (f *firstWords) any() bool { return len(bytes.TrimSpace(f.b)) > 0 }
+
+// orElse is what the program said, on one line, or other if it said nothing.
+func (f *firstWords) orElse(other string) string {
+	if !f.any() {
+		return other
+	}
+	return clip(strings.Join(strings.Fields(string(f.b)), " "), 400)
+}
+
+// subtitleTrouble notes in the log that a file's subtitles went wrong. The
+// log names the file and never its folder (see pathless); ffmpeg names the
+// file by its full path, which is cut down to the name first.
+func (s *Server) subtitleTrouble(path, what, why string) {
+	name := filepath.Base(path)
+	s.log.Printf("the subtitles of %s %s: %s", name, what, s.pathless(strings.ReplaceAll(why, path, name)))
 }
 
 // keepSubtitle stores a finished subtitle for next time. The copy is kept

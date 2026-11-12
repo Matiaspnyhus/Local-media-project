@@ -7,13 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -230,9 +230,12 @@ func (s *Server) scopeOf(itemID string) (string, error) {
 	return itemID, nil
 }
 
-// playedFile is the tail of the query that finds the file an item plays
-// from. Playing and remembering a pick both use it, so a pick is always
-// read against the file it was made on.
+// playedFile is the tail of the query that finds a file of an item without
+// regard to the device: the first copy the database gives. Only "open in
+// another player" uses it, where no browser has to be able to play the
+// file. The page's own player gets the copy its device plays best, and a
+// pick of sound and subtitles is read against that copy (see
+// playedVersion).
 const playedFile = ` FROM items i JOIN versions v ON v.item_id=i.id JOIN files f ON f.version_id=v.id JOIN libraries l ON l.id=f.library_id
 		WHERE i.id=? AND f.missing=0 ORDER BY f.part_index LIMIT 1`
 
@@ -245,6 +248,13 @@ const playedFile = ` FROM items i JOIN versions v ON v.item_id=i.id JOIN files f
 // own record of the file. A page loaded before those two were added sends
 // only two languages and whether subtitles were on, which is kept as it
 // comes.
+//
+// A film kept as several copies has one record for all of them. The pick
+// is read against the copy this device plays, which is the one it was made
+// on. On a device that plays another copy, whose tracks may be different
+// ones in a different order, it is used as a pick made in one episode is
+// used in the next: the track of the same language and kind, and the same
+// place only among several such (see playback.Choose).
 func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 	itemID := chi.URLParam(r, "id")
 	var in struct {
@@ -271,10 +281,8 @@ func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 	}
 	mem := playback.Memory{AudioLang: playback.Lang(in.AudioLang), SubLang: playback.Lang(in.SubLang), SubsOn: in.SubsOn}
 	if in.AudioIndex != nil && in.SubKey != nil {
-		var fileID, container string
-		var probed int
-		if s.db.QueryRow(`SELECT f.id, f.probed, f.container`+playedFile, itemID).Scan(&fileID, &probed, &container) == nil {
-			if ft, err := s.loadTracks(fileID, probed == 1, container); err == nil {
+		if ver, err := s.playedVersion(currentUser(r), itemID); err == nil && ver != nil {
+			if ft, err := s.loadTracks(ver.fileID, ver.probed, ver.container); err == nil {
 				// A pick the file does not have (it changed meanwhile) is
 				// not kept as one; the languages sent with it still are.
 				if m, ok := playback.Remember(ft.media.Audio, ft.subs, *in.AudioIndex, *in.SubKey); ok {
@@ -326,6 +334,61 @@ func (s *Server) loadMemory(userID, scope string) *playback.Memory {
 	return &m
 }
 
+// playerClocks is how the place a viewer stopped at stays the film's own
+// time whichever way the film reaches the device.
+//
+// A repackaged film can play with its clock a little ahead of the film's
+// own (see hls.Grid.LeadMs): every time its player reports, and every time
+// it is given, is that much later than the same moment in the file played
+// as it is. The page knows nothing of this, and does not need to. Play
+// notes how far ahead the player it has just answered will run, and gives
+// that player the place to carry on from on the player's clock. What the
+// player then reports is moved back by as much before it is saved (see
+// handleProgress).
+//
+// A note is kept by sign-in and film, in memory, and only for a clock that
+// does run ahead, which few do. It outlives the conversion it was made
+// for: the last things a page does are to save the place and to stop the
+// conversion, and the two can arrive in either order. It is lost when the
+// program restarts. So are the chunk addresses the page holds, and the
+// page then has to ask Play again, which makes the note afresh.
+type playerClocks struct {
+	mu    sync.Mutex
+	ahead map[string]int64 // milliseconds, by sign-in and item
+}
+
+// maxClockNotes bounds the notes. Signing out does not remove a sign-in's
+// notes, so they are all dropped when there are this many; a player still
+// open then saves a few seconds late until its film is next started.
+const maxClockNotes = 2000
+
+// noteClock records that the player this sign-in has just been given for
+// an item runs aheadMs ahead of the film: 0 for a file sent as it is and
+// for nearly every repackaged one.
+func (s *Server) noteClock(sessionID, itemID string, aheadMs int64) {
+	c := &s.helpers.clocks
+	key := sessionID + " " + itemID
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if aheadMs <= 0 {
+		delete(c.ahead, key)
+		return
+	}
+	if c.ahead == nil || len(c.ahead) >= maxClockNotes {
+		c.ahead = map[string]int64{}
+	}
+	c.ahead[key] = aheadMs
+}
+
+// clockAhead is how far ahead of the film the player runs that this
+// sign-in was last given for an item, in milliseconds.
+func (s *Server) clockAhead(sessionID, itemID string) int64 {
+	c := &s.helpers.clocks
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ahead[sessionID+" "+itemID]
+}
+
 // playCaps is what this device can do here and now: what it reported, less
 // repackaging when this PC has no converter to do it with.
 func (s *Server) playCaps(u *User) *playback.Caps {
@@ -359,15 +422,16 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&in) // the body is optional
 	}
-	var fileID, rel, libPath, title, container string
-	var size, mtime, durationMs int64
-	var probed int
-	err := s.db.QueryRow(`SELECT f.id, f.rel_path, l.path, i.title, f.size, f.mtime, f.probed, f.container, f.duration_ms`+playedFile,
-		itemID).Scan(&fileID, &rel, &libPath, &title, &size, &mtime, &probed, &container, &durationMs)
-	if err != nil {
+	// Of several copies of the film, the one this device plays best: the
+	// same one the lists judged it by.
+	ver, err := s.playedVersion(u, itemID)
+	if err != nil || ver == nil {
 		writeErr(w, http.StatusNotFound, "That file is not available right now.")
 		return
 	}
+	fileID, rel, libPath, size, mtime, durationMs := ver.fileID, ver.rel, ver.libPath, ver.size, ver.mtime, ver.durationMs
+	var title string
+	s.db.QueryRow(`SELECT title FROM items WHERE id=?`, itemID).Scan(&title)
 	var pos, dur int64
 	var played int
 	s.db.QueryRow(`SELECT position_ms, duration_ms, played FROM progress WHERE user_id=? AND item_id=?`, u.ID, itemID).Scan(&pos, &dur, &played)
@@ -377,7 +441,8 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	if views, _ := s.loadItems(u, `i.id = ?`, "", itemID); len(views) == 1 {
 		title = views[0].Display()
 	}
-	ft, err := s.loadTracks(fileID, probed == 1, container)
+	container := ver.container
+	ft, err := s.loadTracks(fileID, ver.probed, container)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not read the file's details.")
 		return
@@ -450,6 +515,18 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		out["url"] = "/stream/" + fileID + "?e=" + strconv.FormatInt(exp, 10) + "&s=" + u.SessionID + "&g=" + sig
 		out["mimeType"] = mediaType(rel, container)
 	}
+	// The place to carry on from is kept in the film's own time. The player
+	// this answer is for gets it on its own clock, and what it reports from
+	// now on is read on that clock (see playerClocks). A film that starts
+	// from the beginning needs no place: its player starts where its list
+	// of chunks tells it to.
+	s.noteClock(u.SessionID, itemID, subtitleShift)
+	if pos > 0 {
+		out["positionMs"] = pos + subtitleShift
+	}
+	// For the page, should it ever need the film's own time from its
+	// player's clock: it is the player's time less this.
+	out["clockAheadMs"] = subtitleShift
 	planOut := map[string]any{"playable": plan.Playable, "method": plan.Method, "reasons": plan.Reasons, "audioTrack": plan.AudioTrack, "audioCopy": plan.AudioCopy, "hasAudio": nil,
 		"deviceUnknown": plan.DeviceUnknown}
 	if ft.media.Probed {
@@ -700,21 +777,25 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusNotFound, "That subtitle file is not available.")
 			return
 		}
+		format = strings.ToLower(format)
+		if format != "srt" && format != "subrip" && format != "vtt" && format != "webvtt" {
+			// Every other format goes through ffmpeg, which reads the file
+			// itself.
+			f.Close()
+			s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(subRel)), 0, keptName(fileID, key, st.Size(), st.ModTime().Unix()))
+			return
+		}
 		raw, err := io.ReadAll(f)
 		f.Close()
 		if err != nil {
 			writeErr(w, http.StatusNotFound, "That subtitle file is not available.")
 			return
 		}
-		switch strings.ToLower(format) {
-		case "srt", "subrip":
+		if format == "srt" || format == "subrip" {
 			w.Write(srtToVTT(raw))
-			return
-		case "vtt", "webvtt":
+		} else {
 			w.Write(decodeText(raw))
-			return
 		}
-		s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(subRel)), 0, fmt.Sprintf("%s-%s-%d", fileID, key, st.ModTime().Unix()))
 		return
 	}
 	f, _, err := openMedia(libPath, rel)
@@ -729,7 +810,7 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
 	}
-	s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(rel)), n, fmt.Sprintf("%s-%s-%d-%d", fileID, key, size, mtime))
+	s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(rel)), n, keptName(fileID, key, size, mtime))
 }
 
 // handleDiagnostics says what this device reported it can play and what the
