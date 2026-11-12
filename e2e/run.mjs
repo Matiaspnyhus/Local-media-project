@@ -7,7 +7,7 @@
 //
 // Needs the program built at ./localmedia (or LOCALMEDIA_BIN).
 import { spawn, spawnSync } from 'node:child_process'
-import { mkdtempSync, cpSync, rmSync, existsSync, mkdirSync, copyFileSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, cpSync, rmSync, existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir, networkInterfaces } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -203,7 +203,14 @@ const made3 = spawnSync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
   join(media, 'Three.Sounds.Test.mkv')], { encoding: 'utf8' })
 assert.equal(made3.status, 0, `ffmpeg could not make the film with three sound tracks: ${made3.error || made3.stderr}`)
 
-const server = spawn(bin, ['--data', data, '--port', String(port), '--no-browser'], { stdio: ['ignore', 'pipe', 'pipe'] })
+// "Open in another player" on the PC starts the PC's own video player. No
+// player must start on the machine running this test, so the program is
+// told to write down what it would have opened instead.
+const openedInPlayer = join(data, 'opened-in-player.txt')
+const server = spawn(bin, ['--data', data, '--port', String(port), '--no-browser'], {
+  stdio: ['ignore', 'pipe', 'pipe'],
+  env: { ...process.env, LOCALMEDIA_OPEN_RECORD: openedInPlayer },
+})
 let serverLog = ''
 server.stdout.on('data', (d) => (serverLog += d))
 server.stderr.on('data', (d) => (serverLog += d))
@@ -729,6 +736,130 @@ try {
     await page.waitForSelector('text=Films (3)')
   })
 
+  // The way out for a film the browser cannot play well: a real video
+  // player. Which way depends on where the browser is.
+  const hasFocus = (p, selector) => p.evaluate((s) => document.activeElement === document.querySelector(s), selector)
+  let handedLink
+  // (Without a network address this whole run is on the PC's own address,
+  // where there is no "other device" to be.)
+  if (!remote) console.log('  --  no network address here: what another device is offered by "Open in another player" was not checked')
+  else await step('another device is offered a file for VLC and a link to copy, keyboard only', async () => {
+    await focusByText(page, 'Test Clip')
+    await page.keyboard.press('Enter')
+    await waitPlaying(page, 0.2)
+    // Stopped at a known place, which the other player must start from: in
+    // the eighth second. (The middle of it, as a browser may put the film a
+    // hair beside where it was told to.)
+    const stopAt = (seconds) => page.evaluate((s) => {
+      const v = document.querySelector('video')
+      v.pause()
+      v.currentTime = s + 0.5
+    }, seconds).then(() => page.waitForFunction((s) => {
+      const v = document.querySelector('video')
+      return v.paused && !v.seeking && Math.floor(v.currentTime) === s
+    }, seconds, { timeout: 20000 }))
+    await stopAt(7)
+    await focusByText(page, 'Open in another player')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('[data-testid=elsewhere-offer]')
+    assert.ok(await hasFocus(page, '[data-testid=open-elsewhere]'), 'the keyboard is still on the button that was pressed')
+    assert.equal(await page.locator('[data-testid=elsewhere-problem]').count(), 0, `nothing went wrong, yet the page says: ${await page.locator('[data-testid=elsewhere-problem]').allTextContents()}`)
+
+    // The next two stops of the keyboard are the file for VLC and the link.
+    await page.keyboard.press(TAB)
+    assert.ok(await hasFocus(page, '[data-testid=elsewhere-vlc]'), 'the keyboard goes on to the file for VLC')
+    const file = await page.evaluate(() => ({ text: document.activeElement.textContent, href: document.activeElement.getAttribute('href'), download: document.activeElement.hasAttribute('download') }))
+    assert.equal(file.text, 'Download a file for VLC')
+    assert.match(file.href, /^\/api\/items\/[0-9a-f]{32}\/handoff\.xspf\?at=7$/)
+    assert.ok(file.download, 'the file is offered as a download')
+    await page.keyboard.press(TAB)
+    assert.ok(await hasFocus(page, '[data-testid=elsewhere-link]'), 'the keyboard goes on to the link')
+    const link = await page.evaluate(() => {
+      const el = document.activeElement
+      return { value: el.value, from: el.selectionStart, to: el.selectionEnd, readOnly: el.readOnly, label: el.labels[0]?.textContent || '' }
+    })
+    assert.ok(link.value.startsWith(base + '/stream/'), `the link is a whole address, at the address this device uses: ${link.value.replace(/[?].*/, '')}`)
+    assert.ok(link.readOnly && link.from === 0 && link.to === link.value.length, 'reaching the link selects all of it, ready to copy')
+    assert.match(link.label, /copy this link/)
+    // What the link is good for is said, with the lifetime the PC gave.
+    const life = await page.evaluate(async (path) => (await (await fetch(path)).json()).validSeconds, file.href.replace(/\.xspf.*/, ''))
+    assert.equal(life, 12 * 3600, 'a link lasts twelve hours')
+    assert.match(await page.textContent('[data-testid=elsewhere-terms]'), /plays this one film without signing in, for 12 hours, and stops working when you sign out/)
+    assert.equal((await fetch(link.value, { headers: { Range: 'bytes=0-9' } })).status, 206, 'the link plays with no sign-in')
+    handedLink = link.value
+
+    // The file for VLC: a playlist with the film's name, a link of the
+    // same kind, and the place the film was stopped at.
+    const res = await page.request.get(base + file.href)
+    assert.equal(res.status(), 200)
+    assert.match(res.headers()['content-type'], /^application\/xspf\+xml/)
+    assert.match(res.headers()['content-disposition'], /^attachment; filename="Test Clip\.xspf"$/)
+    const list = await res.text()
+    assert.match(list, /<title>Test Clip<\/title>/)
+    assert.match(list, /<vlc:option>start-time=7<\/vlc:option>/)
+    const inList = (list.match(/<location>([^<]+)<\/location>/) || [])[1]?.replace(/&amp;/g, '&')
+    assert.ok(inList && inList.startsWith(base + '/stream/'), 'the playlist holds a whole address')
+    assert.equal((await fetch(inList, { headers: { Range: 'bytes=0-9' } })).status, 206, 'the link in the playlist plays with no sign-in')
+    assert.equal((await fetch(base + file.href)).status, 401, 'the playlist itself is only given to someone signed in')
+
+    if (browserName === 'chromium') {
+      // Pressed for real: the file that arrives starts the film where it
+      // is at that moment, which is no longer where it was when the offer
+      // opened.
+      await stopAt(9)
+      await pressUntilFocused(page, '[data-testid=elsewhere-vlc]', 'Shift+Tab')
+      const [download] = await Promise.all([page.waitForEvent('download', { timeout: 20000 }), page.keyboard.press('Enter')])
+      assert.equal(download.suggestedFilename(), 'Test Clip.xspf')
+      assert.match(readFileSync(await download.path(), 'utf8'), /<vlc:option>start-time=9<\/vlc:option>/)
+      assert.ok(await hasFocus(page, '[data-testid=elsewhere-vlc]'), 'the keyboard is still on the download after it was pressed')
+    }
+
+    // Only the browser on the PC may start the PC's video player.
+    const refused = await page.evaluate(async (path) => {
+      const r = await fetch(path, { method: 'POST', headers: { 'X-Requested-With': 'localmedia', 'Content-Type': 'application/json' }, body: '{}' })
+      return { status: r.status, error: (await r.json()).error }
+    }, file.href.replace(/handoff\.xspf.*/, 'open-local'))
+    assert.equal(refused.status, 403)
+    assert.match(refused.error, /from the browser on that PC/)
+    assert.ok(!existsSync(openedInPlayer), 'nothing was opened on the PC for another device')
+
+    // A second press puts the offer away, and the keyboard stays put.
+    await focusByText(page, 'Open in another player')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('[data-testid=elsewhere-offer]', { state: 'detached' })
+    assert.ok(await hasFocus(page, '[data-testid=open-elsewhere]'))
+    await focusByText(page, '← Back')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('text=Continue watching')
+  })
+
+  await step('on the PC, a film this browser cannot play is opened in the PC\'s own video player, keyboard only', async () => {
+    // The browser on the PC is made out to play nothing at all, which is
+    // how a film it cannot play looks to the PC.
+    const say = (caps) => setupPage.evaluate(async (c) => (await fetch('/api/capabilities', {
+      method: 'POST', headers: { 'X-Requested-With': 'localmedia', 'Content-Type': 'application/json' }, body: JSON.stringify(c),
+    })).status, caps)
+    assert.equal(await say({ containers: {}, video: {}, audio: {}, hls: false }), 200)
+    await focusByText(setupPage, 'Test Clip')
+    await setupPage.keyboard.press('Enter')
+    // The page says the film does not play here, and shows no player.
+    await setupPage.waitForSelector('[data-testid=play-problem]')
+    assert.equal(await setupPage.locator('video').count(), 0, 'there is no player on the page')
+    await focusByText(setupPage, 'Open in another player')
+    await setupPage.keyboard.press('Enter')
+    await setupPage.waitForFunction(() => /Opened in this PC's video player/.test(document.querySelector('[data-testid=elsewhere-said]')?.textContent || ''), null, { timeout: 20000 })
+      .catch(async () => assert.fail(`the page did not say the film was opened; it says: ${await setupPage.textContent('[data-testid=elsewhere]')}`))
+    assert.ok(await hasFocus(setupPage, '[data-testid=open-elsewhere]'), 'the keyboard is still on the button that was pressed')
+    // On the PC there is nothing to download or copy: the film is open.
+    assert.equal(await setupPage.locator('[data-testid=elsewhere-offer]').count(), 0)
+    // What the PC was asked to open: the film's own file, and nothing else.
+    assert.equal(readFileSync(openedInPlayer, 'utf8'), join(media, 'Test Clip.mp4') + '\n')
+    // Back to a browser that says what it really plays.
+    await setupPage.goto(local)
+    await setupPage.waitForSelector('text=Films (3)')
+    await setupPage.waitForFunction(async () => Object.keys((await (await fetch('/api/diagnostics')).json()).device.containers).length > 0, null, { timeout: 10000 })
+  })
+
   await step('the stream link stops working after signing out', async () => {
     const link = await page.evaluate(async () => {
       const items = (await (await fetch('/api/movies')).json()).items
@@ -748,6 +879,7 @@ try {
     await page.waitForSelector('text=Sign in to Local Media')
     assert.equal((await fetch(base + link.file)).status, 403)
     assert.equal((await fetch(base + link.chunks)).status, 403)
+    if (handedLink) assert.equal((await fetch(handedLink)).status, 403, 'the link given for another player ends with the sign-in too')
   })
 
   await step('the support bundle downloads for the owner', async () => {
