@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"path/filepath"
 	"sort"
@@ -100,7 +101,7 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	if !readJSON(w, r, &c) {
 		return
 	}
-	if len(c.Containers) > 40 || len(c.Video) > 40 || len(c.Audio) > 40 {
+	if len(c.Containers) > 40 || len(c.Video) > 40 || len(c.Audio) > 40 || len(c.Tall) > 40 {
 		writeErr(w, http.StatusBadRequest, "That report is too large.")
 		return
 	}
@@ -165,6 +166,14 @@ func applyOverrides(c *playback.Caps, userAgent string) {
 	// Firefox says it opens MKV but reads the whole file before playing.
 	if strings.Contains(userAgent, "Firefox/") {
 		c.Containers["matroska"] = false
+	}
+	// A report without a word about pictures larger than 1080p comes from
+	// a page of the version before such pictures could be converted. It
+	// is read as that version read it: what the device plays, it plays at
+	// any size. (A page that asks the device sends a list, even an empty
+	// one.)
+	if c.Tall == nil {
+		c.Tall = maps.Clone(c.Video)
 	}
 }
 
@@ -245,28 +254,30 @@ func (s *Server) judge(u *User, copies []*version) error {
 	}
 	for start := 0; start < len(fileIDs); start += 400 {
 		end := min(start+400, len(fileIDs))
-		q := `SELECT file_id, kind, codec, codec_tag, bit_depth, is_default, is_commentary, language, width, height FROM streams
+		q := `SELECT file_id, kind, codec, codec_tag, bit_depth, is_default, is_commentary, language, width, height,
+			frame_rate, color_transfer, side_data FROM streams
 			WHERE kind IN ('video','audio') AND file_id IN (?` + strings.Repeat(",?", end-start-1) + `) ORDER BY file_id, idx`
 		rows, err := s.db.Query(q, fileIDs[start:end]...)
 		if err != nil {
 			return err
 		}
 		for rows.Next() {
-			var fileID, kind string
+			var fileID, kind, frameRate, transfer, sideData string
 			var t playback.Track
 			var def, com, width, height int
-			if err := rows.Scan(&fileID, &kind, &t.Codec, &t.Tag, &t.BitDepth, &def, &com, &t.Language, &width, &height); err != nil {
+			if err := rows.Scan(&fileID, &kind, &t.Codec, &t.Tag, &t.BitDepth, &def, &com, &t.Language, &width, &height,
+				&frameRate, &transfer, &sideData); err != nil {
 				rows.Close()
 				return err
 			}
 			t.Default, t.Commentary = def != 0, com != 0
 			m := media[fileID]
 			if kind == "video" {
-				// The picture's size is kept beside the track, not in it: it
-				// ranks the copies here and plays no part in the decision.
+				// The picture's size also ranks the copies of a film.
 				if len(m.Video) == 0 {
 					byFile[fileID].pixels = width * height
 				}
+				pictureOf(&t, width, height, frameRate, transfer, sideData)
 				m.Video = append(m.Video, t)
 			} else {
 				m.Audio = append(m.Audio, t)
@@ -277,9 +288,12 @@ func (s *Server) judge(u *User, copies []*version) error {
 			return err
 		}
 	}
-	caps := s.playCaps(u)
+	// What a film would need on this device with the PC otherwise idle: a
+	// list must not call a film unplayable because the PC happens to be
+	// converting for someone else at this moment.
+	caps, limits := s.playCaps(u), s.limits(nil)
 	for _, v := range copies {
-		v.plan = playback.Decide(*media[v.fileID], caps, -1)
+		v.plan = playback.DecideFor(*media[v.fileID], caps, playback.Want{Audio: -1, Subtitle: -1}, limits)
 	}
 	return nil
 }

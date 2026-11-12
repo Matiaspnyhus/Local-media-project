@@ -44,8 +44,8 @@ export function App() {
   const [capsSent, setCapsSent] = useState(false)
   useEffect(() => {
     if (!signedIn) return setCapsSent(false)
-    api
-      .capabilities(measureCaps())
+    measureCaps()
+      .then((caps) => api.capabilities(caps))
       .catch(() => undefined)
       .then(() => setCapsSent(true))
   }, [signedIn])
@@ -218,7 +218,7 @@ function containerLabel(c: string): string {
   return names[c] || c.toUpperCase()
 }
 
-const NEEDS = 'Needs converting, which arrives in a later version'
+const NEEDS = 'Does not play on this device'
 
 function itemLabel(it: Item, withShow: boolean): string {
   if (it.kind !== 'episode') return it.title + (it.year ? ` (${it.year})` : '')
@@ -1048,13 +1048,13 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       {problem && <p className="note" role="alert" data-testid="play-problem">{problem}</p>}
       {info && info.plan.playable === 'no' && !tryAnyway && (
         <div className="card" role="alert" data-testid="play-problem">
-          <p>This browser cannot play this file yet.</p>
+          <p>{info.explain}</p>
           <ul>
             {info.plan.reasons.map((r) => (
               <li key={r}>{r}</li>
             ))}
           </ul>
-          <p className="dim">Another browser or device may be able to play it today.</p>
+          {!info.plan.pcCannot && <p className="dim">Another browser or device may be able to play it today.</p>}
           <button onClick={() => setTryAnyway(true)}>Try anyway</button>
           {elsewhere}
         </div>
@@ -1068,6 +1068,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
             playsInline
             preload="metadata"
             data-method={info.plan.method}
+            data-rung={info.plan.method === 'convert' ? info.plan.video.rung : undefined}
             onLoadedMetadata={onLoaded}
             onPlaying={onPlaying}
             onResize={onResize}
@@ -1121,6 +1122,16 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
                 <p className="dim">Why the original file is not simply sent to this browser:</p>
                 <ul>
                   {info.plan.reasons.map((r) => (
+                    <li key={r}>{r}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+            {info.plan.lost.length > 0 && (
+              <>
+                <p className="dim">What is different from the original:</p>
+                <ul data-testid="how-lost">
+                  {info.plan.lost.map((r) => (
                     <li key={r}>{r}</li>
                   ))}
                 </ul>

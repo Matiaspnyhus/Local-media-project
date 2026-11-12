@@ -130,17 +130,46 @@ export interface PlayInfo {
   // perhaps with its sound converted) rather than as the original file.
   hls?: string
   explain: string
-  plan: {
-    playable: 'yes' | 'no' | 'unknown'
-    method: 'direct' | 'remux' | 'audio' | 'none'
-    reasons: string[]
-    hasAudio: boolean | null
-    audioTrack: number
-    audioCopy: boolean
-  }
+  plan: PlayPlan
   audio: AudioTrack[]
   subtitles: SubtitleTrack[]
   pictureSubtitles: number
+}
+// How a film reaches this device, as the PC decided it. The PC sends
+// exactly these fields (a test on the PC's side holds the two lists
+// together).
+export interface PlayPlan {
+  playable: 'yes' | 'no' | 'unknown'
+  // direct: the original file. remux: repackaged, nothing converted.
+  // audio: repackaged with the sound converted. convert: the picture is
+  // converted too. none: it cannot be played here.
+  method: 'direct' | 'remux' | 'audio' | 'convert' | 'none'
+  // Why the original file is not simply sent.
+  reasons: string[]
+  // null: the file has not been inspected, so nobody knows yet.
+  hasAudio: boolean | null
+  audioTrack: number
+  audioCopy: boolean
+  deviceUnknown: boolean
+  // The answer is no only because this PC converts slower than the film plays.
+  tooSlow: boolean
+  // The answer is no because of this PC, not this device.
+  pcCannot: boolean
+  // What the picture is converted to; only meaningful for method convert.
+  video: PlayVideo
+  subtitles: 'none' | 'track' | 'draw' | 'burn'
+  subtitleKind: '' | 'text' | 'styled' | 'picture'
+  // What the viewer does not get compared with the original, in plain words.
+  lost: string[]
+  // The kind of picture this device is asked to show.
+  picture: { codec: string; bitDepth: number; size: string }
+}
+export interface PlayVideo {
+  rung: number // the setting, 1 (best picture) to 5 (lightest)
+  height: number
+  encoder: string
+  hdrToSdr: boolean
+  class: string
 }
 export interface Prefs {
   audioLang: string
@@ -180,6 +209,13 @@ export interface Caps {
   video: Record<string, boolean>
   audio: Record<string, boolean>
   hls: boolean
+  // Which of the picture formats this device plays smoothly when the
+  // picture is larger than 1080p (4K). Left out when the browser has no
+  // way to ask; the PC then takes the device at its word for any size.
+  tall?: Record<string, boolean>
+  // The page itself can fill the screen (not so on an iPhone, where only
+  // the video can).
+  pageFullscreen?: boolean
 }
 
 export const api = {
@@ -204,8 +240,10 @@ export const api = {
   setAutoUpdate: (on: boolean) => call<{ ok: boolean }>('PUT', '/api/settings/auto-update', { on }),
   health: () => call<{ status: string; version: string }>('GET', '/health'),
   capabilities: (c: Caps) => call<{ ok: boolean }>('POST', '/api/capabilities', c),
-  play: (id: string, audio?: number) =>
-    call<PlayInfo>('POST', `/api/items/${id}/play`, audio === undefined ? {} : { audio }),
+  // lower asks for a lighter picture: the number of the best setting that
+  // may be used (see PlayVideo.rung).
+  play: (id: string, audio?: number, lower?: number) =>
+    call<PlayInfo>('POST', `/api/items/${id}/play`, { ...(audio === undefined ? {} : { audio }), ...(lower ? { lower } : {}) }),
   // What the viewer picked while watching. The tracks themselves are sent
   // (audioIndex, -1 for none; subKey, '' for off) as well as their
   // languages: the same film is opened again with exactly those tracks,
