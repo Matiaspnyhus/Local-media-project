@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -109,7 +110,8 @@ func keptName(fileID, key string, size, mtime int64) string {
 
 // subtitleByFFmpeg converts subtitle track n of path to WebVTT. The result
 // is sent while it is being made, since reading a long film through takes
-// a while, and kept under name for next time.
+// a while, and kept under name for next time. beside says that path is a
+// subtitle file beside a film, and not a film.
 //
 // The caller has said that a browser may keep the answer for a while. That
 // holds for the kept copy, which is whole. An answer that is still being
@@ -118,7 +120,7 @@ func keptName(fileID, key string, size, mtime int64) string {
 // When ffmpeg fails, the answer is an error if nothing has been sent yet,
 // and is cut off if captions have (see below). It is never a success with
 // nothing in it.
-func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path string, n int, name string) {
+func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path string, n int, beside bool, name string) {
 	dir := filepath.Join(s.dataDir, "cache", "subtitles")
 	cached := filepath.Join(dir, name+".vtt")
 	if b, err := os.ReadFile(cached); err == nil {
@@ -131,7 +133,7 @@ func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path s
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	job := s.joinSubtitleJob(name, func(ctx context.Context, job *subtitleJob) {
-		s.runSubtitleJob(ctx, job, path, n, dir, cached)
+		s.runSubtitleJob(ctx, job, path, n, beside, dir, cached)
 	})
 	if job == nil {
 		writeErr(w, http.StatusServiceUnavailable, "Local Media is shutting down.")
@@ -244,24 +246,46 @@ func (s *Server) leaveSubtitleJob(name string, job *subtitleJob) {
 // ignore). Left to check, it throws away every line that is not UTF-8 and
 // still reports success: a subtitle saved in the old Western European
 // encoding lost each line with an accented letter. Unchecked, every line
-// comes out as it went in, and is put right here (see readable). Text in
-// two bytes a letter (UTF-16) ffmpeg reads properly by itself.
+// comes out as it went in, and is put right here (see readable).
+//
+// A subtitle file saved two bytes a letter (UTF-16) is another matter.
+// ffmpeg reads one properly only if it is a styled file and has the mark
+// at its start that says how it was saved. Without the mark ffmpeg takes
+// the file for another kind of file, finds no captions in it, says nothing
+// and reports success. So such a file is read here, and ffmpeg is given its
+// text in today's encoding to read from its standard input. (Subtitles
+// inside a film are never stored that way.)
 //
 // Whatever ffmpeg says while it works means something went wrong, since it
 // is asked to report errors only. When it says something and still ends
 // well (a film that is cut short gives up only its first captions), the
 // viewers get what there is, but it is not kept: it may lack lines, and a
 // kept copy is served from then on.
-func (s *Server) runSubtitleJob(ctx context.Context, job *subtitleJob, path string, n int, dir, cached string) {
+//
+// A subtitle file beside a film in which ffmpeg finds no caption at all has
+// been misread in some other way, and that is a failure too: a file is put
+// beside a film because it holds captions. A subtitle track inside a film
+// may well be empty, and is then kept as it is.
+func (s *Server) runSubtitleJob(ctx context.Context, job *subtitleJob, path string, n int, beside bool, dir, cached string) {
 	select {
 	case s.helpers.subSlots <- struct{}{}:
 		defer func() { <-s.helpers.subSlots }()
 	case <-ctx.Done():
 		return
 	}
-	cmd := exec.CommandContext(ctx, s.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-sub_charenc_mode", "ignore", "-i", path,
+	from := path
+	var text []byte
+	if beside {
+		if text = twoByteText(path); text != nil {
+			from = "pipe:0"
+		}
+	}
+	cmd := exec.CommandContext(ctx, s.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-sub_charenc_mode", "ignore", "-i", from,
 		"-map", "0:s:"+strconv.Itoa(n), "-f", "webvtt", "pipe:1")
 	hideWindow(cmd)
+	if text != nil {
+		cmd.Stdin = bytes.NewReader(text)
+	}
 	var said firstWords
 	cmd.Stderr = &said
 	out, err := cmd.StdoutPipe()
@@ -312,6 +336,9 @@ func (s *Server) runSubtitleJob(ctx context.Context, job *subtitleJob, path stri
 	case len(job.text) == 0: // (only this function changes the text)
 		s.subtitleTrouble(path, "could not be prepared", said.orElse("ffmpeg ended without writing anything"))
 		return
+	case beside && !job.caption:
+		s.subtitleTrouble(path, "could not be prepared", said.orElse("no captions were found in the file"))
+		return
 	}
 	if said.any() {
 		s.subtitleTrouble(path, "may lack lines, so they were not kept for next time", said.orElse(""))
@@ -324,6 +351,27 @@ func (s *Server) runSubtitleJob(ctx context.Context, job *subtitleJob, path stri
 	job.mu.Lock()
 	job.ok = true
 	job.mu.Unlock()
+}
+
+// twoByteText returns, in today's encoding, the text of a subtitle file
+// that is saved two bytes a letter, and nil for any other file. The file is
+// one the caller has found to be of a size a subtitle file can be.
+func twoByteText(path string) []byte {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	start := make([]byte, 4096)
+	k, _ := io.ReadFull(f, start)
+	if _, _, ok := inTwoBytes(start[:k]); !ok {
+		return nil
+	}
+	rest, err := io.ReadAll(io.LimitReader(f, maxSubtitleBytes))
+	if err != nil {
+		return nil
+	}
+	return decodeText(append(start[:k], rest...))
 }
 
 // firstWords keeps the start of what a helper program says and lets the

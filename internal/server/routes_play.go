@@ -780,9 +780,10 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		format = strings.ToLower(format)
 		if format != "srt" && format != "subrip" && format != "vtt" && format != "webvtt" {
 			// Every other format goes through ffmpeg, which reads the file
-			// itself.
+			// itself (but for a file saved two bytes a letter, which is read
+			// for it: see runSubtitleJob).
 			f.Close()
-			s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(subRel)), 0, keptName(fileID, key, st.Size(), st.ModTime().Unix()))
+			s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(subRel)), 0, true, keptName(fileID, key, st.Size(), st.ModTime().Unix()))
 			return
 		}
 		raw, err := io.ReadAll(f)
@@ -810,7 +811,7 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
 	}
-	s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(rel)), n, keptName(fileID, key, size, mtime))
+	s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(rel)), n, false, keptName(fileID, key, size, mtime))
 }
 
 // handleDiagnostics says what this device reported it can play and what the
