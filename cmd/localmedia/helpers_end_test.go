@@ -40,14 +40,18 @@ func TestMain(m *testing.M) {
 // standIn is the helper: it says that it has started, by leaving a file
 // named after its process number, then stays alive. Where the system can
 // tie a helper's life to the program's, it also says when that was done.
-// It ends by itself after ten minutes, so that a test gone wrong leaves
-// nothing behind for long.
+// So that a test gone wrong leaves nothing behind, it ends by itself when
+// the folder it reports to is removed, which the end of the test does, and
+// in any case after ten minutes.
 func standIn(dir string) {
 	pid := strconv.Itoa(os.Getpid())
 	os.WriteFile(filepath.Join(dir, "started-"+pid), nil, 0o600)
 	end := time.Now().Add(10 * time.Minute)
 	tied := false
 	for time.Now().Before(end) {
+		if _, err := os.Stat(dir); err != nil {
+			return
+		}
 		if !tied && tiedToTheProgram() {
 			tied = true
 			os.WriteFile(filepath.Join(dir, "tied-"+pid), nil, 0o600)
@@ -68,13 +72,21 @@ type helped struct {
 	helperEnd func(limit time.Duration) bool // waits for the helper to be gone
 }
 
-// startHelped builds and starts the program, sets it up with one film, and
-// waits until it has a helper running: it inspects a new film with ffprobe.
-func startHelped(t *testing.T) *helped {
+// builtProgram builds the program once for a test and its parts.
+func builtProgram(t *testing.T) string {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("builds the program")
 	}
+	exe := filepath.Join(t.TempDir(), exeName())
+	build(t, exe, "dev", false)
+	return exe
+}
+
+// startHelped starts the program, sets it up with one film, and waits
+// until it has a helper running: it inspects a new film with ffprobe.
+func startHelped(t *testing.T, exe string) *helped {
+	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
@@ -86,8 +98,6 @@ func startHelped(t *testing.T) *helped {
 		os.MkdirAll(d, 0o755)
 	}
 	os.WriteFile(filepath.Join(media, "A Film (2001).mkv"), []byte("not really a film"), 0o644)
-	exe := filepath.Join(work, exeName())
-	build(t, exe, "dev", false)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -105,11 +115,10 @@ func startHelped(t *testing.T) *helped {
 	t.Cleanup(func() {
 		h.cmd.Process.Kill()
 		<-h.exited
-		// A helper that the program failed to stop must not be left to
-		// the next test, or to the machine.
-		if p, err := os.FindProcess(h.helper); err == nil && h.helper != 0 {
-			p.Kill()
-		}
+		// A helper that the program failed to stop ends when it sees that
+		// the folder it reports to has gone (see standIn). It is not
+		// stopped by its number: by now that may be another process's.
+		os.RemoveAll(h.dir)
 	})
 
 	jar, _ := cookiejar.New(nil)
@@ -178,9 +187,10 @@ func TestHelpersEndWhenTheProgramIsToldToStop(t *testing.T) {
 		// that is killed can do nothing, and its helpers still end.
 		t.Skip("no way to ask a program to stop from a test on Windows; see TestHelpersEndWhenTheProgramIsKilled")
 	}
+	exe := builtProgram(t)
 	for _, how := range polite {
 		t.Run(how.name, func(t *testing.T) {
-			h := startHelped(t)
+			h := startHelped(t, exe)
 			if err := h.cmd.Process.Signal(how.signal); err != nil {
 				t.Fatal(err)
 			}
@@ -196,7 +206,7 @@ func TestHelpersEndWhenTheProgramIsKilled(t *testing.T) {
 	if !helpersAreTied {
 		t.Skip("only Windows, where a running helper blocks its own file, ties helpers to the program")
 	}
-	h := startHelped(t)
+	h := startHelped(t, builtProgram(t))
 	h.waitFor("tied-", "the helper was never tied to the program")
 	if err := h.cmd.Process.Kill(); err != nil {
 		t.Fatal(err)
