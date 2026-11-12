@@ -200,9 +200,17 @@ func network() Step {
 // planning a later film for a device with a remembered lesson. For the
 // second, clear Lower first: it belongs to the play that took the step.
 //
-// Everything Apply does takes something away, so a plan made after it is
-// never a better one than before. Whether it is a different one depends on
-// what this PC can do: where it cannot convert, a lesson changes nothing.
+// Everything Apply does takes something away, never adds. What that
+// promises, and what it does not:
+//
+//   - With speeds like real ones (a lighter rung is never slower than a
+//     heavier one), the plan made afterwards is never a better picture
+//     than the one before. With a table where a lighter rung is slower,
+//     a cap can leave only rungs that are too slow, and a lesson that is
+//     only advice then gives way to the film as it was (see advised).
+//   - The plan made afterwards may be the very same one: where this PC
+//     cannot convert, a lesson changes nothing. The caller can see that
+//     and spare the viewer a restart.
 func (s Step) Apply(c *Caps, w Want, l Limits) (*Caps, Want, Limits) {
 	switch s.Lesson {
 	case LessonDevice:
