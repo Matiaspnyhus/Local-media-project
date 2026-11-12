@@ -1,0 +1,9 @@
+This commit must not be published as a release.
+
+It holds parts of milestone M4 that were merged only to keep them safe:
+they are unfinished, and "Open in another player" (which starts a program
+on the PC) has not been independently checked.
+
+To publish v0.3.0, the release must point at the commit named in
+docs/decisions.md under "Release v0.3.0", not at the newest commit.
+Remove this file only when docs/decisions.md says the M4 parts are checked.
