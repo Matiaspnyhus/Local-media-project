@@ -186,6 +186,9 @@ jobs:
           go test ./...
           if ($LASTEXITCODE -ne 0) { throw "tests failed" }
       - name: The Windows package starts, answers and has a working file inspector and converter
+        # (Runs also when the tests above failed, so that one failing
+        # test does not hide what this step would have found.)
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $dir = "package\LocalMedia"
@@ -220,6 +223,7 @@ jobs:
           Write-Host "Windows program started, served the web app and answered. Version: $($r.version)"
 
       - name: Build the installer
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
@@ -230,6 +234,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "the installer did not build" }
           Get-Item installer\LocalMedia-Setup.exe | Format-List Name, Length
       - name: Install, start, and uninstall on a real Windows machine
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $app = Join-Path $env:LOCALAPPDATA "Programs\LocalMedia"
@@ -277,6 +282,7 @@ jobs:
           # as an error code, which would otherwise fail this step.
           exit 0
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: LocalMedia-Setup
           path: installer/LocalMedia-Setup.exe
@@ -311,10 +317,14 @@ jobs:
       - name: Go tests on macOS
         run: go test ./...
       - uses: actions/download-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: localmedia-builds
           path: release
       - name: End-to-end test in Safari's engine (the owner's phone is an iPhone)
+        # (Runs also when the tests above failed, so that one failing
+        # test does not hide what this step would have found.)
+        if: ${{ !cancelled() }}
         run: |
           cp release/localmedia-darwin-arm64 localmedia && chmod +x localmedia
           cd e2e && npm ci --no-audit --no-fund && npx playwright install webkit
