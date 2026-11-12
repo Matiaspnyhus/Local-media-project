@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -27,6 +29,9 @@ import (
 //	        ("open GOP"), as on most discs and in most HEVC films.
 //	uneven: 60 seconds with every fifth frame missing, so the time from one
 //	        frame to the next varies (a "variable frame rate").
+//	recording: the rough film as a TV recording keeps it: MPEG-TS, which has
+//	        no list of key frames, with a clock that starts ten hours in.
+//	still:  90 seconds with one key frame, at the very start.
 
 func tools(t *testing.T) (ffmpeg, ffprobe string) {
 	t.Helper()
@@ -56,6 +61,9 @@ func source(t *testing.T, ffmpeg, name string) string {
 		filmDir = dir
 	}
 	p := filepath.Join(filmDir, name+".mkv")
+	if name == "recording" {
+		p = filepath.Join(filmDir, name+".ts")
+	}
 	picture := func(seconds string) []string {
 		return []string{"-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=" + seconds, "-f", "lavfi", "-i", "sine=frequency=440:duration=" + seconds}
 	}
@@ -83,6 +91,15 @@ func source(t *testing.T, ffmpeg, name string) string {
 		recipes = [][]string{append(picture("60"),
 			"-vf", `select=not(eq(mod(n\,5)\,3))`, "-fps_mode", "vfr",
 			"-c:v", "libx264", "-preset", "veryfast", "-bf", "2", "-g", "40",
+			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
+	case "recording":
+		recipes = [][]string{append(picture("60"),
+			"-c:v", "libx264", "-preset", "veryfast", "-bf", "2", "-g", "168", "-sc_threshold", "0",
+			"-force_key_frames", "3.5,5,11.25,18,19,26.5,33,40.75,47,54.5",
+			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", "-output_ts_offset", "36000", "-f", "mpegts", p)}
+	case "still":
+		recipes = [][]string{append(picture("90"),
+			"-c:v", "libx264", "-preset", "ultrafast", "-g", "9999", "-sc_threshold", "0",
 			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
 	}
 	var out []byte
@@ -258,21 +275,28 @@ func TestSoundIsConvertedAndPictureStillUntouched(t *testing.T) {
 	}
 }
 
-func TestCutsAreFoundAtRealKeyFrames(t *testing.T) {
-	ffmpeg, ffprobe := tools(t)
-	src := source(t, ffmpeg, "rough")
-	g := grid(t, ffprobe, src, 60000)
-	// The film's key frames, read the slow and certain way.
+// realKeyFrames returns a film's key frames, in milliseconds, read by the
+// test itself the slow and certain way.
+func realKeyFrames(t *testing.T, ffprobe, src string) map[int64]bool {
+	t.Helper()
 	out, err := exec.Command(ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", src).Output()
 	if err != nil {
 		t.Fatal(err)
 	}
 	keys := map[int64]bool{}
 	for _, line := range strings.Split(string(out), "\n") {
-		if p := strings.Split(line, ","); len(p) == 2 && strings.HasPrefix(p[1], "K") {
+		if p := strings.Split(line, ","); len(p) >= 2 && strings.HasPrefix(p[1], "K") {
 			keys[int64(f(p[0])*1000+0.5)] = true
 		}
 	}
+	return keys
+}
+
+func TestCutsAreFoundAtRealKeyFrames(t *testing.T) {
+	ffmpeg, ffprobe := tools(t)
+	src := source(t, ffmpeg, "rough")
+	g := grid(t, ffprobe, src, 60000)
+	keys := realKeyFrames(t, ffprobe, src)
 	// An MKV file's own index gives the same key frames with one read.
 	index, err := matroskaKeyFrames(src)
 	if err != nil || len(index) != len(keys) {
@@ -345,13 +369,86 @@ func TestCutsAreFoundAtRealKeyFrames(t *testing.T) {
 	}
 }
 
+// A TV recording has no list of key frames and jumping in it does not land
+// on one, so it is read through for them; and its clock starts hours in.
+func TestCutsAreFoundInATVRecording(t *testing.T) {
+	ffmpeg, ffprobe := tools(t)
+	src := source(t, ffmpeg, "recording")
+	g := grid(t, ffprobe, src, 60000)
+	keys := realKeyFrames(t, ffprobe, src)
+	if g.From != "read" {
+		t.Errorf("the recording was cut by %q", g.From)
+	}
+	// ffmpeg starts such a file about a second and a half after the time
+	// it was told to.
+	if g.StartMs < 36000000 || g.StartMs > 36003000 || g.EndMs != g.StartMs+60000 {
+		t.Errorf("the recording's clock runs from %d to %d ms, want from just after 36000000 for a minute", g.StartMs, g.EndMs)
+	}
+	if len(g.Cuts) < 6 || len(g.Cuts) > 10 {
+		t.Errorf("a 60-second recording was cut into %d chunks: %v", len(g.Cuts), g.Cuts)
+	}
+	for i, c := range g.Cuts[1:] {
+		if !keys[c] {
+			t.Errorf("cut %d at %d ms is not a key frame (key frames: %v)", i+1, c, keys)
+		}
+		if c-g.Cuts[i] < SegmentSeconds*1000 {
+			t.Errorf("chunk %d is only %d ms long", i, c-g.Cuts[i])
+		}
+	}
+	// A run for a chunk of such a file starts one chunk early, so that it
+	// has passed a key frame by the time the chunk begins.
+	a := strings.Join(args(Spec{Path: src, Grid: g, VideoCodec: "h264", AudioTrack: -1}, 3, 8, 60), " ")
+	at := g.Cuts[2] - g.StartMs - 100
+	if want := fmt.Sprintf("-ss %d.%03d ", at/1000, at%1000); !strings.Contains(a, want) {
+		t.Errorf("a run for chunk 3 should start with %q: %s", want, a)
+	}
+}
+
+// A film with one key frame in a minute and a half cannot be cut into
+// chunks. That must be said, and not answered with a list of one chunk as
+// long as the film, which no player could ever be given in time.
+func TestAFilmThatCannotBeCutIsNotGivenAListAsIfItCould(t *testing.T) {
+	if (Grid{EndMs: 90000, Cuts: []int64{0}}).Valid() || (Grid{EndMs: 200000, Cuts: []int64{0, 6000, 70000, 140000}}).Valid() ||
+		(Grid{StartMs: 5000, EndMs: 1205000, Cuts: []int64{5000}}).Valid() {
+		t.Error("a grid with a chunk of over a minute was accepted")
+	}
+	if !(Grid{EndMs: 60000, Cuts: []int64{0}}).Valid() || !(Grid{EndMs: 200000, Cuts: []int64{0, 60000, 120000, 180000}}).Valid() {
+		t.Error("a grid with chunks of a minute was refused")
+	}
+	if u := uniform(36000000, 90000); !u.Valid() || len(u.Cuts) != 15 || u.StartMs != 36000000 || u.Cuts[14] != 36084000 || u.EndMs != 36090000 {
+		t.Errorf("an even grid on a clock that starts ten hours in: %+v", u)
+	}
+	ffmpeg, ffprobe := tools(t)
+	src := source(t, ffmpeg, "still")
+	g, err := FindCuts(context.Background(), ffprobe, src, 90000)
+	if !errors.Is(err, ErrKeyFramesTooFar) {
+		t.Fatalf("a film with one key frame: %v %+v", err, g)
+	}
+	// What comes back with the error is the grid to fall back on.
+	if !g.Valid() || g.From != "uniform" || len(g.Cuts) != 15 {
+		t.Errorf("the grid to fall back on: %+v", g)
+	}
+	// A list like that kept from an earlier version is not played from
+	// either: the film is cut evenly instead, on the same clock.
+	m := manager(t, ffmpeg)
+	token := m.Open(Spec{Path: src, Grid: Grid{StartMs: 36000000, EndMs: 36090000, Cuts: []int64{36000000}, From: "probe"}, VideoCodec: "h264", AudioTrack: -1})
+	list, _ := m.Playlist(token)
+	m.mu.Lock()
+	used := m.sessions[token].spec.Grid
+	m.mu.Unlock()
+	if strings.Count(string(list), "#EXTINF") != 15 || used.StartMs != 36000000 || !used.Valid() {
+		t.Errorf("a one-chunk list for 90 seconds was used as it came: %+v\n%s", used, list)
+	}
+}
+
 // The heart of it: wherever ffmpeg is started, each chunk begins exactly
 // where the list said it would, and holds exactly the same frames.
 func TestEveryChunkBeginsWhereTheListSays(t *testing.T) {
 	ffmpeg, ffprobe := tools(t)
-	for _, film := range []string{"rough", "open", "uneven"} {
+	for _, film := range []string{"rough", "open", "uneven", "recording"} {
+		src := source(t, ffmpeg, film)
 		t.Run(film, func(t *testing.T) {
-			src := source(t, ffmpeg, film)
+			t.Parallel() // the films are checked side by side to save time
 			g := grid(t, ffprobe, src, 60000)
 			codec := inspect(t, ffprobe, src)["video"].Codec
 			for _, copySound := range []bool{true, false} {

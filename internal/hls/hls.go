@@ -159,7 +159,9 @@ func (m *Manager) Close() {
 // the only way to reach the session's chunks.
 func (m *Manager) Open(spec Spec) string {
 	if !spec.Grid.Valid() {
-		spec.Grid = Uniform(spec.Grid.EndMs - spec.Grid.StartMs)
+		// Nothing to cut by, or cuts so far apart that a chunk could never
+		// be made in time: cut evenly instead, on the same clock.
+		spec.Grid = uniform(spec.Grid.StartMs, spec.Grid.EndMs-spec.Grid.StartMs)
 	}
 	b := make([]byte, 16)
 	rand.Read(b)
@@ -393,7 +395,14 @@ func args(spec Spec, startSeg int, readRate, burst int) []string {
 		// Start a little before the chunk, which lands ffmpeg one key frame
 		// early: the sound around the cut is then complete, and what comes
 		// before the chunk is thrown away as it is read.
-		if at := spec.Grid.Cuts[startSeg] - spec.Grid.StartMs - 100; at > 0 {
+		from := startSeg
+		if spec.Grid.From == "read" {
+			// In these files ffmpeg does not land on a key frame but wherever
+			// the time falls, and starts with whatever sound it finds there.
+			// One chunk earlier, it has passed a key frame before the chunk.
+			from--
+		}
+		if at := spec.Grid.Cuts[from] - spec.Grid.StartMs - 100; at > 0 {
 			a = append(a, "-ss", fmt.Sprintf("%d.%03d", at/1000, at%1000), "-noaccurate_seek")
 		}
 	}
