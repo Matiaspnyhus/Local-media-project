@@ -229,9 +229,12 @@ func (s *Server) scopeOf(itemID string) (string, error) {
 	return itemID, nil
 }
 
-// playedFile is the tail of the query that finds the file an item plays
-// from. Playing and remembering a pick both use it, so a pick is always
-// read against the file it was made on.
+// playedFile is the tail of the query that finds a file of an item without
+// regard to the device: the first copy the database gives. Only "open in
+// another player" uses it, where no browser has to be able to play the
+// file. The page's own player gets the copy its device plays best, and a
+// pick of sound and subtitles is read against that copy (see
+// playedVersion).
 const playedFile = ` FROM items i JOIN versions v ON v.item_id=i.id JOIN files f ON f.version_id=v.id JOIN libraries l ON l.id=f.library_id
 		WHERE i.id=? AND f.missing=0 ORDER BY f.part_index LIMIT 1`
 
@@ -244,6 +247,13 @@ const playedFile = ` FROM items i JOIN versions v ON v.item_id=i.id JOIN files f
 // own record of the file. A page loaded before those two were added sends
 // only two languages and whether subtitles were on, which is kept as it
 // comes.
+//
+// A film kept as several copies has one record for all of them. The pick
+// is read against the copy this device plays, which is the one it was made
+// on. On a device that plays another copy, whose tracks may be different
+// ones in a different order, it is used as a pick made in one episode is
+// used in the next: the track of the same language and kind, and the same
+// place only among several such (see playback.Choose).
 func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 	itemID := chi.URLParam(r, "id")
 	var in struct {
@@ -270,10 +280,8 @@ func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 	}
 	mem := playback.Memory{AudioLang: playback.Lang(in.AudioLang), SubLang: playback.Lang(in.SubLang), SubsOn: in.SubsOn}
 	if in.AudioIndex != nil && in.SubKey != nil {
-		var fileID, container string
-		var probed int
-		if s.db.QueryRow(`SELECT f.id, f.probed, f.container`+playedFile, itemID).Scan(&fileID, &probed, &container) == nil {
-			if ft, err := s.loadTracks(fileID, probed == 1, container); err == nil {
+		if ver, err := s.playedVersion(currentUser(r), itemID); err == nil && ver != nil {
+			if ft, err := s.loadTracks(ver.fileID, ver.probed, ver.container); err == nil {
 				// A pick the file does not have (it changed meanwhile) is
 				// not kept as one; the languages sent with it still are.
 				if m, ok := playback.Remember(ft.media.Audio, ft.subs, *in.AudioIndex, *in.SubKey); ok {
@@ -358,15 +366,16 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	if r.Body != nil {
 		json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&in) // the body is optional
 	}
-	var fileID, rel, libPath, title, container string
-	var size, mtime, durationMs int64
-	var probed int
-	err := s.db.QueryRow(`SELECT f.id, f.rel_path, l.path, i.title, f.size, f.mtime, f.probed, f.container, f.duration_ms`+playedFile,
-		itemID).Scan(&fileID, &rel, &libPath, &title, &size, &mtime, &probed, &container, &durationMs)
-	if err != nil {
+	// Of several copies of the film, the one this device plays best: the
+	// same one the lists judged it by.
+	ver, err := s.playedVersion(u, itemID)
+	if err != nil || ver == nil {
 		writeErr(w, http.StatusNotFound, "That file is not available right now.")
 		return
 	}
+	fileID, rel, libPath, size, mtime, durationMs := ver.fileID, ver.rel, ver.libPath, ver.size, ver.mtime, ver.durationMs
+	var title string
+	s.db.QueryRow(`SELECT title FROM items WHERE id=?`, itemID).Scan(&title)
 	var pos, dur int64
 	var played int
 	s.db.QueryRow(`SELECT position_ms, duration_ms, played FROM progress WHERE user_id=? AND item_id=?`, u.ID, itemID).Scan(&pos, &dur, &played)
@@ -376,7 +385,8 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	if views, _ := s.loadItems(u, `i.id = ?`, "", itemID); len(views) == 1 {
 		title = views[0].Display()
 	}
-	ft, err := s.loadTracks(fileID, probed == 1, container)
+	container := ver.container
+	ft, err := s.loadTracks(fileID, ver.probed, container)
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not read the file's details.")
 		return
