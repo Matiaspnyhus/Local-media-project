@@ -486,3 +486,20 @@ func TestOtherFaultsAreNotBlamedOnATrack(t *testing.T) {
 		})
 	}
 }
+
+// A track that calls itself text and turns out, when copied, not to be
+// (or to hold more than any film has words) is left out like a damaged
+// one; the film's other tracks are a result.
+func TestATextTrackThatIsNotTextIsLeftOut(t *testing.T) {
+	dir, res, percents := extracted(t, standInTools(t, "odd-txt"), "any.mkv")
+	if len(res.Tracks) != 3 {
+		t.Fatalf("tracks: %+v", res.Tracks)
+	}
+	onlyTheDamagedTrackIsLost(t, dir, res, 1)
+	if got := strings.Join(onlyOwnNames(t, dir), " "); got != "fonts fonts/f0 index.json p2.sup s0.ass" {
+		t.Errorf("the folder holds: %s", got)
+	}
+	if why := rising(percents); why != "" {
+		t.Error(why)
+	}
+}

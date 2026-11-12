@@ -423,6 +423,8 @@ var standInOutput = regexp.MustCompile(`^(s[0-9]+\.ass|t[0-9]+\.(mks|vtt)|p[0-9]
 //	             that file is cut short (the font: is empty), and it ends well
 //	no-sup, no-txt
 //	             that file is not written, and it ends well
+//	odd-txt      what it writes for the text track is whole but not text,
+//	             and it ends well
 //	short:WORDS  it says WORDS as ffmpeg says what troubles it, stops
 //	             reading at 50 seconds, and ends well
 //	whole:WORDS  it says WORDS, reads to the end, and ends well
@@ -498,6 +500,8 @@ func standIn(how string) {
 		delete(files, "p2.sup")
 	case "no-txt":
 		delete(files, "t1.mks")
+	case "odd-txt":
+		files["t1.mks"] = textMKS("S_HDMV/PGS", textCaption{500, 1000, "PG and what follows it on a disc"})
 	}
 	for name, content := range files {
 		if err := os.WriteFile(filepath.FromSlash(name), content, 0o600); err != nil {
