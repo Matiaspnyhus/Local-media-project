@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
 // A styled track (ASS, or its older form SSA) is a script: a list of lines,
@@ -77,7 +78,10 @@ const joinMs = 100
 // Lines with the same words that follow each other without a pause, or are
 // shown at once, become one caption. That is what makes one caption of a
 // sign written once for every frame, and of a line written twice to give
-// it a border.
+// it a border. A sign set one letter to a line is put together again
+// (joinLetters), and a song that a program wrote out syllable by syllable
+// is taken from the line it was made from (songLines). Words that are in a
+// line but made wholly see-through are not in the caption.
 //
 // The captions come in the order they appear. Of those that appear at the
 // same moment, speech comes first, which a player puts lowest, and
@@ -92,6 +96,8 @@ func Flatten(script []byte) []Cue {
 		section string
 		fields  = defaultFields
 		lines   []scriptLine
+		sources []scriptLine // lines kept as notes that a song's lines were made from
+		count   int          // lines read so far, for the script's order
 	)
 	for len(text) > 0 {
 		// A line ends the Unix way, the Windows way or the old Mac way. (A
@@ -126,19 +132,25 @@ func Flatten(script []byte) []Cue {
 		}
 		// Lines are taken wherever they stand: scripts turn up with their
 		// headings missing or misspelt. "Comment:" lines are the maker's
-		// notes and are not shown.
+		// notes and are not shown, with one exception (see songLines).
 		switch strings.ToLower(strings.TrimSpace(key)) {
 		case "format":
 			if f, ok := readFields(value); ok {
 				fields = f
 			}
 		case "dialogue":
-			if l, ok := fields.read(value, len(lines)); ok {
+			if l, ok := fields.read(value, count); ok {
 				lines = append(lines, l)
+				count++
+			}
+		case "comment":
+			if l, ok := fields.read(value, count); ok && l.effect == "karaoke" {
+				sources = append(sources, l)
+				count++
 			}
 		}
 	}
-	return collapse(lines)
+	return collapse(joinLetters(songLines(lines, sources)))
 }
 
 // scriptLine is one line of a script, cleaned.
@@ -146,7 +158,10 @@ type scriptLine struct {
 	start, end int64
 	text       string
 	role       Role
-	order      int // its place in the script
+	order      int    // its place in the script
+	style      string // the name of its style
+	effect     string // what its effect field says, in small letters
+	pinned     bool   // it is put at a place of its own in the picture
 }
 
 // lineFields says where in a line each thing is. A script says so itself,
@@ -205,7 +220,114 @@ func (f lineFields) read(value string, order int) (scriptLine, bool) {
 		return scriptLine{}, false
 	}
 	return scriptLine{start: start, end: end, text: text, order: order,
+		style: field(f.style), effect: strings.ToLower(field(f.effect)), pinned: pinned,
 		role: roleOf(field(f.style), field(f.effect), karaoke, pinned)}, true
+}
+
+// songLines deals with songs whose lines were written by a program. The
+// maker times a line to the music, syllable by syllable; the program (the
+// one that comes with the usual editor for these scripts) then writes a
+// line for each syllable, at its own place and with its own movement,
+// marks those "fx", and turns the maker's line into a note marked
+// "karaoke". Read plainly, the syllables are a heap of crumbs all shown at
+// once, and nothing tells them from the song's translation, which is a
+// song line too.
+//
+// So where a note marked "karaoke" has "fx" lines in its style at its
+// time, the note is the caption, and those lines are left out. "fx" lines
+// with no such note are kept: they are all there is of that song. A note
+// with no such lines stays a note.
+//
+// "At its time" takes in the lines that end as the note begins or begin as
+// it ends: a syllable is often brought in and taken out by lines of their
+// own, before and after the song's line.
+func songLines(lines, sources []scriptLine) []scriptLine {
+	if len(sources) == 0 {
+		return lines
+	}
+	made, from := map[string][]scriptLine{}, map[string][]scriptLine{}
+	for _, l := range lines {
+		if l.effect == "fx" {
+			made[l.style] = append(made[l.style], l)
+		}
+	}
+	if len(made) == 0 {
+		return lines
+	}
+	for _, s := range sources {
+		from[s.style] = append(from[s.style], s)
+	}
+	madeAt, fromAt := map[string][][2]int64{}, map[string][][2]int64{}
+	for style, list := range made {
+		madeAt[style] = stretches(list)
+	}
+	for style, list := range from {
+		fromAt[style] = stretches(list)
+	}
+	out := make([]scriptLine, 0, len(lines))
+	for _, l := range lines {
+		if l.effect != "fx" || !within(fromAt[l.style], l.start, l.end) {
+			out = append(out, l)
+		}
+	}
+	for _, s := range sources {
+		if within(madeAt[s.style], s.start, s.end) {
+			s.role = Song
+			out = append(out, s)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].order < out[j].order })
+	return out
+}
+
+// stretches returns the times a list of lines covers between them, as
+// stretches that do not touch, in order.
+func stretches(list []scriptLine) [][2]int64 {
+	sort.Slice(list, func(i, j int) bool { return list[i].start < list[j].start })
+	var out [][2]int64
+	for _, l := range list {
+		if n := len(out); n > 0 && l.start <= out[n-1][1] {
+			out[n-1][1] = max(out[n-1][1], l.end)
+		} else {
+			out = append(out, [2]int64{l.start, l.end})
+		}
+	}
+	return out
+}
+
+// within says whether any of the stretches shares time with start to end,
+// or touches it (as nearly as lines with the same words have to be to be
+// shown as one).
+func within(stretches [][2]int64, start, end int64) bool {
+	i := sort.Search(len(stretches), func(i int) bool { return stretches[i][1]+joinMs >= start })
+	return i < len(stretches) && stretches[i][0]-joinMs <= end
+}
+
+// joinLetters deals with signs that are set one letter to a line, each
+// letter at its own place, so that they can be coloured or moved one by
+// one. Read plainly that is a pile of one-letter captions, all shown at
+// once. Lines of a single letter that follow each other in the script, are
+// shown from and to the same moments, are each put at a place of their
+// own and have the same style are taken for one sign and made one line.
+//
+// (Where the sign has a space, the script has no line, so the words of a
+// sign of several come out run together. A sign whose letters do not
+// follow each other in the script is not put together.)
+func joinLetters(lines []scriptLine) []scriptLine {
+	letter := func(l scriptLine) bool { return l.pinned && utf8.RuneCountInString(l.text) == 1 }
+	out := lines[:0]
+	for i := 0; i < len(lines); {
+		l := lines[i]
+		j := i + 1
+		if letter(l) {
+			for ; j < len(lines) && letter(lines[j]) && lines[j].start == l.start && lines[j].end == l.end && lines[j].style == l.style; j++ {
+				l.text += lines[j].text
+			}
+		}
+		out = append(out, l)
+		i = j
+	}
+	return out
 }
 
 // assTime reads a time as scripts write it: hours, minutes, seconds and
@@ -244,38 +366,63 @@ func assTime(s string) (int64, bool) {
 }
 
 // plainText takes the instructions out of a line's text and returns the
-// words, with "\n" between lines. It also says whether the line had
-// karaoke timing, and whether it was pinned to a place in the picture.
+// words that are shown, with "\n" between lines. It also says whether the
+// line had karaoke timing, and whether it was pinned to a place in the
+// picture.
 func plainText(raw string) (text string, karaoke, pinned bool) {
 	var b strings.Builder
 	drawing := false // between {\p1} and {\p0} the "text" is pen movements
+	hidden := false  // after {\alpha&HFF&} the text is there and cannot be seen
 	for i := 0; i < len(raw); {
 		c := raw[i]
 		switch {
 		case c == '{':
 			end := strings.IndexByte(raw[i:], '}')
 			if end < 0 {
-				// A brace that is never closed is just a brace.
-				if !drawing {
-					b.WriteString(raw[i:])
+				// A brace that is never closed is just a brace, and what
+				// follows it is text like any other.
+				if !drawing && !hidden {
+					b.WriteByte(c)
 				}
-				i = len(raw)
+				i++
 				continue
 			}
 			// Instructions each begin with a backslash. A block without
 			// one is a note by the maker, and is not shown either.
+			changing := false // inside "\t(...)", which says what the text turns into over a time
 			for _, tag := range strings.Split(raw[i+1:i+end], `\`)[1:] {
 				tag = strings.TrimSpace(tag)
+				later := changing
+				if strings.HasPrefix(tag, "t(") {
+					changing = true
+				}
+				if strings.Contains(tag, ")") {
+					changing = false
+				}
 				switch {
 				case strings.HasPrefix(tag, "pos(") || strings.HasPrefix(tag, "move("):
 					pinned = true
-				case len(tag) > 1 && tag[0] == 'p' && digits(tag[1:]):
-					// \p1 (or any number but 0) begins a drawing, \p0 ends
-					// it. \pos and \pbo are other things.
-					n, _ := strconv.Atoi(tag[1:])
-					drawing = n != 0
+				case strings.HasPrefix(tag, "alpha"):
+					// "\alpha&HFF&" makes the text wholly see-through,
+					// and any other value, or none, makes it seen. Text
+					// that turns see-through or seen over a time is seen
+					// for some of it, and counts as seen.
+					if through := seeThrough(tag[len("alpha"):]); !later {
+						hidden = through
+					} else if !through {
+						hidden = false
+					}
+				case strings.HasPrefix(tag, "r"):
+					hidden = false // "\r": everything back to what the style says
 				case karaokeTag.MatchString(tag):
 					karaoke = true
+				case strings.HasPrefix(tag, "p") && !strings.HasPrefix(tag, "pos") && !strings.HasPrefix(tag, "pbo"):
+					// "\p" with a number above 0 begins a drawing; with 0,
+					// less, or no number it ends one. The number is read as
+					// the programs that draw these scripts read it: as far
+					// as it is one, whatever follows it ("\p1.5", "\p1)").
+					// "\pos" and "\pbo" are other things.
+					drawing = leadingNumber(tag[1:]) > 0
 				}
 			}
 			i += end + 1
@@ -286,12 +433,12 @@ func plainText(raw string) (text string, karaoke, pinned bool) {
 			b.WriteByte(' ') // a space that lines are not broken at
 			i += 2
 		case c == '\\' && i+1 < len(raw) && (raw[i+1] == '{' || raw[i+1] == '}'):
-			if !drawing {
+			if !drawing && !hidden {
 				b.WriteByte(raw[i+1]) // a brace that is meant to be seen
 			}
 			i += 2
 		default:
-			if !drawing {
+			if !drawing && !hidden {
 				b.WriteByte(c)
 			}
 			i++
@@ -313,13 +460,30 @@ func plainText(raw string) (text string, karaoke, pinned bool) {
 // music: \k, \K, \kf, \ko and \kt, each followed by a number.
 var karaokeTag = regexp.MustCompile(`^(k[fot]?|K)\s*\d`)
 
-func digits(s string) bool {
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return false
-		}
+// leadingNumber reads the whole number a text begins with, after any
+// spaces, and returns 0 if it begins with none.
+func leadingNumber(s string) int {
+	s = strings.TrimLeft(s, " \t")
+	negative := strings.HasPrefix(s, "-")
+	if negative || strings.HasPrefix(s, "+") {
+		s = s[1:]
 	}
-	return s != ""
+	n := 0
+	for i := 0; i < len(s) && s[i] >= '0' && s[i] <= '9' && n < 1000000; i++ {
+		n = n*10 + int(s[i]-'0')
+	}
+	if negative {
+		return -n
+	}
+	return n
+}
+
+// seeThrough reads what follows "\alpha": how see-through the text is to
+// be, from 00 (not at all) to FF (wholly), written "&HFF&". It says
+// whether that is wholly.
+func seeThrough(value string) bool {
+	n, err := strconv.ParseUint(strings.Trim(value, "&Hh) \t"), 16, 32)
+	return err == nil && n&0xFF == 0xFF
 }
 
 // Words that makers of scripts put in the names of styles for lines that

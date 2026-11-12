@@ -447,3 +447,228 @@ func TestFlattenOfAnExtractedTrack(t *testing.T) {
 	t.Logf("ffmpeg's own conversion shows the drawing as a caption: %v; ends its lines the Windows way when taking the track out: %v",
 		bytes.Contains(theirs, []byte("m 0 0 l 100 0")), bytes.Contains(raw, []byte("\r\n")))
 }
+
+// The programs that draw styled tracks read the number after "\p" as far
+// as it is one and pay no heed to what follows it, so a drawing can begin
+// in more ways than "{\p1}". None of them may come out as a caption.
+func TestFlattenKnowsADrawingHoweverItBegins(t *testing.T) {
+	for text, want := range map[string]string{
+		`{\p1.5}m 0 0 l 10 10 20 20{\p0}`:      "",
+		`{\p 1}m 0 0 l 10 10`:                  "",
+		`{\p1 mask}m 0 0 l 10 10`:              "",
+		`{\p1)}m 0 0 l 10 10`:                  "",
+		`{\t(\p1)}m 0 0 l 10 10`:               "",
+		`{\p+2}m 0 0 l 10 10`:                  "",
+		`{\p1}m 0 0 l 10 10{\p 0 }Label`:       "Label",
+		`{\p1}m 0 0{\p-1}after`:                "after", // less than nothing is nothing
+		`{\p1}m 0 0{\p}after`:                  "after", // and so is no number at all
+		`{\p1}m 0 0{\pause}after`:              "after",
+		`{\p0.9}Words, not a drawing`:          "Words, not a drawing",
+		`{\pos(10,10)}Placed, not drawn`:       "Placed, not drawn",
+		`{\pbo-5}Lowered, not drawn`:           "Lowered, not drawn",
+		`{\an8\p1\pos(5,5)}m 0 0 l 1 1{\p0}On`: "On",
+	} {
+		got := Flatten(lines(said(text)))
+		switch {
+		case want == "" && len(got) != 0:
+			t.Errorf("%s came out as %q", text, got[0].Text)
+		case want != "" && (len(got) != 1 || got[0].Text != want):
+			t.Errorf("%s became %+v, want %q", text, got, want)
+		}
+	}
+	// A brace that is never closed is a brace, and what follows it is read
+	// like any other text: its line breaks are line breaks.
+	for text, want := range map[string]string{
+		`text {\i1 never closed\Nsecond line`: "text {\\i1 never closed\nsecond line",
+		`{ one\hbrace\Nand more`:              "{ one brace\nand more",
+		`{ a note\Nby the maker {\b1}more`:    "more", // closed after all, further on
+		`{\p1}m 0 0 l 5 5 {never closed`:      "",
+	} {
+		if got := Flatten(lines(said(text))); want == "" && len(got) != 0 || want != "" && (len(got) != 1 || got[0].Text != want) {
+			t.Errorf("%s became %+v, want %q", text, got, want)
+		}
+	}
+}
+
+// Words can be in a line and not be shown: made see-through until a later
+// line, with the same words, shows them. A caption has only what is shown.
+func TestFlattenLeavesOutWordsThatAreNotShown(t *testing.T) {
+	got := Flatten(lines(
+		`Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,I...{\alpha&HFF&} love you.`,
+		`Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,I... love you.`,
+	))
+	if want := []Cue{cue(1000, 2000, "I...", Speech), cue(2000, 3000, "I... love you.", Speech)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("a line that is shown in two steps: %+v", got)
+	}
+	for text, want := range map[string]string{
+		`{\alpha&HFF&}Not shown at all`:                      "",
+		`{\alpha&HFF&}Hidden {\alpha&H00&}shown`:             "shown",
+		`{\alpha&HFF&}Hidden {\alpha}shown`:                  "shown", // back to what the style says
+		`{\alpha&HFF&}Hidden {\r}shown`:                      "shown", // the same, for everything
+		`{\alpha&HFF&}Hidden {\rAlt}shown`:                   "shown",
+		`{\alpha&Hff&}Hidden {\alpha&H80&}half shown`:        "half shown",
+		`{\alphaFF}Hidden {\alpha&H00}shown`:                 "shown",
+		`{\alpha&HFF&}Hidden\Nstill {\i1}hidden`:             "",
+		`Shown {\alpha&HFF&}hidden {\alpha&H00&}shown again`: "Shown shown again",
+		// Fading in and fading out: shown at some time, so shown.
+		`{\alpha&HFF&\t(0,500,\alpha&H00&)}Fading in`:  "Fading in",
+		`{\alpha&H00&\t(0,500,\alpha&HFF&)}Fading out`: "Fading out",
+		`{\t(0,500,\alpha&HFF&)}Fading {\b1}out`:       "Fading out",
+		// Only one of its parts made see-through: the rest of it shows.
+		`{\1a&HFF&}An outline is still seen`: "An outline is still seen",
+		`{\fad(200,200)}Faded at both ends`:  "Faded at both ends",
+	} {
+		got := Flatten(lines(said(text)))
+		if want == "" && len(got) != 0 || want != "" && (len(got) != 1 || got[0].Text != want) {
+			t.Errorf("%s became %+v, want %q", text, got, want)
+		}
+	}
+}
+
+// A sign can be set one letter to a line, each letter at its own place, so
+// that the letters can be coloured or moved one by one. Read plainly that
+// is a pile of one-letter captions, all at once. Letters that stand
+// together in the script, at the same time and in the same style, are one
+// caption.
+func TestFlattenJoinsASignSetLetterByLetter(t *testing.T) {
+	letters := func(from, to, word string) (out []string) {
+		for i, r := range word {
+			out = append(out, fmt.Sprintf(`Dialogue: 0,%s,%s,Sign,,0,0,0,,{\pos(%d,100)\c&H%02X00FF&}%c`, from, to, 100+20*i, 10*i, r))
+		}
+		return out
+	}
+	got := Flatten(lines(letters("0:00:10.00", "0:00:12.00", "OPEN")...))
+	if want := []Cue{cue(10000, 12000, "OPEN", Sign)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("a sign of four letters: %+v", got)
+	}
+	// Moving with the picture: every letter again for each frame. A letter
+	// that the word has twice is there twice.
+	var moving []string
+	at := func(hundredths int) string { return fmt.Sprintf("0:00:%02d.%02d", 20+hundredths/100, hundredths%100) }
+	for frame := 0; frame < 25; frame++ {
+		moving = append(moving, letters(at(frame*4), at(frame*4+4), "HELLO")...)
+	}
+	got = Flatten(lines(moving...))
+	if want := []Cue{cue(20000, 21000, "HELLO", Sign)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("the same over 25 frames: %d captions, %+v", len(got), got)
+	}
+	// Letters of other alphabets are letters.
+	got = Flatten(lines(letters("0:00:10.00", "0:00:12.00", "駅前ÅØ")...))
+	if want := []Cue{cue(10000, 12000, "駅前ÅØ", Sign)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("letters of other alphabets: %+v", got)
+	}
+	// What is left alone: single letters that are spoken (not pinned to a
+	// place), that are shown at other times, that are in different styles,
+	// or that do not stand together in the script.
+	got = Flatten(lines(
+		`Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,A`,
+		`Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,I`,
+		`Dialogue: 0,0:00:03.00,0:00:04.00,Sign,,0,0,0,,{\pos(1,1)}X`,
+		`Dialogue: 0,0:00:03.00,0:00:05.00,Sign,,0,0,0,,{\pos(9,1)}Y`,
+		`Dialogue: 0,0:00:06.00,0:00:07.00,Sign,,0,0,0,,{\pos(1,1)}P`,
+		`Dialogue: 0,0:00:06.00,0:00:07.00,Note,,0,0,0,,{\pos(9,1)}Q`,
+		`Dialogue: 0,0:00:08.00,0:00:09.00,Sign,,0,0,0,,{\pos(1,1)}R`,
+		`Dialogue: 0,0:00:08.00,0:00:09.00,Sign,,0,0,0,,{\pos(5,1)}a whole word`,
+		`Dialogue: 0,0:00:08.00,0:00:09.00,Sign,,0,0,0,,{\pos(9,1)}S`,
+	))
+	want := []Cue{
+		cue(1000, 2000, "A", Speech), cue(1000, 2000, "I", Speech),
+		cue(3000, 4000, "X", Sign), cue(3000, 5000, "Y", Sign),
+		cue(6000, 7000, "P", Sign), cue(6000, 7000, "Q", Sign),
+		cue(8000, 9000, "R", Sign), cue(8000, 9000, "a whole word", Sign), cue(8000, 9000, "S", Sign),
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("letters that are not one sign:\n got %+v\nwant %+v", got, want)
+	}
+}
+
+// The words of a song are often written by a program from a line the
+// maker timed: the line is kept in the script as a note, marked
+// "karaoke", and the program writes a line for every syllable, marked
+// "fx", each at its own place. Read plainly that gives the song in
+// crumbs: "so", "ra", "no", all at once. Where there is such a note, it is
+// the caption, and the syllables written from it are left out.
+func TestFlattenTakesASongFromTheLineItWasMadeFrom(t *testing.T) {
+	song := []string{
+		`Comment: 0,0:00:00.00,0:00:00.00,OP Romaji,,0,0,0,template syl,{\pos($x,$y)\t(!$start!,!$end!,\fscx120)}`,
+		`Comment: 0,0:00:00.00,0:00:00.00,OP Romaji,,0,0,0,code once,function f() return 1 end`,
+		`Comment: 0,0:00:24.70,0:00:29.00,OP Romaji,,0,0,0,karaoke,{\k20}so{\k15}ra {\k30}no {\k10}i{\k25}ro`,
+		`Comment: 0,0:00:29.00,0:00:33.00,OP Romaji,,0,0,0,Karaoke,{\k20}to{\k15}o{\k30}ku`,
+	}
+	// Each syllable comes in a little before its line and goes a little
+	// after.
+	for i, syllable := range []string{"so", "ra", "no", "i", "ro"} {
+		song = append(song, fmt.Sprintf(`Dialogue: 1,0:00:24.50,0:00:29.20,OP Romaji,,0,0,0,fx,{\pos(%d,50)\t(0,300,\fscx120)}%s`, 100+30*i, syllable))
+	}
+	for i, syllable := range []string{"to", "o", "ku"} {
+		song = append(song, fmt.Sprintf(`Dialogue: 1,0:00:28.80,0:00:33.20,OP Romaji,,0,0,0,FX,{\pos(%d,50)}%s`, 100+30*i, syllable))
+	}
+	// And the first comes in, and the last goes out, in a line of its own
+	// that ends where the song's line begins, or begins where it ends.
+	song = append(song,
+		`Dialogue: 0,0:00:24.40,0:00:24.70,OP Romaji,,0,0,0,fx,{\pos(100,50)\fad(300,0)}so`,
+		`Dialogue: 0,0:00:33.00,0:00:33.30,OP Romaji,,0,0,0,fx,{\pos(160,50)\fad(0,300)}ku`)
+	song = append(song,
+		`Dialogue: 0,0:00:24.70,0:00:29.00,OP English,,0,0,0,,The colour of the sky`,
+		`Dialogue: 0,0:00:29.00,0:00:33.00,OP English,,0,0,0,,So far away`,
+		`Dialogue: 0,0:00:25.00,0:00:27.00,Default,,0,0,0,,Someone speaks over the song`,
+	)
+	want := []Cue{
+		cue(24700, 29000, "sora no iro", Song), cue(24700, 29000, "The colour of the sky", Song),
+		cue(25000, 27000, "Someone speaks over the song", Speech),
+		cue(29000, 33000, "tooku", Song), cue(29000, 33000, "So far away", Song),
+	}
+	if got := Flatten(lines(song...)); !reflect.DeepEqual(got, want) {
+		t.Errorf("a song written by a program:\n got %+v\nwant %+v", got, want)
+	}
+
+	// Without the lines they were made from, the syllables are all there
+	// is of the song, and are kept. And a note marked "karaoke" with no
+	// syllables made from it is a note: nothing of it is shown where the
+	// track is drawn, so nothing is shown here.
+	// The same goes for syllables in another style than the note's, or half
+	// a second away from it.
+	got := Flatten(lines(
+		`Dialogue: 1,0:01:00.00,0:01:05.00,ED,,0,0,0,fx,{\pos(100,50)}la`,
+		`Dialogue: 1,0:01:00.00,0:01:05.00,ED,,0,0,0,fx,{\pos(130,50)}li`,
+		`Comment: 0,0:02:00.00,0:02:05.00,ED,,0,0,0,karaoke,{\k20}not {\k20}used`,
+		`Comment: 0,0:01:00.00,0:01:05.00,ED,,0,0,0,,a note at the time of the song`,
+		`Comment: 0,0:01:00.00,0:01:05.00,ED Kanji,,0,0,0,karaoke,{\k20}another {\k20}style`,
+		`Comment: 0,0:01:05.50,0:01:09.00,ED,,0,0,0,karaoke,{\k20}half a second {\k20}later`,
+	))
+	if want := []Cue{cue(60000, 65000, "la", Song), cue(60000, 65000, "li", Song)}; !reflect.DeepEqual(got, want) {
+		t.Errorf("syllables without the line they were made from: %+v", got)
+	}
+}
+
+// A time's fraction of a second is hundredths in every script written by
+// the usual programs; one digit is tenths' worth of hundredths as those
+// programs read it, and three digits are thousandths.
+func TestFlattenReadsFractionsOfASecond(t *testing.T) {
+	got := Flatten(lines(
+		`Dialogue: 0,0:00:01.5,0:00:02.25,Default,,0,0,0,,One digit, two digits`,
+		`Dialogue: 0,0:00:03.125,0:00:04.999,Default,,0,0,0,,Three digits`,
+		`Dialogue: 0,0:00:05,0:00:06,Default,,0,0,0,,None`,
+		`Dialogue: 0,0:00:07.1234,0:00:08.00,Default,,0,0,0,,Four is not a time`,
+	))
+	want := []Cue{cue(1050, 2250, "One digit, two digits", Speech), cue(3125, 4999, "Three digits", Speech), cue(5000, 6000, "None", Speech)}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+}
+
+// Lines that were joined because they had the same words stand where the
+// first of them stood in the script.
+func TestFlattenKeepsTheScriptsOrderAfterJoining(t *testing.T) {
+	got := Flatten(lines(
+		`Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Zebra, written first`,
+		`Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,Apple, in two parts`,
+		`Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,Mango, written between`,
+		`Dialogue: 0,0:00:02.00,0:00:03.00,Default,,0,0,0,,Apple, in two parts`,
+		`Dialogue: 1,0:00:01.00,0:00:03.00,Default,,0,0,0,,Zebra, written first`,
+	))
+	want := []Cue{cue(1000, 3000, "Zebra, written first", Speech), cue(1000, 3000, "Apple, in two parts", Speech), cue(1000, 3000, "Mango, written between", Speech)}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("got %+v\nwant %+v", got, want)
+	}
+}
