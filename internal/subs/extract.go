@@ -60,7 +60,9 @@ var (
 // Extract reads film through once and writes every subtitle track it can
 // use and every font the film carries into dir, which is made if it is not
 // there. The files are named by this package (see Track.File and
-// Font.File), never after anything the film says.
+// Font.File), never after anything the film says. Files with such names
+// that an earlier run left in dir are removed; nothing else in it is
+// touched.
 //
 // progress, if not nil, is told how far through the film the reading has
 // got, as a whole percentage, each time that number rises; 100 is only
@@ -103,7 +105,10 @@ type extraction struct {
 type job struct {
 	forms []form // one for each subtitle track, in order; formNone for a track that is left
 	fonts []int  // which attachments are written out
-	clock clock
+	// fontsLeft is how many more might have been fonts, in a film that has
+	// more attachments than are taken.
+	fontsLeft int
+	clock     clock
 	// through has the film read to its end even when no track is taken
 	// from it, to find out whether it can be.
 	through bool
@@ -129,8 +134,12 @@ func plan(f inventory) job {
 		j.forms = append(j.forms, form)
 	}
 	for k, a := range f.attachments {
-		if a.mayBeFont() && len(j.fonts) < maxFonts {
+		switch {
+		case !a.mayBeFont():
+		case len(j.fonts) < maxFonts:
 			j.fonts = append(j.fonts, k)
+		default:
+			j.fontsLeft++
 		}
 	}
 	return j
@@ -214,11 +223,21 @@ func (j job) args(film string) []string {
 	return append(a, "-f", "mkvtimestamp_v2", "-flush_packets", "1", "pipe:1")
 }
 
-func (e *extraction) run(ctx context.Context) (Result, error) {
+func (e *extraction) run(ctx context.Context) (res Result, err error) {
 	if e.tools.FFmpeg == "" {
 		return Result{}, errors.New("ffmpeg is not available")
 	}
 	e.reported = -1
+	dir, err := filepath.Abs(e.dir)
+	if err != nil {
+		return Result{}, err
+	}
+	// Whatever goes wrong, the error does not say where the folder is.
+	defer func() {
+		if err != nil {
+			err = placeless(err, dir)
+		}
+	}()
 	// ffmpeg is started in another folder, where a path that is not whole
 	// would lead somewhere else: the film's, and ffmpeg's own if it was
 	// given as a path and not as a bare name to look up.
@@ -230,10 +249,6 @@ func (e *extraction) run(ctx context.Context) (Result, error) {
 		if e.tools.FFmpeg, err = filepath.Abs(e.tools.FFmpeg); err != nil {
 			return Result{}, err
 		}
-	}
-	dir, err := filepath.Abs(e.dir)
-	if err != nil {
-		return Result{}, err
 	}
 	busyMu.Lock()
 	if busy[dir] {
@@ -256,7 +271,7 @@ func (e *extraction) run(ctx context.Context) (Result, error) {
 		return Result{}, err
 	}
 	j := plan(seen)
-	res := Result{DurationMs: seen.durationMs, StartMs: seen.startMs, Tracks: seen.tracks, Fonts: []Font{}}
+	res = Result{DurationMs: seen.durationMs, StartMs: seen.startMs, Tracks: seen.tracks, Fonts: []Font{}, FontsLeftOut: j.fontsLeft}
 	if res.Tracks == nil {
 		res.Tracks = []Track{}
 	}
@@ -338,7 +353,11 @@ func (e *extraction) run(ctx context.Context) (Result, error) {
 	}
 
 	// Everything is moved into place, and only then is the index written.
+	// What an earlier run left in the folder goes first.
 	if err := os.MkdirAll(filepath.Join(dir, "fonts"), 0o700); err != nil {
+		return Result{}, err
+	}
+	if err := clearOld(dir); err != nil {
 		return Result{}, err
 	}
 	for _, name := range ready {
@@ -353,6 +372,38 @@ func (e *extraction) run(ctx context.Context) (Result, error) {
 		e.progress(100)
 	}
 	return res, nil
+}
+
+// ownFile matches the name of every file a finished folder can hold
+// besides its index.
+var ownFile = regexp.MustCompile(`^(s[0-9]+\.ass|t[0-9]+\.vtt|p[0-9]+\.(sup|mks)|fonts/f[0-9]+)$`)
+
+// clearOld removes the files an earlier run left in a folder: every file
+// with a name this package gives, and nothing else. Without this a folder
+// that is used again (for a film that has changed, or after this package
+// has) would keep tracks and fonts that the new result does not have; and
+// a font left lying there would be drawn with, since the program that
+// draws styled subtitles takes every font in the folder it is given.
+func clearOld(dir string) error {
+	for _, sub := range []string{"", "fonts"} {
+		entries, err := os.ReadDir(filepath.Join(dir, sub))
+		if err != nil {
+			return err
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if sub != "" {
+				name = sub + "/" + name
+			}
+			if entry.IsDir() || !ownFile.MatchString(name) {
+				continue
+			}
+			if err := os.Remove(filepath.Join(dir, filepath.FromSlash(name))); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // removeWork removes the working folder and what is in it. On Windows a
@@ -587,6 +638,11 @@ func check(f form, work string, n int) (PictureFacts, int64, error) {
 		// captions, which ffmpeg 6.1 writes as it finds it, line end or
 		// none. So a file that stops without a line end is cut short if
 		// what it stops in is a caption.
+		//
+		// (One kind of script is turned away wrongly by this, with ffmpeg
+		// 6.1 only: one whose own last line, after its captions, is
+		// itself written like a caption and has no line end. The
+		// converter that ships ends that line, and all is well.)
 		facts.FirstMs, err = firstLine(file, st.Size(), assStart, func(last []byte) bool {
 			return bytes.HasPrefix(last, []byte("Dialogue:")) || bytes.HasPrefix([]byte("Dialogue:"), last)
 		})
@@ -863,6 +919,31 @@ func (h *heard) String() string {
 	}
 	return strings.TrimSpace(string(b))
 }
+
+// placeless takes the place of the output folder out of an error's words:
+// the folder is somewhere under the home of whoever runs the program, and
+// errors are logged and travel in support bundles. What the error is about
+// stays readable ("open the subtitle folder/making/s0.ass: ..."), and what
+// kind of error it is can still be asked of it.
+func placeless(err error, dir string) error {
+	words := strings.ReplaceAll(err.Error(), dir, "the subtitle folder")
+	for up := filepath.Dir(dir); len(up) > 1 && up != filepath.Dir(up); up = filepath.Dir(up) {
+		words = strings.ReplaceAll(words, up, "a folder above the subtitle folder")
+	}
+	if words == err.Error() {
+		return err
+	}
+	return &reworded{err: err, words: words}
+}
+
+// reworded is an error that says what another says in other words.
+type reworded struct {
+	err   error
+	words string
+}
+
+func (r *reworded) Error() string { return r.words }
+func (r *reworded) Unwrap() error { return r.err }
 
 // pathless takes the folder the film is in out of what ffmpeg said.
 // ffmpeg names the file it was given in full; only the file's own name is

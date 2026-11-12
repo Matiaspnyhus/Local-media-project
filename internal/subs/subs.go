@@ -163,7 +163,10 @@ type Track struct {
 	Kind  Kind   `json:"kind"`
 	Codec string `json:"codec"`
 	// Language, Title and the marks are what the film says about the
-	// track. They are for showing and choosing, nothing else.
+	// track. They are for showing and choosing, nothing else. The title is
+	// any words on one line. The language is in small letters and has the
+	// shape of a language's code ("eng", "pt-br"), or is empty: what a film
+	// gives as a language is not kept if it is anything else.
 	Language        string `json:"language,omitempty"`
 	Title           string `json:"title,omitempty"`
 	Default         bool   `json:"default,omitempty"`
@@ -182,7 +185,9 @@ type Track struct {
 	FirstMs int64 `json:"firstMs"`
 	// Width and Height are the size of picture a picture track was made
 	// for: its captions are placed, and sized, for a picture that big.
-	// Both are 0 for other kinds.
+	// Both are 0 for other kinds, and for a picture track that does not
+	// say (see PictureFacts): such a track is laid over the film by the
+	// film's own size.
 	Width  int `json:"width,omitempty"`
 	Height int `json:"height,omitempty"`
 	// Done says the whole track was written. It is false for a kind that
@@ -210,6 +215,15 @@ func (t Track) JumpBaseMs() int64 {
 }
 
 // Font is one of the fonts a film brings along for its styled subtitles.
+//
+// An attachment is kept as a font if its file begins the way the common
+// kinds of font file do, or if the film says it is a font, by its name or
+// its stated type: there are more kinds of font file than this package
+// knows the beginning of, and a file that is no font after all is of no
+// use to anyone but does no harm. No limit is put on a font's size. Fonts
+// for Chinese and Japanese run to tens of megabytes each, and all that a
+// film attaches is part of the film's own file, so it cannot be more than
+// the film is.
 type Font struct {
 	// K is its place among the film's attachments, counted from 0, as
 	// ffmpeg counts them: a cover picture is not one of them to ffmpeg,
@@ -237,6 +251,10 @@ type Result struct {
 	Tracks []Track `json:"tracks"`
 	// Fonts has every font that was written.
 	Fonts []Font `json:"fonts"`
+	// FontsLeftOut is how many attachments that may have been fonts were
+	// not looked at, because the film has more than this package takes
+	// from one film. It is 0 for every film anyone has made in earnest.
+	FontsLeftOut int `json:"fontsLeftOut,omitempty"`
 }
 
 // Track returns subtitle track n of the film.
@@ -387,14 +405,10 @@ func parseInspection(out []byte) (inventory, error) {
 				picture = true
 			}
 		case "subtitle":
-			lang := strings.ToLower(tag(s.Tags, "language"))
-			if lang == "und" {
-				lang = ""
-			}
 			title := tag(s.Tags, "title")
 			f.tracks = append(f.tracks, Track{
 				N: len(f.tracks), Kind: KindOf(s.CodecName), Codec: s.CodecName,
-				Language: clip(lang), Title: clip(title),
+				Language: language(tag(s.Tags, "language")), Title: clip(title),
 				Default: s.Disposition["default"] == 1, Forced: s.Disposition["forced"] == 1,
 				HearingImpaired: s.Disposition["hearing_impaired"] == 1,
 				Commentary:      s.Disposition["comment"] == 1 || strings.Contains(strings.ToLower(title), "commentary"),

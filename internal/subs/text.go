@@ -2,7 +2,9 @@ package subs
 
 import (
 	"bytes"
+	"regexp"
 	"strings"
+	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -54,13 +56,31 @@ func modern(raw []byte) string {
 var cp1252 = [32]rune{0x20AC, 0xFFFD, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0xFFFD, 0x017D, 0xFFFD,
 	0xFFFD, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014, 0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0xFFFD, 0x017E, 0x0178}
 
-// clip shortens text a film says about itself to a length worth keeping.
-// A file can claim a title of any size.
+// clip makes text a film says about itself fit to keep and to show: on one
+// line, with single spaces, and of a length worth keeping. A file can
+// claim a title of any size with anything in it.
 func clip(s string) string {
 	const most = 200
 	s = strings.ToValidUTF8(s, "�")
+	s = strings.Join(strings.FieldsFunc(s, func(r rune) bool { return unicode.IsSpace(r) || unicode.IsControl(r) }), " ")
 	if utf8.RuneCountInString(s) <= most {
 		return s
 	}
 	return string([]rune(s)[:most])
+}
+
+// The shape of a language's code as films give it: two or three letters
+// ("en", "nor"), sometimes with more after hyphens ("pt-br", "zh-hant").
+var languageShape = regexp.MustCompile(`^[a-z]{2,8}(-[a-z0-9]{1,8})*$`)
+
+// language tidies what a film calls a track's language. Anything that does
+// not have the shape of a language's code is dropped, and so is "und",
+// which is how films say they do not know. What is kept is letters, digits
+// and hyphens only, so nothing a later step does with it can go wrong.
+func language(said string) string {
+	l := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(said)), "_", "-")
+	if l == "und" || len(l) > 35 || !languageShape.MatchString(l) {
+		return ""
+	}
+	return l
 }

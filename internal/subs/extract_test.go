@@ -727,8 +727,8 @@ func TestAFullDiskLeavesNoResult(t *testing.T) {
 			_, err := e.run(context.Background())
 			if err == nil {
 				t.Error("a run whose disk was full for " + name + " counted")
-			} else if strings.Contains(err.Error(), filepath.Dir(path)) {
-				t.Errorf("the error names the film's folder: %v", err)
+			} else if strings.Contains(err.Error(), filepath.Dir(path)) || strings.Contains(err.Error(), filepath.Dir(dir)) {
+				t.Errorf("the error names the film's folder or the one written to: %v", err)
 			}
 			nothingKept(t, dir)
 		})
@@ -875,5 +875,240 @@ func TestReadingWhatAFilmHolds(t *testing.T) {
 		if got := a.mayBeFont(); got != want {
 			t.Errorf("%+v worth looking at: %v, want %v", a, got, want)
 		}
+	}
+}
+
+// A folder may be used again: for the same film after it changed, or
+// after this package changed what it writes. What an earlier run left
+// there must not outlive it. A font from the film as it was would be
+// drawn with (the program that draws styled subtitles takes every font in
+// the folder), and a track's file would lie about with nothing to say it
+// is stale. Only files with this package's own names are removed.
+func TestAFolderUsedAgainHoldsOnlyTheNewResult(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "subs")
+	if _, err := Extract(context.Background(), standInTools(t, "ok"), "any.mkv", dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(onlyOwnNames(t, dir), " "); got != "fonts fonts/f0 index.json p2.sup s0.ass t1.vtt" {
+		t.Fatalf("after the first run the folder holds: %s", got)
+	}
+	// Someone else's files, which are nobody's to remove.
+	for _, name := range []string{"notes.txt", "fonts/README", "s0.ass.bak", "p2.sup.old"} {
+		if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(name)), []byte("not ours"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The film as it is now: one styled track, no font.
+	t.Setenv(standInFilmVar, `{"format": {"start_time": "0.000000", "duration": "100.000000"}, "streams": [{"codec_type": "audio", "codec_name": "ac3"}, {"codec_type": "subtitle", "codec_name": "ass"}]}`)
+	res, err := Extract(context.Background(), standInTools(t, "ok"), "any.mkv", dir, nil)
+	if err != nil || len(res.Tracks) != 1 || len(res.Fonts) != 0 {
+		t.Fatalf("the second run: %+v, %v", res, err)
+	}
+	var names []string
+	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if rel, _ := filepath.Rel(dir, path); rel != "." {
+			names = append(names, filepath.ToSlash(rel))
+		}
+		return err
+	})
+	if got := strings.Join(names, " "); got != "fonts fonts/README index.json notes.txt p2.sup.old s0.ass s0.ass.bak" {
+		t.Errorf("after the second run the folder holds: %s", got)
+	}
+	if back, err := Load(dir); err != nil || !reflect.DeepEqual(back, res) {
+		t.Errorf("read back: %+v, %v", back, err)
+	}
+}
+
+// A film can claim any number of attachments. Past the most this package
+// takes, the rest are left, and the result says how many, so that nobody
+// takes a missing font for a fault in the film.
+func TestFontsLeftOutAreCounted(t *testing.T) {
+	film := `{"format": {"start_time": "0.000000", "duration": "100.000000"}, "streams": [{"codec_type": "audio", "codec_name": "ac3"}, {"codec_type": "subtitle", "codec_name": "ass"}, {"codec_type": "attachment", "tags": {"filename": "cover.jpg", "mimetype": "image/jpeg"}}` +
+		strings.Repeat(`, {"codec_type": "attachment", "tags": {"filename": "A.ttf", "mimetype": "font/ttf"}}`, maxFonts+2) + `]}`
+	t.Setenv(standInFilmVar, film)
+	dir, res, _ := extracted(t, standInTools(t, "ok"), "any.mkv")
+	// (The cover picture is attachment 0, so the fonts are 1 to 300, and
+	// 301 and 302 are the ones left.)
+	if len(res.Fonts) != maxFonts || res.FontsLeftOut != 2 || res.Fonts[0].K != 1 || res.Fonts[maxFonts-1].K != maxFonts {
+		t.Errorf("%d fonts, %d left out, the first is attachment %d", len(res.Fonts), res.FontsLeftOut, res.Fonts[0].K)
+	}
+	if back, err := Load(dir); err != nil || back.FontsLeftOut != 2 || len(back.Fonts) != maxFonts {
+		t.Errorf("read back: %d fonts, %d left out, %v", len(back.Fonts), back.FontsLeftOut, err)
+	}
+	// An ordinary film has none left out, and its index does not speak of it.
+	t.Setenv(standInFilmVar, "")
+	dir, res, _ = extracted(t, standInTools(t, "ok"), "any.mkv")
+	if res.FontsLeftOut != 0 || bytes.Contains(mustRead(t, filepath.Join(dir, indexName)), []byte("LeftOut")) {
+		t.Errorf("an ordinary film: %d fonts left out", res.FontsLeftOut)
+	}
+}
+
+// What a film says about itself is kept as words to show. It is still made
+// fit to be shown on one line, and a language is kept only if it has the
+// shape of one, so that nothing a later step does with it can go wrong.
+func TestWhatAFilmSaysAboutItselfIsTidied(t *testing.T) {
+	f, err := parseInspection([]byte(`{"format": {}, "streams": [
+	 {"codec_type": "subtitle", "codec_name": "ass", "tags": {"language": "ENG", "title": "Line one\nline two\ttabbed\u0000\u0007 \u2028end  "}},
+	 {"codec_type": "subtitle", "codec_name": "ass", "tags": {"language": "en-US", "title": "\n\n"}},
+	 {"codec_type": "subtitle", "codec_name": "ass", "tags": {"language": "pt_BR", "title": "Français (forcé) 日本語"}}]}`))
+	if err != nil || len(f.tracks) != 3 {
+		t.Fatalf("%+v, %v", f, err)
+	}
+	if got := []string{f.tracks[0].Title, f.tracks[1].Title, f.tracks[2].Title}; !reflect.DeepEqual(got, []string{"Line one line two tabbed end", "", "Français (forcé) 日本語"}) {
+		t.Errorf("titles: %q", got)
+	}
+	if got := []string{f.tracks[0].Language, f.tracks[1].Language, f.tracks[2].Language}; !reflect.DeepEqual(got, []string{"eng", "en-us", "pt-br"}) {
+		t.Errorf("languages: %q", got)
+	}
+	for said, want := range map[string]string{
+		"nor": "nor", "NO": "no", " nor ": "nor", "English": "english", "zh-Hant-TW": "zh-hant-tw", "sr-Latn": "sr-latn", "es-419": "es-419",
+		"und": "", "": "", "../..": "", "-vf": "", "en us": "", "e": "", "eng;rm": "", "eng\nnor": "", "en--us": "", "en-": "", "1eng": "",
+		"abcdefghi": "", "a-very-long-row-of-parts-that-no-language-has": "", "nor/eng": "", `nor\eng`: "", "C:": "",
+	} {
+		if got := language(said); got != want {
+			t.Errorf("the language %q is kept as %q, want %q", said, got, want)
+		}
+	}
+	// The name a film gives a font is tidied the same way.
+	t.Setenv(standInFilmVar, `{"format": {"start_time": "0.000000", "duration": "100.000000"}, "streams": [{"codec_type": "audio", "codec_name": "ac3"}, {"codec_type": "subtitle", "codec_name": "ass"},
+	 {"codec_type": "attachment", "tags": {"filename": "Evil\nName\r\n.ttf", "mimetype": "font/ttf\n"}}]}`)
+	_, res, _ := extracted(t, standInTools(t, "ok"), "any.mkv")
+	if len(res.Fonts) != 1 || res.Fonts[0].Name != "Evil Name .ttf" || res.Fonts[0].Mime != "font/ttf" {
+		t.Errorf("fonts: %+v", res.Fonts)
+	}
+}
+
+// An error says what went wrong without saying where on the PC the
+// program keeps its files: the folder's place can hold a person's name,
+// and errors are logged and travel in support bundles.
+func TestErrorsDoNotNameTheFolder(t *testing.T) {
+	base := t.TempDir()
+	private := filepath.Join(base, "Private Folder Name")
+	// A file stands where the folder should be made.
+	if err := os.WriteFile(private, []byte("in the way"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Extract(context.Background(), standInTools(t, "ok"), "any.mkv", filepath.Join(private, "cache", "subs"), nil)
+	if err == nil || strings.Contains(err.Error(), "Private") || strings.Contains(err.Error(), base) {
+		t.Errorf("error: %v", err)
+	}
+	// What it is about is still there to read.
+	if err != nil && !strings.Contains(err.Error(), "mkdir") {
+		t.Errorf("the error no longer says what failed: %v", err)
+	}
+	// And what kind of error it is can still be asked.
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Extract(ended, standInTools(t, "ok"), "any.mkv", filepath.Join(base, "Another Private Name", "subs"), nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("with a context that had ended: %v", err)
+	}
+	// A file of the output that cannot be read back: the copy of the text
+	// track is cut short.
+	dir := filepath.Join(base, "Third Private Name", "subs")
+	_, err = Extract(context.Background(), standInTools(t, "cut-txt"), "any.mkv", dir, nil)
+	if err == nil || strings.Contains(err.Error(), "Private") || !errors.Is(err, errNotWhole) {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// A film given by a path that is not whole is found by the real ffmpeg
+// too, although ffmpeg is started in another folder.
+func TestAFilmGivenByAShortPathIsFound(t *testing.T) {
+	tl := tools(t)
+	film := madeFilm(t, tl, "five")
+	t.Chdir(filepath.Dir(film))
+	out := t.TempDir()
+	res, err := Extract(context.Background(), tl, filepath.Base(film), filepath.Join(out, "subs"), nil)
+	if err != nil || len(res.Tracks) != 5 || !res.Tracks[0].Done || !res.Tracks[4].Done {
+		t.Fatalf("with the film's bare name: %+v, %v", res, err)
+	}
+	// And a folder given the same way is the one the files go to.
+	t.Chdir(out)
+	if _, err := Extract(context.Background(), tl, film, "short", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(filepath.Join(out, "short")); err != nil {
+		t.Errorf("the result is not in the folder that was named: %v", err)
+	}
+}
+
+// Load takes a name from the index only if it is one this package gives
+// that track or font. Here the index names a file that is there, outside
+// the folder, at exactly the length it says: only the name is wrong.
+func TestLoadRefusesANameThisPackageDoesNotGive(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "subs")
+	if _, err := Extract(context.Background(), standInTools(t, "ok"), "any.mkv", dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	for outside, inside := range map[string]string{"outside.ass": "s0.ass", "outside-font": "fonts/f0", "outside.vtt": "t1.vtt"} {
+		if err := os.WriteFile(filepath.Join(filepath.Dir(dir), outside), mustRead(t, filepath.Join(dir, filepath.FromSlash(inside))), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A copy inside the folder too, under a name that is not the track's.
+	if err := os.WriteFile(filepath.Join(dir, "s7.ass"), mustRead(t, filepath.Join(dir, "s0.ass")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "fonts", "f9"), mustRead(t, filepath.Join(dir, "fonts", "f0")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	index := mustRead(t, filepath.Join(dir, indexName))
+	for _, swap := range [][2]string{
+		{`"file": "s0.ass"`, `"file": "../outside.ass"`}, {`"file": "fonts/f0"`, `"file": "../outside-font"`}, {`"file": "t1.vtt"`, `"file": "../outside.vtt"`},
+		{`"file": "s0.ass"`, `"file": "s7.ass"`}, {`"file": "fonts/f0"`, `"file": "fonts/f9"`}, {`"file": "s0.ass"`, `"file": "./s0.ass"`},
+	} {
+		if !bytes.Contains(index, []byte(swap[0])) {
+			t.Fatalf("the index does not hold %s:\n%s", swap[0], index)
+		}
+		if err := os.WriteFile(filepath.Join(dir, indexName), bytes.Replace(index, []byte(swap[0]), []byte(swap[1]), 1), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if res, err := Load(dir); !errors.Is(err, ErrNotExtracted) {
+			t.Errorf("an index with %s was taken: %+v, %v", swap[1], res, err)
+		}
+	}
+	os.WriteFile(filepath.Join(dir, indexName), index, 0o600)
+	if _, err := Load(dir); err != nil {
+		t.Errorf("the index as it was: %v", err)
+	}
+}
+
+// A styled track is whole unless it stops inside a caption. What a script
+// has after its captions may end without the end of a line (one converter
+// writes it as the film has it, the other ends the line); a caption never
+// does.
+func TestCheckingAStyledTrack(t *testing.T) {
+	dir := t.TempDir()
+	head := "[Script Info]\r\nScriptType: v4.00+\r\n\r\n[Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n"
+	for name, c := range map[string]struct {
+		file  string
+		whole bool
+		first int64
+	}{
+		"as ffmpeg writes it":                 {head + "Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,Two\r\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,One\r\n", true, 1000},
+		"no captions":                         {head, true, -1},
+		"nothing at all":                      {"", true, -1},
+		"more after the captions, ended":      {head + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,One\n\n[Aegisub Extradata]\nData: 0,e,a note\n", true, 1000},
+		"more after the captions, not ended":  {head + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,One\n\n[Aegisub Extradata]\nData: 0,e,a note", true, 1000},
+		"a heading alone, not ended":          {"[Script Info]\nScriptType: v4.00+", true, -1},
+		"cut inside a caption's words":        {head + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,On", false, -1},
+		"cut inside a caption's times":        {head + "Dialogue: 0,0:00:01.00,0:00:0", false, -1},
+		"cut inside the word that begins one": {head + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,One\r\nDialo", false, -1},
+		"cut after a caption's last letter":   {head + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,One", false, -1},
+		"cut after a caption's first letter":  {head + "D", false, -1},
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "s4.ass"), []byte(c.file), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		facts, size, err := check(formASS, dir, 4)
+		if c.whole && (err != nil || facts.FirstMs != c.first || size != int64(len(c.file))) {
+			t.Errorf("%s: first caption at %d ms, %d bytes, %v", name, facts.FirstMs, size, err)
+		}
+		if !c.whole && !errors.Is(err, errNotWhole) {
+			t.Errorf("%s: taken for whole: %v", name, err)
+		}
+	}
+	if _, _, err := check(formASS, dir, 5); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a file that is not there: %v", err)
 	}
 }
