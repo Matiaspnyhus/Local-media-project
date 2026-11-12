@@ -54,6 +54,7 @@ type Spec struct {
 	VideoCodec string // as ffprobe names it; "hevc" needs a tag Apple devices insist on
 	AudioTrack int    // which sound track, counted from 0; -1 for none
 	AudioCopy  bool   // pass the sound through untouched, or convert it to stereo AAC
+	AudioCodec string // the chosen sound track's codec, as ffprobe names it; matters when it is passed through
 	Owner      string // the sign-in this session belongs to
 }
 
@@ -417,6 +418,15 @@ func args(spec Spec, startSeg int, readRate, burst int) []string {
 		a = append(a, "-map", "0:a:"+strconv.Itoa(spec.AudioTrack))
 		if spec.AudioCopy {
 			a = append(a, "-c:a", "copy")
+			if spec.AudioCodec == "aac" {
+				// AAC is stored one way in MPEG-TS and another in the chunks.
+				// ffmpeg rewraps it by itself for most outputs but not for
+				// this one, and stops at the first sound if not told to. For
+				// AAC that is already in the right form this does nothing.
+				// It must not be asked for with any other codec: ffmpeg
+				// would refuse to start.
+				a = append(a, "-bsf:a", "aac_adtstoasc")
+			}
 		} else {
 			a = append(a, "-c:a", "aac", "-ac", "2", "-b:a", "192k")
 		}

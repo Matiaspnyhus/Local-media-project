@@ -31,6 +31,8 @@ import (
 //	        frame to the next varies (a "variable frame rate").
 //	recording: the rough film as a TV recording keeps it: MPEG-TS, which has
 //	        no list of key frames, with a clock that starts ten hours in.
+//	capture: 20 seconds of MPEG-TS with AAC sound, as programs that record
+//	        the screen or a web stream write it.
 //	still:  90 seconds with one key frame, at the very start.
 
 func tools(t *testing.T) (ffmpeg, ffprobe string) {
@@ -61,7 +63,7 @@ func source(t *testing.T, ffmpeg, name string) string {
 		filmDir = dir
 	}
 	p := filepath.Join(filmDir, name+".mkv")
-	if name == "recording" {
+	if name == "recording" || name == "capture" {
 		p = filepath.Join(filmDir, name+".ts")
 	}
 	picture := func(seconds string) []string {
@@ -97,6 +99,9 @@ func source(t *testing.T, ffmpeg, name string) string {
 			"-c:v", "libx264", "-preset", "veryfast", "-bf", "2", "-g", "168", "-sc_threshold", "0",
 			"-force_key_frames", "3.5,5,11.25,18,19,26.5,33,40.75,47,54.5",
 			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", "-output_ts_offset", "36000", "-f", "mpegts", p)}
+	case "capture":
+		recipes = [][]string{append(picture("20"),
+			"-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-f", "mpegts", p)}
 	case "still":
 		recipes = [][]string{append(picture("90"),
 			"-c:v", "libx264", "-preset", "ultrafast", "-g", "9999", "-sc_threshold", "0",
@@ -290,6 +295,46 @@ func realKeyFrames(t *testing.T, ffprobe, src string) map[int64]bool {
 		}
 	}
 	return keys
+}
+
+// AAC sound is stored one way in MPEG-TS and another in the chunks. ffmpeg
+// has to be told to rewrap it; left alone it stops at the first sound.
+func TestAACSoundFromMPEGTSIsPassedThrough(t *testing.T) {
+	ffmpeg, ffprobe := tools(t)
+	src := source(t, ffmpeg, "capture")
+	g := grid(t, ffprobe, src, 20000)
+	if len(g.Cuts) < 3 {
+		t.Fatalf("a 20-second film was cut into %d chunks", len(g.Cuts))
+	}
+	m := manager(t, ffmpeg)
+	spec := Spec{Path: src, Grid: g, VideoCodec: "h264", AudioTrack: 0, AudioCopy: true, AudioCodec: "aac"}
+	joined := fetch(t, m, m.Open(spec), 0, len(g.Cuts)-1)
+	got, want := inspect(t, ffprobe, joined), inspect(t, ffprobe, src)
+	if got["video"].Codec != "h264" || got["audio"].Codec != "aac" {
+		t.Fatalf("codecs %s + %s, want h264 + aac passed through", got["video"].Codec, got["audio"].Codec)
+	}
+	if got["video"].Packets != want["video"].Packets || got["audio"].Packets != want["audio"].Packets {
+		t.Errorf("frames were lost or added: picture %s of %s, sound %s of %s", got["video"].Packets, want["video"].Packets, got["audio"].Packets, want["audio"].Packets)
+	}
+	decodes(t, ffmpeg, joined)
+	// The same when ffmpeg is started partway through.
+	last := len(g.Cuts) - 1
+	if tail := inspect(t, ffprobe, fetch(t, m, m.Open(spec), last, last)); tail["audio"].Codec != "aac" || f(tail["audio"].Packets) < 10 {
+		t.Errorf("jumping to the last chunk gave %+v", tail)
+	}
+	// AAC from a file that already stores it the right way (MKV, MP4) is
+	// asked to be rewrapped all the same, and must come through unharmed.
+	mkv := filepath.Join(t.TempDir(), "capture.mkv")
+	if out, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-c", "copy", mkv).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	spec.Path, spec.Grid = mkv, grid(t, ffprobe, mkv, 20000)
+	joined = fetch(t, m, m.Open(spec), 0, len(spec.Grid.Cuts)-1)
+	got, want = inspect(t, ffprobe, joined), inspect(t, ffprobe, mkv)
+	if got["audio"].Codec != "aac" || got["video"].Packets != want["video"].Packets || got["audio"].Packets != want["audio"].Packets {
+		t.Errorf("from MKV: sound %s, picture %s of %s frames, sound %s of %s", got["audio"].Codec, got["video"].Packets, want["video"].Packets, got["audio"].Packets, want["audio"].Packets)
+	}
+	decodes(t, ffmpeg, joined)
 }
 
 func TestCutsAreFoundAtRealKeyFrames(t *testing.T) {
@@ -799,5 +844,22 @@ func TestCommandLineIsBuiltOnlyFromTypedValues(t *testing.T) {
 	}
 	if b := args(Spec{Path: "x", Grid: g, VideoCodec: "h264", AudioTrack: -1}, 0, 8, 60); strings.Contains(strings.Join(b, " "), "-ss") || strings.Contains(strings.Join(b, " "), "0:a") {
 		t.Errorf("from the start with no sound: %v", b)
+	}
+	// AAC that is passed through is rewrapped. Nothing else is: ffmpeg
+	// refuses the rewrapping for any other codec, and converted sound is
+	// written in the right form to begin with.
+	for _, c := range []struct {
+		spec Spec
+		want bool
+	}{
+		{Spec{Path: "x", Grid: g, AudioTrack: 0, AudioCopy: true, AudioCodec: "aac"}, true},
+		{Spec{Path: "x", Grid: g, AudioTrack: 0, AudioCopy: true, AudioCodec: "ac3"}, false},
+		{Spec{Path: "x", Grid: g, AudioTrack: 0, AudioCopy: true}, false},
+		{Spec{Path: "x", Grid: g, AudioTrack: 0, AudioCopy: false, AudioCodec: "aac"}, false},
+		{Spec{Path: "x", Grid: g, AudioTrack: -1, AudioCopy: true, AudioCodec: "aac"}, false},
+	} {
+		if got := strings.Contains(strings.Join(args(c.spec, 0, 8, 60), "\x00"), "-bsf:a\x00aac_adtstoasc"); got != c.want {
+			t.Errorf("rewrapping of AAC asked for: %v, want %v, for %+v", got, c.want, c.spec)
+		}
 	}
 }
