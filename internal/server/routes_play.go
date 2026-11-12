@@ -755,7 +755,7 @@ func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path s
 		writeErr(w, http.StatusInternalServerError, "Could not prepare the subtitle.")
 		return
 	}
-	tmp, err := os.CreateTemp(dir, "making-*.tmp")
+	tmp, err := subtitleTemp(dir, "making-*.tmp")
 	if err != nil {
 		cmd.Process.Kill()
 		cmd.Wait()
@@ -764,11 +764,15 @@ func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path s
 	}
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 32<<10)
-	var copyErr error
+	// copyErr: the viewer went away. keepErr: the copy for next time could
+	// not be written, which is no reason to stop sending to the viewer.
+	var copyErr, keepErr error
 	for {
 		k, err := out.Read(buf)
 		if k > 0 {
-			tmp.Write(buf[:k])
+			if _, werr := tmp.Write(buf[:k]); werr != nil && keepErr == nil {
+				keepErr = werr
+			}
 			if _, werr := w.Write(buf[:k]); werr != nil {
 				copyErr = werr
 				break
@@ -785,14 +789,26 @@ func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path s
 		cmd.Process.Kill()
 	}
 	waitErr := cmd.Wait()
-	tmp.Close()
-	if copyErr == nil && waitErr == nil {
+	if err := tmp.Close(); err != nil && keepErr == nil {
+		keepErr = err
+	}
+	// The copy is kept only if it is whole: ffmpeg finished, the viewer got
+	// everything, and every write to the copy and its close succeeded. A
+	// short copy (the disk filled up) would be served from then on.
+	if copyErr == nil && waitErr == nil && keepErr == nil {
 		if os.Rename(tmp.Name(), cached) == nil {
 			return
 		}
 	}
+	if keepErr != nil {
+		s.log.Printf("a subtitle could not be kept for next time: %s", s.pathless(keepErr.Error()))
+	}
 	os.Remove(tmp.Name())
 }
+
+// subtitleTemp makes the file a subtitle is written to while it is being
+// taken out of a film. Tests replace it to stand in for a full disk.
+var subtitleTemp = os.CreateTemp
 
 // handleDiagnostics says what this device reported it can play and what the
 // PC has to convert with: the facts behind every "why is this converting?".

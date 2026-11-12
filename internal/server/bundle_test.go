@@ -30,6 +30,67 @@ func TestProblemsInTheSupportBundleAreScrubbedLikeTheLog(t *testing.T) {
 	}
 }
 
+// A subtitle track taken out of a film is kept for next time. If the copy
+// could not be written in full (the disk filled up), it must not be kept:
+// a short copy would be served to everyone from then on, with the film's
+// subtitles stopping partway through and nothing to say why.
+func TestASubtitleThatCouldNotBeWrittenInFullIsNotKept(t *testing.T) {
+	e := newConvertEnv(t)
+	c := e.setup()
+	e.s.InspectNow()
+	film := e.firstItem(c, "Test Film")
+	var p playAnswer
+	decode(t, e.do("POST", "/api/items/"+film+"/play", remote, c, nil), &p)
+	if len(p.Subtitles) == 0 || p.Subtitles[0].Key != "e0" {
+		t.Fatalf("subtitles: %+v", p.Subtitles)
+	}
+	dir := filepath.Join(e.s.dataDir, "cache", "subtitles")
+	inFolder := func() (kept, other []string) {
+		entries, _ := os.ReadDir(dir)
+		for _, f := range entries {
+			if strings.HasSuffix(f.Name(), ".vtt") {
+				kept = append(kept, f.Name())
+			} else {
+				other = append(other, f.Name())
+			}
+		}
+		return kept, other
+	}
+	whole := func(when string) {
+		t.Helper()
+		w := e.do("GET", p.Subtitles[0].URL, remote, c, nil)
+		if w.Code != 200 || !strings.Contains(w.Body.String(), "Hello there") || !strings.Contains(w.Body.String(), "Goodbye") {
+			t.Fatalf("%s the viewer got %d %q", when, w.Code, w.Body)
+		}
+	}
+
+	// The disk is full: the file for the copy can be made, and every write
+	// to it fails. (A file opened for reading only refuses writes too.)
+	real := subtitleTemp
+	subtitleTemp = func(dir, pattern string) (*os.File, error) {
+		f, err := real(dir, pattern)
+		if err != nil {
+			return nil, err
+		}
+		f.Close()
+		return os.Open(f.Name())
+	}
+	defer func() { subtitleTemp = real }()
+	whole("while the copy could not be written,")
+	if kept, other := inFolder(); len(kept) != 0 || len(other) != 0 {
+		t.Fatalf("a copy that could not be written was kept, or its leftovers were: %v %v", kept, other)
+	}
+
+	// With room on the disk again, the subtitle is taken out afresh, whole,
+	// and kept this time.
+	subtitleTemp = real
+	whole("afterwards")
+	if kept, other := inFolder(); len(kept) != 1 || len(other) != 0 {
+		t.Fatalf("after a good run the folder holds %v and %v, want one kept copy", kept, other)
+	}
+	whole("from the kept copy")
+}
+
 // When the converter cannot open a film (its drive dropped out, or it was
 // moved while playing), ffmpeg names the file by its full path. On the
 // owner's PC that path holds their account name, or the name or address of
