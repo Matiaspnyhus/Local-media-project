@@ -37,6 +37,7 @@ import (
 //	still:  90 seconds with one key frame, at the very start.
 //	long:   two minutes, a key frame every second: twenty chunks to jump
 //	        about in.
+//	hush:   60 seconds of picture whose sound stops after 50.
 
 func tools(t *testing.T) (ffmpeg, ffprobe string) {
 	t.Helper()
@@ -105,6 +106,9 @@ func source(t *testing.T, ffmpeg, name string) string {
 	case "capture":
 		recipes = [][]string{append(picture("20"),
 			"-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-f", "mpegts", p)}
+	case "hush":
+		recipes = [][]string{{"-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=60", "-f", "lavfi", "-i", "sine=frequency=440:duration=50",
+			"-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p}}
 	case "long":
 		recipes = [][]string{append(picture("120"),
 			"-c:v", "libx264", "-preset", "ultrafast", "-g", "24", "-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
@@ -654,6 +658,98 @@ func TestAFragmentIsFiledByWhenItsKeyFrameIsShown(t *testing.T) {
 		if d := editStart(junk); d != 0 {
 			t.Errorf("junk %x was read as an edit at %d", junk, d)
 		}
+	}
+}
+
+// In many films the sound stops a little before the picture does. ffmpeg
+// sends nothing until it has the first piece of every track, and started
+// in the silent end it never gets one for the sound. A viewer who jumps
+// there, or comes back to a film they left there, must still get the
+// picture.
+func TestJumpingToWhereTheSoundHasEnded(t *testing.T) {
+	ffmpeg, ffprobe := tools(t)
+	src := source(t, ffmpeg, "hush")
+	g := grid(t, ffprobe, src, 60000)
+	last := len(g.Cuts) - 1
+	if last != 9 {
+		t.Fatalf("the film was cut into %d chunks, want 10", last+1)
+	}
+	ctx := context.Background()
+	join := func(parts ...[]byte) string {
+		p := filepath.Join(t.TempDir(), "joined.mp4")
+		os.WriteFile(p, bytes.Join(parts, nil), 0o600)
+		return p
+	}
+	for _, copySound := range []bool{true, false} {
+		spec := Spec{Path: src, Grid: g, VideoCodec: "h264", AudioTrack: 0, AudioCopy: copySound, AudioCodec: "ac3"}
+		m := manager(t, ffmpeg)
+		m.Log = func(string, ...any) {} // the run that finds no sound says so
+		token := m.Open(spec)
+		starts := func() int {
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			return m.sessions[token].starts
+		}
+		header, err := m.Init(ctx, token)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Straight to the last chunk, 54 to 60 seconds: no sound there.
+		tail, err := m.Segment(ctx, token, last)
+		if err != nil {
+			t.Fatalf("copy sound %v: jumping to the silent end: %v", copySound, err)
+		}
+		got := inspect(t, ffprobe, join(header, tail))
+		if got["video"].Packets != "144" || math.Abs(f(got["video"].StartTime)-54-shift) > 0.002 {
+			t.Errorf("copy sound %v: the silent end has %s frames from %s s, want 144 from %.3f", copySound, got["video"].Packets, got["video"].StartTime, 54+shift)
+		}
+		decodes(t, ffmpeg, join(header, tail))
+		if n := starts(); n != 3 {
+			t.Errorf("copy sound %v: ffmpeg was started %d times, want 3 (the header, the jump, and again without the sound)", copySound, n)
+		}
+		// A player that asks for the header again gets the one it knows,
+		// with the sound in it, and the converter is left where it is.
+		if again, err := m.Init(ctx, token); err != nil || !bytes.Equal(again, header) || starts() != 3 {
+			t.Errorf("copy sound %v: the header asked for again in the silent end: %v, same %v, %d starts", copySound, err, bytes.Equal(again, header), starts())
+		}
+		// Back to where there is sound: it is there.
+		early, err := m.Segment(ctx, token, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := inspect(t, ffprobe, join(header, early)); f(got["audio"].Packets) < 100 || got["video"].Packets != "144" {
+			t.Errorf("copy sound %v: back at 12 seconds: %s frames of picture, %s of sound", copySound, got["video"].Packets, got["audio"].Packets)
+		}
+		// To the silent end once more: this time it is known, and ffmpeg is
+		// started once.
+		before := starts()
+		if _, err := m.Segment(ctx, token, last); err != nil || starts() != before+1 {
+			t.Errorf("copy sound %v: to the silent end a second time: %v, %d more starts", copySound, err, starts()-before)
+		}
+		// A player that asks for a chunk in the silent end before it asks
+		// for the header still gets a header with the sound in it.
+		fresh := m.Open(spec)
+		if _, err := m.Segment(ctx, fresh, last); err != nil {
+			t.Fatalf("copy sound %v: a session that begins in the silent end: %v", copySound, err)
+		}
+		h2, err := m.Init(ctx, fresh)
+		if err != nil {
+			t.Fatal(err)
+		}
+		early, err = m.Segment(ctx, fresh, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := inspect(t, ffprobe, join(h2, early)); f(got["audio"].Packets) < 100 {
+			t.Errorf("copy sound %v: a session that began in the silent end has no sound at 12 seconds: %+v", copySound, got)
+		}
+		// Played through from the start, the film is whole, as it was.
+		whole := inspect(t, ffprobe, fetch(t, m, m.Open(spec), 0, last))
+		want := inspect(t, ffprobe, src)
+		if whole["video"].Packets != want["video"].Packets || copySound && whole["audio"].Packets != want["audio"].Packets {
+			t.Errorf("copy sound %v: played through: %s/%s frames, the film has %s/%s", copySound, whole["video"].Packets, whole["audio"].Packets, want["video"].Packets, want["audio"].Packets)
+		}
+		m.Close()
 	}
 }
 

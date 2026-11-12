@@ -106,6 +106,13 @@ type session struct {
 	starts  int
 	halting chan struct{} // not nil while a stop is in progress; closed when it is done
 	gone    bool          // closed for good
+	// quietFrom is the earliest chunk at which ffmpeg, started with the
+	// sound, found no sound left in the film (0 if that has not happened).
+	// Runs started there or later carry the picture alone. header is the
+	// header of the first run that carried the sound, which is the one a
+	// player must be given whatever is running: see wait.
+	quietFrom int
+	header    []byte
 }
 
 // run is one ffmpeg process and the chunks cut from its output.
@@ -116,6 +123,7 @@ type run struct {
 	low     int           // the lowest chunk still on disk
 	next    int           // chunks low..next-1 are complete
 	header  bool          // the header is complete
+	quiet   bool          // the film has sound but this run leaves it out
 	ended   bool          // ffmpeg reached the end of the film
 	stop    chan struct{} // closed to make the reader give up
 	stopped sync.Once
@@ -388,8 +396,16 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 		}
 		r := s.run
 		alive := r != nil && r.alive()
+		if n < 0 && r != nil && r.quiet && s.header != nil {
+			// What is running leaves the sound out, and its header says the
+			// film has none. A player goes by the header it is given, so it
+			// gets the one an earlier run made, with the sound in it.
+			b := s.header
+			m.mu.Unlock()
+			return b, nil
+		}
 		lost := false
-		if r != nil && (n < 0 && r.header || n >= r.low && n < r.next) {
+		if r != nil && (n < 0 && r.header && !r.quiet || n >= r.low && n < r.next) {
 			if r != unreadable {
 				p := r.file(n)
 				m.mu.Unlock()
@@ -408,6 +424,14 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 			// cleaning tool), and waiting will not bring it back.
 			lost = true
 		}
+		// ffmpeg sends nothing until it has the first piece of every track.
+		// Started with the sound at a point where the sound track has
+		// already ended (in many films it stops a little before the picture
+		// does), it reads to the end of the film and has sent nothing: it
+		// ends having made no chunk, or says it cannot write the header.
+		dry := r != nil && !alive && !r.quiet && s.spec.AudioTrack >= 0 && r.first > 0 && r.next == r.first &&
+			n >= r.first && n < r.first+m.reach() &&
+			(r.ended || strings.Contains(r.stderr.String(), "Cannot write moov atom before"))
 		startAt := -1
 		switch {
 		case lost:
@@ -417,10 +441,20 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 			if n < 0 {
 				startAt = r.first
 			}
+		case dry:
+			// Start again here with the picture alone, which is what a
+			// viewer who plays through to this point gets too, and remember
+			// it for the next jump. This request may start ffmpeg twice.
+			if s.quietFrom == 0 || r.first < s.quietFrom {
+				s.quietFrom = r.first
+			}
+			startAt, launched = n, false
 		case n < 0:
 			// The header was asked for and nothing is running: start at the
-			// top, or where the stopped run began.
-			if r == nil {
+			// top, or where the stopped run began. The same when what is
+			// running leaves the sound out and no run has yet made a header
+			// with the sound in it.
+			if r == nil || r.quiet {
 				startAt = 0
 			} else if !alive && !r.header {
 				startAt = r.first
@@ -545,12 +579,17 @@ func (m *Manager) launch(ctx context.Context, s *session, startSeg int) error {
 	}
 	os.RemoveAll(s.dir) // one run's chunks are never mixed with another's
 	s.gen++
-	r := &run{dir: filepath.Join(s.dir, "run-"+strconv.Itoa(s.gen)), first: startSeg, low: startSeg, next: startSeg,
+	spec := s.spec
+	quiet := spec.AudioTrack >= 0 && s.quietFrom > 0 && startSeg >= s.quietFrom
+	if quiet {
+		spec.AudioTrack = -1 // no sound is left from here on: see wait
+	}
+	r := &run{dir: filepath.Join(s.dir, "run-"+strconv.Itoa(s.gen)), first: startSeg, low: startSeg, next: startSeg, quiet: quiet,
 		stop: make(chan struct{}), exited: make(chan struct{}), stderr: &tail{}}
 	if err := os.MkdirAll(r.dir, 0o700); err != nil {
 		return err
 	}
-	cmd := exec.Command(m.ffmpeg, args(s.spec, startSeg, m.ReadRate, m.Burst)...)
+	cmd := exec.Command(m.ffmpeg, args(spec, startSeg, m.ReadRate, m.Burst)...)
 	hideWindow(cmd)
 	cmd.Stderr = r.stderr
 	out, err := cmd.StdoutPipe()
@@ -658,6 +697,9 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 				}
 				m.mu.Lock()
 				r.header = true
+				if !r.quiet && s.header == nil {
+					s.header = header
+				}
 				m.mu.Unlock()
 			}
 		case "moof":
