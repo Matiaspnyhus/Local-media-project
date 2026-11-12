@@ -31,6 +31,10 @@ func TestWriteSampleDatabase(t *testing.T) {
 	e.s.db.Exec(`DELETE FROM sessions`)
 	e.s.db.Exec(`UPDATE users SET password_hash='sample'`)
 	e.s.db.Exec(`DELETE FROM settings`)
+	// The scan had SQLite measure its tables, and the measurements quote
+	// samples of what was in them then, the real folder included. Measure
+	// again now that it is gone.
+	e.s.db.Exec(`ANALYZE`)
 	out, _ := filepath.Abs(filepath.Join("..", "db", "testdata", fmt.Sprintf("schema-%03d.db", db.SchemaVersion())))
 	os.MkdirAll(filepath.Dir(out), 0o755)
 	if _, err := os.Stat(out); err == nil {
