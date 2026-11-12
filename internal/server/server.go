@@ -153,6 +153,9 @@ func New(cfg Config) (*Server, error) {
 	if s.linkKey, err = s.loadOrCreateKey("link_key"); err != nil {
 		return nil, err
 	}
+	// Before anything can be written to the cache. (The caller has made
+	// sure no other copy of the program is using this data folder.)
+	removeLeftovers(cfg.DataDir)
 	if cfg.FFmpeg != "" {
 		s.ffmpeg = cfg.FFmpeg
 		if s.hls, err = hls.New(cfg.FFmpeg, filepath.Join(cfg.DataDir, "cache", "chunks")); err != nil {
