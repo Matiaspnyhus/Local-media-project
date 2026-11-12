@@ -34,6 +34,8 @@ import (
 //	capture: 20 seconds of MPEG-TS with AAC sound, as programs that record
 //	        the screen or a web stream write it.
 //	still:  90 seconds with one key frame, at the very start.
+//	long:   two minutes, a key frame every second: twenty chunks to jump
+//	        about in.
 
 func tools(t *testing.T) (ffmpeg, ffprobe string) {
 	t.Helper()
@@ -102,6 +104,9 @@ func source(t *testing.T, ffmpeg, name string) string {
 	case "capture":
 		recipes = [][]string{append(picture("20"),
 			"-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "96k", "-f", "mpegts", p)}
+	case "long":
+		recipes = [][]string{append(picture("120"),
+			"-c:v", "libx264", "-preset", "ultrafast", "-g", "24", "-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
 	case "still":
 		recipes = [][]string{append(picture("90"),
 			"-c:v", "libx264", "-preset", "ultrafast", "-g", "9999", "-sc_threshold", "0",

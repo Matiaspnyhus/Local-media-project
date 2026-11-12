@@ -76,11 +76,25 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
-	stop     chan struct{}
-	closing  sync.Once
-	done     sync.WaitGroup
+	// live holds every run whose ffmpeg has been started and is not yet
+	// gone, whatever became of its session, so that closing the manager
+	// can be sure to leave nothing running.
+	live    map[*run]struct{}
+	closed  bool
+	stop    chan struct{}
+	closing sync.Once
+	done    sync.WaitGroup
 }
 
+// A session's ffmpeg takes a few thousandths of a second to stop, and the
+// lock is let go of meanwhile (see halt). Two rules keep that gap safe:
+//
+//   - Only one stop is in progress for a session at a time, and nothing is
+//     started for it until that stop is done. halting says so.
+//   - A session that has been closed is marked gone before its ffmpeg is
+//     stopped, and nothing is ever started for a session that is gone. A
+//     request that was in the gap when the session was closed finds the
+//     mark when it gets the lock back.
 type session struct {
 	spec    Spec
 	dir     string
@@ -89,20 +103,23 @@ type session struct {
 	lastReq time.Time
 	lastSeg int
 	starts  int
+	halting chan struct{} // not nil while a stop is in progress; closed when it is done
+	gone    bool          // closed for good
 }
 
 // run is one ffmpeg process and the chunks cut from its output.
 type run struct {
-	cmd    *exec.Cmd
-	dir    string
-	first  int           // the chunk this run was started for
-	low    int           // the lowest chunk still on disk
-	next   int           // chunks low..next-1 are complete
-	header bool          // the header is complete
-	ended  bool          // ffmpeg reached the end of the film
-	stop   chan struct{} // closed to make the reader give up
-	exited chan struct{} // closed when ffmpeg is gone and its output read
-	stderr *tail
+	cmd     *exec.Cmd
+	dir     string
+	first   int           // the chunk this run was started for
+	low     int           // the lowest chunk still on disk
+	next    int           // chunks low..next-1 are complete
+	header  bool          // the header is complete
+	ended   bool          // ffmpeg reached the end of the film
+	stop    chan struct{} // closed to make the reader give up
+	stopped sync.Once
+	exited  chan struct{} // closed when ffmpeg is gone and its output read
+	stderr  *tail
 }
 
 func (r *run) alive() bool {
@@ -112,6 +129,13 @@ func (r *run) alive() bool {
 	default:
 		return true
 	}
+}
+
+// kill tells the run to end: the reader to give up and ffmpeg to die. It
+// does not wait for either; exited says when both have happened.
+func (r *run) kill() {
+	r.stopped.Do(func() { close(r.stop) })
+	r.cmd.Process.Kill()
 }
 
 func (r *run) file(n int) string {
@@ -135,25 +159,47 @@ func New(ffmpeg, root string) (*Manager, error) {
 	}
 	m := &Manager{ffmpeg: ffmpeg, root: root, IdleStop: 75 * time.Second, Forget: 12 * time.Hour,
 		Ahead: 50, Behind: 20, ReadRate: 8, Burst: 60,
-		Log: func(string, ...any) {}, sessions: map[string]*session{}, stop: make(chan struct{})}
+		Log: func(string, ...any) {}, sessions: map[string]*session{}, live: map[*run]struct{}{}, stop: make(chan struct{})}
 	m.done.Add(1)
 	go m.janitor()
 	return m, nil
 }
 
-// Close stops every conversion and removes every chunk.
+// Close stops every conversion and removes every chunk. When it returns no
+// ffmpeg started by this manager is running, and none will be started.
 func (m *Manager) Close() {
 	m.closing.Do(func() {
 		close(m.stop)
 		m.done.Wait()
 		m.mu.Lock()
-		defer m.mu.Unlock()
-		for _, s := range m.sessions {
-			m.halt(s)
+		m.closed = true
+		for token, s := range m.sessions {
+			s.gone = true
+			delete(m.sessions, token)
 		}
-		m.sessions = map[string]*session{}
+		// Every run, not only those the sessions hold: whatever is running
+		// is stopped, however it came to be.
+		var running []*run
+		for r := range m.live {
+			r.kill()
+			running = append(running, r)
+		}
+		m.mu.Unlock()
+		for _, r := range running {
+			<-r.exited
+		}
 		os.RemoveAll(m.root)
 	})
+}
+
+// end closes a session for good: no request can reach it any more, its
+// ffmpeg is stopped and its chunks are removed. The caller holds the lock;
+// it is released while ffmpeg stops.
+func (m *Manager) end(token string, s *session) {
+	s.gone = true
+	delete(m.sessions, token)
+	m.halt(s)
+	os.RemoveAll(s.dir)
 }
 
 // Open registers a session and returns its token: a random value that is
@@ -171,7 +217,7 @@ func (m *Manager) Open(spec Spec) string {
 	defer m.mu.Unlock()
 	// One sign-in watches one film at a time, give or take a tab or two.
 	// Beyond a handful, the one left alone longest is closed.
-	for {
+	for !m.closed {
 		var oldest string
 		n := 0
 		for t, s := range m.sessions {
@@ -185,10 +231,11 @@ func (m *Manager) Open(spec Spec) string {
 		if n < maxPerOwner {
 			break
 		}
-		s := m.sessions[oldest]
-		m.halt(s)
-		os.RemoveAll(s.dir)
-		delete(m.sessions, oldest)
+		m.end(oldest, m.sessions[oldest])
+	}
+	if m.closed {
+		// Too late: the token is as good as any other unknown one.
+		return token
 	}
 	m.sessions[token] = &session{spec: spec, dir: filepath.Join(m.root, token), lastReq: time.Now()}
 	return token
@@ -229,11 +276,16 @@ func (m *Manager) Sessions() int {
 func (m *Manager) Drop(owner string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for token, s := range m.sessions {
-		if s.spec.Owner == owner {
-			m.halt(s)
-			os.RemoveAll(s.dir)
-			delete(m.sessions, token)
+	// The lock is let go of while each one's ffmpeg stops, and a session of
+	// this owner's may be opened meanwhile, so look until none is left.
+	for again := true; again; {
+		again = false
+		for token, s := range m.sessions {
+			if s.spec.Owner == owner {
+				m.end(token, s)
+				again = true
+				break
+			}
 		}
 	}
 }
@@ -243,9 +295,7 @@ func (m *Manager) Stop(token string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s := m.sessions[token]; s != nil {
-		m.halt(s)
-		os.RemoveAll(s.dir)
-		delete(m.sessions, token)
+		m.end(token, s)
 	}
 }
 
@@ -322,6 +372,18 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 		if n >= 0 {
 			s.lastSeg = n
 		}
+		if stopping := s.halting; stopping != nil {
+			// Its ffmpeg is being stopped at this moment, for another
+			// request or because nobody was watching. Look again when that
+			// is done; what this request needs depends on what comes next.
+			m.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-stopping:
+			}
+			continue
+		}
 		r := s.run
 		alive := r != nil && r.alive()
 		if r != nil && (n < 0 && r.header || n >= r.low && n < r.next) {
@@ -365,8 +427,15 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 				m.mu.Unlock()
 				return nil, err
 			}
+			if err := ctx.Err(); err != nil {
+				// Whoever asked has stopped waiting (a player that jumps
+				// about drops one request for the next), so the converter
+				// is left where it is for the request that is wanted.
+				m.mu.Unlock()
+				return nil, err
+			}
 			launched = true
-			if err := m.launch(s, startAt); err != nil {
+			if err := m.launch(ctx, s, startAt); err != nil {
 				m.mu.Unlock()
 				return nil, err
 			}
@@ -440,9 +509,18 @@ func args(spec Spec, startSeg int, readRate, burst int) []string {
 		"-f", "mp4", "-movflags", "+frag_keyframe+delay_moov+default_base_moof+frag_discont", "pipe:1")
 }
 
-// launch starts a fresh run at startSeg. The caller holds the lock.
-func (m *Manager) launch(s *session, startSeg int) error {
+// launch starts a fresh run at startSeg for the request ctx belongs to. The
+// caller holds the lock; it is released while the old run stops.
+func (m *Manager) launch(ctx context.Context, s *session, startSeg int) error {
 	m.halt(s)
+	// The lock was let go of. From here to the end it is held, so what is
+	// true now stays true until the new run is in place.
+	if s.gone {
+		return ErrNoSession // closed meanwhile: nothing may be started for it
+	}
+	if err := ctx.Err(); err != nil {
+		return err // given up meanwhile: the next request starts what it needs
+	}
 	os.RemoveAll(s.dir) // one run's chunks are never mixed with another's
 	s.gen++
 	r := &run{dir: filepath.Join(s.dir, "run-"+strconv.Itoa(s.gen)), first: startSeg, low: startSeg, next: startSeg,
@@ -463,6 +541,7 @@ func (m *Manager) launch(s *session, startSeg int) error {
 	r.cmd = cmd
 	s.run = r
 	s.starts++
+	m.live[r] = struct{}{}
 	go m.pump(s, r, out)
 	return nil
 }
@@ -477,10 +556,14 @@ func (m *Manager) pump(s *session, r *run, out io.Reader) {
 	werr := r.cmd.Wait()
 	m.mu.Lock()
 	r.ended = err == nil && werr == nil
-	stopped := s.run != r
+	delete(m.live, r)
 	m.mu.Unlock()
-	if !r.ended && !stopped {
-		m.Log("the converter stopped: %v %v %s", err, werr, r.stderr.String())
+	select {
+	case <-r.stop: // stopped on purpose: nothing to report
+	default:
+		if !r.ended {
+			m.Log("the converter stopped: %v %v %s", err, werr, r.stderr.String())
+		}
 	}
 	close(r.exited)
 }
@@ -632,18 +715,30 @@ func (m *Manager) hold(s *session, r *run, seg int) error {
 }
 
 // halt stops the session's ffmpeg, if any, and waits for it to be gone.
-// The caller holds the lock; it is released while waiting.
+// The caller holds the lock; it is released while waiting. When halt
+// returns the lock is held again, the session has no run, and no other
+// stop is in progress for it.
 func (m *Manager) halt(s *session) {
+	for s.halting != nil {
+		// Someone else is stopping it: wait for them, then look again.
+		stopping := s.halting
+		m.mu.Unlock()
+		<-stopping
+		m.mu.Lock()
+	}
 	r := s.run
 	if r == nil {
 		return
 	}
 	s.run = nil
-	close(r.stop)
-	r.cmd.Process.Kill()
+	done := make(chan struct{})
+	s.halting = done
+	r.kill()
 	m.mu.Unlock()
 	<-r.exited
 	m.mu.Lock()
+	s.halting = nil
+	close(done)
 }
 
 func (m *Manager) janitor() {
@@ -662,13 +757,15 @@ func (m *Manager) janitor() {
 			idle := now.Sub(s.lastReq)
 			switch {
 			case idle > m.Forget:
-				m.halt(s)
-				os.RemoveAll(s.dir)
-				delete(m.sessions, token)
+				m.end(token, s)
 			case idle > m.IdleStop && s.run != nil:
-				// Nobody is watching: stop, and give the disk space back.
+				// Nobody is watching: stop, and give the disk space back. A
+				// request that arrives while ffmpeg stops waits for that, so
+				// what it then starts is not swept away here.
 				m.halt(s)
-				os.RemoveAll(s.dir)
+				if !s.gone {
+					os.RemoveAll(s.dir)
+				}
 			}
 		}
 		m.mu.Unlock()
