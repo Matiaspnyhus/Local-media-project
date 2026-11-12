@@ -15,5 +15,10 @@ ffprobe.exe and ffmpeg.exe
                https://github.com/jellyfin/jellyfin-ffmpeg/releases/tag/v8.1.3-2
                and checked against a fixed checksum when this package was built.
 
+Local Media also has other people's code built into it (the Go packages it is
+compiled from, and the JavaScript in its web app, such as the hls.js player and
+React). Each piece, its version and the full text of its licence are listed in
+THIRD-PARTY-LICENSES.txt in this folder.
+
 Local Media itself is licensed under the GNU General Public License, version 3 or
 later. Its source code is at https://github.com/Matiaspnyhus/Local-media-project

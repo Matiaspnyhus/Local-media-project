@@ -62,6 +62,10 @@ jobs:
         run: |
           go vet ./...
           go test ./...
+      - name: The list of other people's code built into the program is up to date
+        run: |
+          bash packaging/third-party-licenses.sh
+          git diff --exit-code -- packaging/THIRD-PARTY-LICENSES.txt || { echo "Run: bash packaging/third-party-licenses.sh, and commit the result"; exit 1; }
       - name: Build every platform with cgo off
         run: make cross VERSION=${GITHUB_REF_NAME}
       - name: End-to-end test in Chromium (keyboard only, plain HTTP)
@@ -82,6 +86,7 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=${GITHUB_REF_NAME}" -o package/LocalMedia/localmedia.exe ./cmd/localmedia
           cp LICENSE package/LocalMedia/LICENSE.txt
           cp packaging/THIRD-PARTY.txt package/LocalMedia/THIRD-PARTY.txt
+          cp packaging/THIRD-PARTY-LICENSES.txt package/LocalMedia/THIRD-PARTY-LICENSES.txt
       - uses: actions/upload-artifact@v4
         with:
           name: localmedia-builds
@@ -118,7 +123,7 @@ jobs:
         shell: pwsh
         run: |
           $dir = "package\LocalMedia"
-          foreach ($f in "localmedia.exe", "ffprobe.exe", "ffmpeg.exe", "LICENSE.txt", "THIRD-PARTY.txt") {
+          foreach ($f in "localmedia.exe", "ffprobe.exe", "ffmpeg.exe", "LICENSE.txt", "THIRD-PARTY.txt", "THIRD-PARTY-LICENSES.txt") {
             if (-not (Test-Path (Join-Path $dir $f))) { throw "the package lacks $f" }
           }
           $fver = & "$dir\ffmpeg.exe" -version | Out-String
@@ -172,7 +177,7 @@ jobs:
 
           $i = Start-Process installer\LocalMedia-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/TASKS=autostart,firewall" -Wait -PassThru
           if ($i.ExitCode -ne 0) { throw "the installer failed with $($i.ExitCode)" }
-          foreach ($f in "localmedia.exe", "ffprobe.exe", "ffmpeg.exe", "LICENSE.txt", "THIRD-PARTY.txt", "unins000.exe") {
+          foreach ($f in "localmedia.exe", "ffprobe.exe", "ffmpeg.exe", "LICENSE.txt", "THIRD-PARTY.txt", "THIRD-PARTY-LICENSES.txt", "unins000.exe") {
             if (-not (Test-Path (Join-Path $app $f))) { throw "after installing, $f is missing" }
           }
           if (-not (Rule)) { throw "the firewall rule was not added" }
@@ -291,6 +296,7 @@ jobs:
               *)     base="$f";        mkdir -p "pkg/$base"; cp "$f" "pkg/$base/localmedia"; chmod +x "pkg/$base/localmedia" ;;
             esac
             cp ../LICENSE "pkg/$base/LICENSE.txt"
+            cp ../packaging/THIRD-PARTY-LICENSES.txt "pkg/$base/THIRD-PARTY-LICENSES.txt"
             (cd pkg && zip -q -r "../$base.zip" "$base")
           done
           rm -f localmedia-windows-amd64.zip
