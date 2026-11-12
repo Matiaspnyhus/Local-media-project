@@ -39,8 +39,6 @@ type itemView struct {
 	Overview   string   `json:"overview,omitempty"`
 	Poster     bool     `json:"poster"`
 
-	fileID    string
-	probed    bool
 	updatedAt int64
 }
 
@@ -170,14 +168,212 @@ func applyOverrides(c *playback.Caps, userAgent string) {
 	}
 }
 
+// version is one copy of a film or an episode. Most have one; a film kept
+// as a 1080p file and as a 2160p file has two, and which of them a device
+// gets is settled by preferred.
+type version struct {
+	fileID, rel, libPath, container string
+	size, mtime, durationMs         int64
+	probed                          bool
+
+	// What judge adds.
+	plan   playback.Plan // how this device would get this copy, with the file's own main sound
+	pixels int           // how large its picture is; 0 until the file has been inspected
+}
+
+// before reports whether a device should be given v rather than o: the copy
+// it plays most cheaply, and of two that cost the same the better picture.
+// The rest only makes the answer the same every time.
+func (v *version) before(o *version) bool {
+	if a, b := effort(v.plan), effort(o.plan); a != b {
+		return a < b
+	}
+	if v.pixels != o.pixels {
+		return v.pixels > o.pixels
+	}
+	if v.size != o.size {
+		return v.size > o.size // the same picture size with more spent on it
+	}
+	return v.rel < o.rel
+}
+
+// effort ranks the ways a copy can reach a device, cheapest first: as it
+// is, repackaged, with its sound converted, with its picture converted. A
+// copy that may or may not play (it has not been inspected, or the device
+// has not said what it plays) comes after every copy known to play and
+// before one known not to.
+func effort(p playback.Plan) int {
+	switch p.Playable {
+	case playback.No:
+		return 5
+	case playback.Unknown:
+		return 4
+	}
+	switch p.Method {
+	case playback.Direct:
+		return 0
+	case playback.Remux:
+		return 1
+	case playback.Audio:
+		return 2
+	}
+	return 3
+}
+
+// preferred is the copy to play, of the copies of one film or episode. The
+// lists and Play both ask here, so what a list says about a film is about
+// the very file Play then opens.
+func preferred(copies []*version) *version {
+	best := copies[0]
+	for _, v := range copies[1:] {
+		if v.before(best) {
+			best = v
+		}
+	}
+	return best
+}
+
+// withLength finishes the plan for a copy by asking whether the copy says
+// how long it is. One that does not can only be sent as it is: the list of
+// chunks a player is given covers the whole film, so its length has to be
+// known. The lists and Play both ask here, as they both ask preferred, so
+// that such a copy is not chosen while another plays, and a list does not
+// say "plays" of a film that Play then refuses.
+func withLength(p playback.Plan, durationMs int64) playback.Plan {
+	if durationMs > 0 || p.Playable == playback.No || p.Method == playback.Direct {
+		return p
+	}
+	p.Playable, p.Method = playback.No, playback.None
+	// (A new list, in case the plan shares the one it was made with.)
+	p.Reasons = append(append([]string{}, p.Reasons...), "The file does not say how long it is, so it cannot be repackaged for this device.")
+	return p
+}
+
+// judge works out how this device would get each copy (see version.plan).
+func (s *Server) judge(u *User, copies []*version) error {
+	byFile := make(map[string]*version, len(copies))
+	media := make(map[string]*playback.Media, len(copies))
+	fileIDs := make([]any, 0, len(copies))
+	for _, v := range copies {
+		byFile[v.fileID] = v
+		media[v.fileID] = &playback.Media{Probed: v.probed, Container: v.container}
+		fileIDs = append(fileIDs, v.fileID)
+	}
+	for start := 0; start < len(fileIDs); start += 400 {
+		end := min(start+400, len(fileIDs))
+		q := `SELECT file_id, kind, codec, codec_tag, bit_depth, is_default, is_commentary, language, width, height FROM streams
+			WHERE kind IN ('video','audio') AND file_id IN (?` + strings.Repeat(",?", end-start-1) + `) ORDER BY file_id, idx`
+		rows, err := s.db.Query(q, fileIDs[start:end]...)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var fileID, kind string
+			var t playback.Track
+			var def, com, width, height int
+			if err := rows.Scan(&fileID, &kind, &t.Codec, &t.Tag, &t.BitDepth, &def, &com, &t.Language, &width, &height); err != nil {
+				rows.Close()
+				return err
+			}
+			t.Default, t.Commentary = def != 0, com != 0
+			m := media[fileID]
+			if kind == "video" {
+				// The picture's size is kept beside the track, not in it: it
+				// ranks the copies here and plays no part in the decision.
+				if len(m.Video) == 0 {
+					byFile[fileID].pixels = width * height
+				}
+				m.Video = append(m.Video, t)
+			} else {
+				m.Audio = append(m.Audio, t)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+	caps := s.playCaps(u)
+	for _, v := range copies {
+		v.plan = withLength(playback.Decide(*media[v.fileID], caps, -1), v.durationMs)
+	}
+	return nil
+}
+
+// copiesOf lists the copies of one film or episode that are there to play.
+func (s *Server) copiesOf(itemID string) ([]*version, error) {
+	rows, err := s.db.Query(`SELECT f.id, f.rel_path, l.path, f.size, f.mtime, f.probed, f.container, f.duration_ms
+		FROM versions v JOIN files f ON f.version_id=v.id JOIN libraries l ON l.id=f.library_id
+		WHERE v.item_id=? AND f.missing=0 AND f.part_index=0`, itemID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var copies []*version
+	for rows.Next() {
+		v := &version{}
+		var probed int
+		if err := rows.Scan(&v.fileID, &v.rel, &v.libPath, &v.size, &v.mtime, &probed, &v.container, &v.durationMs); err != nil {
+			return nil, err
+		}
+		v.probed = probed == 1
+		copies = append(copies, v)
+	}
+	return copies, rows.Err()
+}
+
+// playedVersion is the copy of a film or episode that this device plays,
+// or nil if no copy is there. Playing a film and remembering a pick of
+// sound and subtitles both ask here, so a pick is always read against the
+// file it was made on.
+//
+// Unlike the lists, it looks at the disk when there are several copies (see
+// onDisk). So until the library is next looked over, a list may still speak
+// of a copy that has just been deleted while Play opens another.
+func (s *Server) playedVersion(u *User, itemID string) (*version, error) {
+	copies, err := s.copiesOf(itemID)
+	if err != nil || len(copies) == 0 {
+		return nil, err
+	}
+	if len(copies) > 1 {
+		copies = onDisk(copies)
+	}
+	if err := s.judge(u, copies); err != nil {
+		return nil, err
+	}
+	return preferred(copies), nil
+}
+
+// onDisk leaves out the copies whose file cannot be opened at this moment:
+// deleted or moved since the library was last looked over, which is done
+// every quarter of an hour. Such a copy is still listed, and handed out it
+// could not be fetched, while another copy of the film is there to play.
+// When none can be opened (a drive that is switched off) all are kept, and
+// the answer is what it is for any film whose file is away.
+func onDisk(copies []*version) []*version {
+	var there []*version
+	for _, v := range copies {
+		if f, _, err := openMedia(v.libPath, v.rel); err == nil {
+			f.Close()
+			there = append(there, v)
+		}
+	}
+	if len(there) == 0 {
+		return copies
+	}
+	return there
+}
+
 // loadItems reads films and episodes matching where, with this user's
-// progress and whether this device can play each one.
+// progress and whether this device can play each one. For an item with
+// several copies the answer is about the copy this device would be given
+// (see preferred).
 func (s *Server) loadItems(u *User, where, order string, args ...any) ([]itemView, error) {
 	if order == "" {
 		order = "i.sort_title"
 	}
 	q := `SELECT i.id, i.kind, i.title, i.year, COALESCE(i.season_number,0), COALESCE(i.episode_number,0), COALESCE(i.episode_end,0),
-		COALESCE(sh.id,''), COALESCE(sh.title,''), f.id, f.rel_path, f.probed, f.container, f.duration_ms,
+		COALESCE(sh.id,''), COALESCE(sh.title,''), f.id, f.rel_path, f.probed, f.container, f.duration_ms, f.size,
 		COALESCE(p.position_ms,0), COALESCE(p.duration_ms,0), COALESCE(p.played,0), COALESCE(p.updated_at,0), i.overview, i.poster <> ''
 		FROM items i
 		LEFT JOIN items sh ON sh.id = i.show_id
@@ -191,84 +387,58 @@ func (s *Server) loadItems(u *User, where, order string, args ...any) ([]itemVie
 		return nil, err
 	}
 	var out []itemView
-	seen := map[string]bool{}
+	var progDurs []int64    // beside out: the length a player last reported for the item
+	var copies [][]*version // beside out: the item's copies
+	var all []*version      // every copy of every item
+	at := map[string]int{}  // where each item is in out
 	for rows.Next() {
 		var v itemView
-		var rel string
+		c := &version{}
 		var probed, played int
-		var fileDur, progDur int64
+		var progDur int64
 		if err := rows.Scan(&v.ID, &v.Kind, &v.Title, &v.Year, &v.Season, &v.Episode, &v.EpisodeEnd, &v.ShowID, &v.ShowTitle,
-			&v.fileID, &rel, &probed, &v.Container, &fileDur, &v.PositionMs, &progDur, &played, &v.updatedAt, &v.Overview, &v.Poster); err != nil {
+			&c.fileID, &c.rel, &probed, &c.container, &c.durationMs, &c.size, &v.PositionMs, &progDur, &played, &v.updatedAt, &v.Overview, &v.Poster); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		if seen[v.ID] {
-			continue // a second version of the same item
+		c.probed = probed == 1
+		all = append(all, c)
+		i, seen := at[v.ID]
+		if !seen { // a row for every copy of an item: the item is listed once
+			i = len(out)
+			at[v.ID] = i
+			v.Played = played != 0
+			v.Reasons = []string{}
+			out = append(out, v)
+			progDurs = append(progDurs, progDur)
+			copies = append(copies, nil)
 		}
-		seen[v.ID] = true
-		v.Played, v.probed = played != 0, probed == 1
-		v.DurationMs = fileDur
-		if v.DurationMs == 0 {
-			v.DurationMs = progDur
-		}
-		if v.Container == "" {
-			v.Container = strings.TrimPrefix(strings.ToLower(filepath.Ext(rel)), ".")
-		}
-		v.Reasons = []string{}
-		out = append(out, v)
+		copies[i] = append(copies[i], c)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return out, s.decide(u, out)
-}
-
-// decide fills in, for each item, whether this device can play it.
-func (s *Server) decide(u *User, items []itemView) error {
-	tracks := map[string]*playback.Media{}
-	for i := range items {
-		tracks[items[i].fileID] = &playback.Media{Probed: items[i].probed}
+	if err := s.judge(u, all); err != nil {
+		return nil, err
 	}
-	fileIDs := make([]any, 0, len(items))
-	for id := range tracks {
-		fileIDs = append(fileIDs, id)
-	}
-	for start := 0; start < len(fileIDs); start += 400 {
-		end := min(start+400, len(fileIDs))
-		q := `SELECT s.file_id, s.kind, s.codec, s.codec_tag, s.bit_depth, s.is_default, s.is_commentary, s.language, f.container FROM streams s
-			JOIN files f ON f.id = s.file_id WHERE s.kind IN ('video','audio') AND s.file_id IN (?` + strings.Repeat(",?", end-start-1) + `) ORDER BY s.file_id, s.idx`
-		rows, err := s.db.Query(q, fileIDs[start:end]...)
-		if err != nil {
-			return err
+	for i := range out {
+		c := preferred(copies[i])
+		v := &out[i]
+		v.DurationMs = c.durationMs
+		if v.DurationMs == 0 {
+			v.DurationMs = progDurs[i]
 		}
-		for rows.Next() {
-			var fileID, kind, container string
-			var t playback.Track
-			var def, com int
-			rows.Scan(&fileID, &kind, &t.Codec, &t.Tag, &t.BitDepth, &def, &com, &t.Language, &container)
-			t.Default, t.Commentary = def != 0, com != 0
-			m := tracks[fileID]
-			m.Container = container
-			if kind == "video" {
-				m.Video = append(m.Video, t)
-			} else {
-				m.Audio = append(m.Audio, t)
-			}
+		v.Container = c.container
+		if v.Container == "" {
+			v.Container = strings.TrimPrefix(strings.ToLower(filepath.Ext(c.rel)), ".")
 		}
-		rows.Close()
-	}
-	caps := s.playCaps(u)
-	for i := range items {
-		m := tracks[items[i].fileID]
-		plan := playback.Decide(*m, caps, -1)
-		items[i].Playable = string(plan.Playable)
-		items[i].Method = string(plan.Method)
-		if plan.Reasons != nil {
-			items[i].Reasons = plan.Reasons
+		v.Playable, v.Method = string(c.plan.Playable), string(c.plan.Method)
+		if c.plan.Reasons != nil {
+			v.Reasons = c.plan.Reasons
 		}
 	}
-	return nil
+	return out, nil
 }
 
 type showView struct {
