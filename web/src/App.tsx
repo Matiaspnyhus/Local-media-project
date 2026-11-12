@@ -939,8 +939,9 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
 
   const remember = (audioIndex: number, sub: string) => {
     if (!info) return
+    const a = info.audio[audioIndex]
     const s = info.subtitles.find((x) => x.key === sub)
-    api.choice(id, info.audio[audioIndex]?.language || '', s?.language || '', !!s)
+    api.choice(id, { audioLang: a?.language || '', subLang: s?.language || '', subsOn: !!s, audioIndex: a ? audioIndex : -1, subKey: s ? s.key : '' })
   }
   const pickAudio = (index: number) => {
     const v = videoRef.current

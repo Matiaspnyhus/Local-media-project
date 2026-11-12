@@ -287,9 +287,23 @@ try {
   })
 
   await step('subtitles show, and are still in step after a jump far ahead', async () => {
+    const choices = []
+    const noteChoice = (r) => /\/choice$/.test(r.url()) && choices.push(r.postDataJSON())
+    page.on('request', noteChoice)
     await pressUntilFocused(page, '[data-testid=pick-subtitles]')
     await page.keyboard.press('ArrowDown')
     if ((await page.inputValue('[data-testid=pick-subtitles]')) === '') await page.selectOption('[data-testid=pick-subtitles]', { index: 1 })
+    // What is remembered is the track itself, not only its language: a
+    // film can have two sound tracks in one language, and subtitles with
+    // no language named at all.
+    for (let i = 0; choices.length === 0; i++) {
+      assert.ok(i < 50, 'the page did not tell the PC which subtitles were picked')
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    page.off('request', noteChoice)
+    const picked = choices[choices.length - 1]
+    assert.equal(picked.subKey, await page.inputValue('[data-testid=pick-subtitles]'), `the subtitles picked are named in what the PC is told to remember: ${JSON.stringify(picked)}`)
+    assert.equal(picked.audioIndex, 0, `the sound track playing is named in what the PC is told to remember: ${JSON.stringify(picked)}`)
     const cue = () => page.evaluate(() => {
       const t = document.querySelector('video').textTracks[0]
       return t && t.mode === 'showing' && t.activeCues && t.activeCues.length ? t.activeCues[0].text : ''
