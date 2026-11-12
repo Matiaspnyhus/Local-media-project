@@ -204,10 +204,12 @@ const made3 = spawnSync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
 assert.equal(made3.status, 0, `ffmpeg could not make the film with three sound tracks: ${made3.error || made3.stderr}`)
 
 // A film in a format no browser plays: MPEG-4 Part 2, the format of DivX and
-// Xvid films, with MP3 sound. From M4 its picture is converted as it plays.
+// Xvid films, with surround sound in Dolby Digital. From M4 its picture is
+// converted as it plays. The sound is converted with it, to stereo, which
+// is something the viewer loses and is told about.
 const madeOld = spawnSync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
   '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=25:duration=30', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=30',
-  '-c:v', 'mpeg4', '-q:v', '6', '-g', '100', '-c:a', 'libmp3lame', '-b:a', '96k',
+  '-c:v', 'mpeg4', '-q:v', '6', '-g', '100', '-c:a', 'ac3', '-ac', '6', '-b:a', '192k',
   join(media, 'Old.Format.Test.mkv')], { encoding: 'utf8' })
 assert.equal(madeOld.status, 0, `ffmpeg could not make the film in an old format: ${madeOld.error || madeOld.stderr}`)
 
@@ -453,6 +455,36 @@ try {
   })
 
   await step('a film in a format no browser plays has its picture converted as it plays, and survives a jump', async () => {
+    // What decides between playing a film as it is and converting it is
+    // partly what this device told the PC about itself: whether it plays 4K
+    // smoothly, whether the page can fill the screen, whether it shows the
+    // kind of Dolby Vision that needs a device made for it. Each is held
+    // against what the browser itself answers here.
+    const r = await page.evaluate(async () => {
+      const can = (type) => document.createElement('video').canPlayType(type) !== ''
+      const big = await navigator.mediaCapabilities.decodingInfo({
+        type: 'file',
+        video: { contentType: 'video/mp4; codecs="avc1.640033"', width: 3840, height: 2160, bitrate: 25_000_000, framerate: 24 },
+      })
+      return {
+        told: (await (await fetch('/api/diagnostics')).json()).device,
+        smooth4K: big.supported && big.smooth,
+        fullscreen: !!(document.fullscreenEnabled || document.webkitFullscreenEnabled),
+        dovi5: can('video/mp4; codecs="dvh1.05.06"'),
+      }
+    })
+    // A page that did not ask about 4K sends no list, and the PC then takes
+    // the device to play at any size whatever it plays: every name in the
+    // list of formats, this one among them.
+    assert.ok(r.told.tall && !('dovi5' in r.told.tall), `the page did not tell the PC what this device plays above 1080p: ${JSON.stringify(r.told.tall)}`)
+    assert.equal(r.told.tall.h264, r.smooth4K, '4K H.264: what the page told the PC against what the browser says')
+    assert.equal(r.told.pageFullscreen, r.fullscreen, 'whether the page can fill the screen: what the page told the PC against what the browser says')
+    assert.equal(r.told.video.dovi5, r.dovi5, 'Dolby Vision profile 5: what the page told the PC against what the browser says')
+    if (browserName === 'chromium') {
+      assert.equal(r.told.pageFullscreen, true, 'a page in Chromium can fill the screen')
+      assert.equal(r.told.video.dovi5, false, 'this Chromium plays no Dolby Vision, and must not be said to')
+    }
+
     await focusByText(page, 'Old Format Test')
     await page.keyboard.press('Enter')
     await waitPlaying(page, 2)
@@ -467,6 +499,14 @@ try {
     if (browserName === 'chromium') assert.ok(v.sound > 0, 'the converted sound is being decoded')
     assert.match(await page.textContent('[data-testid=how-text]'), /Converting the picture/)
     assert.match(await page.textContent('[data-testid=how-playing]'), /MPEG-4/, 'the panel says which format stood in the way')
+    // What the viewer does not get is listed. On a device without Dolby
+    // sound the film's surround track arrives as stereo; a device that has
+    // it is sent the track untouched, and nothing is lost.
+    if (r.told.audio.ac3) {
+      assert.equal(await page.locator('[data-testid=how-lost]').count(), 0, `nothing is lost, yet the panel lists: ${await page.locator('[data-testid=how-lost]').allTextContents()}`)
+    } else {
+      assert.match(await page.textContent('[data-testid=how-lost]'), /Surround sound is played as stereo/, 'the panel lists what is different from the original')
+    }
     assert.equal(await page.locator('[data-testid=play-problem]').count(), 0, `nothing is wrong, yet the page says: ${await page.locator('[data-testid=play-problem]').allTextContents()}`)
     const before = Date.now()
     await page.evaluate(() => (document.querySelector('video').currentTime = 20))

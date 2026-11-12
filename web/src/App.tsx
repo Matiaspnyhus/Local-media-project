@@ -1054,7 +1054,11 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
               <li key={r}>{r}</li>
             ))}
           </ul>
-          {!info.plan.pcCannot && <p className="dim">Another browser or device may be able to play it today.</p>}
+          <p className="dim">
+            {info.plan.pcCannot
+              ? 'A device that plays this file as it is, without converting, may still be able to play it.'
+              : 'Another browser or device may be able to play it today.'}
+          </p>
           <button onClick={() => setTryAnyway(true)}>Try anyway</button>
           {elsewhere}
         </div>
