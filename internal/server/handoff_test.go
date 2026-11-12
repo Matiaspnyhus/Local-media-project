@@ -1137,10 +1137,30 @@ func TestDownloadNamesAreSafeOnEverySystem(t *testing.T) {
 		`<>:"/\|?*`:                        "film",
 		" . ":                              "film",
 		long:                               strings.Repeat("Å", 80),
+		// The rest of what Windows keeps for devices.
+		"COM0":        "film",
+		"lpt0":        "film",
+		"COM¹":        "film", // COM¹: the small raised digits count as digits there
+		"LPT².2019":   "film",
+		"com³ ":       "film",
+		"CONIN$":      "film",
+		"conout$.cut": "film",
+		"Clock$":      "film",
+		"COM10":       "COM10",
+		"COM":         "COM",
+		"Conin":       "Conin",
+		// Most systems count a name's length in bytes, 255 at most, and a
+		// letter can take four of them.
+		strings.Repeat("🎬", 200):       strings.Repeat("🎬", 50),
+		strings.Repeat("日", 300):       strings.Repeat("日", 66),
+		"a" + strings.Repeat("🎬", 200): "a" + strings.Repeat("🎬", 49),
 	} {
 		got := downloadName(title)
 		if got != want {
-			t.Errorf("%q became %q, want %q", title, got, want)
+			t.Errorf("%.60q became %.60q (%d bytes), want %.60q (%d bytes)", title, got, len(got), want, len(want))
+		}
+		if len(got) > 200 {
+			t.Errorf("%.60q became a name of %d bytes", title, len(got))
 		}
 		// Whatever the title, the header that carries the name can be
 		// written and read back.

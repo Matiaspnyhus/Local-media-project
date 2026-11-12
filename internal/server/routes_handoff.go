@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -467,13 +468,20 @@ func xspf(title, link string, durationMs, startSeconds int64) []byte {
 
 // reservedNames cannot begin a file name on Windows, whatever follows the
 // first dot: "nul.xspf" and "nul.2019.xspf" both mean a device, not a file.
-var reservedNames = map[string]bool{"con": true, "prn": true, "aux": true, "nul": true,
-	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true, "com6": true, "com7": true, "com8": true, "com9": true,
-	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true, "lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true}
+// The digits of COM and LPT include 0 and the small raised 1, 2 and 3.
+var reservedNames = func() map[string]bool {
+	names := map[string]bool{"con": true, "prn": true, "aux": true, "nul": true, "conin$": true, "conout$": true, "clock$": true}
+	for _, digit := range "0123456789¹²³" {
+		names["com"+string(digit)], names["lpt"+string(digit)] = true, true
+	}
+	return names
+}()
 
 // downloadName turns a film's title into a file name (without its ending)
 // that Windows, macOS and Linux all accept: no path separators, none of
-// the characters Windows forbids, nothing invisible, not too long.
+// the characters Windows forbids, nothing invisible, not too long. "Too
+// long" is counted both ways: in letters, for the eye, and in bytes, which
+// is how most systems count their limit of 255 (a letter can take four).
 func downloadName(title string) string {
 	var b strings.Builder
 	n, space := 0, true // as if a space came before: none is kept at the start
@@ -487,7 +495,7 @@ func downloadName(title string) string {
 		if c == ' ' && space {
 			continue // never two spaces in a row
 		}
-		if n++; n > 80 {
+		if n++; n > 80 || b.Len()+utf8.RuneLen(c) > 200 {
 			break
 		}
 		space = c == ' '
