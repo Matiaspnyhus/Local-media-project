@@ -141,7 +141,8 @@ type Video struct {
 	Rung int `json:"rung"`
 	// Height is how many lines the converted picture has, as near as can
 	// be told here: the converter works out the exact size, which also
-	// depends on the shape of the film's pixels.
+	// depends on the shape of the film's pixels. A picture held upright
+	// has more lines than its rung's frame, which it fits lying down.
 	Height int `json:"height"`
 	// Encoder is what makes the H.264: "x264" or a graphics-card encoder.
 	Encoder string `json:"encoder"`
@@ -219,6 +220,10 @@ func kindOf(s *Subtitle) SubtitleKind {
 // what it draws is still there in fullscreen, otherwise by the PC, into
 // the picture itself. For styled ones the viewer may prefer plain words
 // over a converted picture.
+//
+// A viewer who would rather have the page draw on a device where it
+// cannot go fullscreen, and do without subtitles there, is served by
+// passing that device in with PageFullscreen set.
 func showing(sub *Subtitle, c *Caps, w Want) SubtitleMode {
 	if sub == nil {
 		return SubsNone
@@ -492,10 +497,23 @@ func pictureOf(v Track) PictureKind {
 // even number (854 for 480).
 func wide(lines int) int { return (lines*16/9 + 1) &^ 1 }
 
+// lying turns a picture that is taller than it is wide (a phone held
+// upright) on its side, and says whether it did. Sizes here are about how
+// much picture there is, and 1080x1920 is as much as 1920x1080: it must
+// not count as larger than 1080p, nor be shrunk to fit a frame it would
+// fill lying down. A width of 0 is not known and is left alone.
+func lying(width, height int) (w, h int, upright bool) {
+	if width > 0 && height > width {
+		return height, width, true
+	}
+	return width, height, false
+}
+
 // fits says a picture is no larger than the frame that is lines tall.
 // Films wider than 16:9 are measured by their width: 1920x800 is a 1080p
-// picture although it has 800 lines. A width of 0 is not known.
+// picture although it has 800 lines.
 func fits(width, height, lines int) bool {
+	width, height, _ = lying(width, height)
 	return height <= lines && width <= wide(lines)
 }
 
@@ -503,25 +521,33 @@ func fits(width, height, lines int) bool {
 // lines tall: shrunk if it has to be, never enlarged. A picture of unknown
 // size is taken to fill the frame.
 func fit(width, height, lines int) (int, int) {
-	switch {
-	case height <= 0:
+	if height <= 0 {
 		return 0, lines
-	case fits(width, height, lines):
-		return width, height
-	case width*9 <= height*16:
-		// No wider than the frame's shape: the height decides.
-		return (width * lines / height) &^ 1, lines
 	}
-	return wide(lines), (height * wide(lines) / width) &^ 1
+	w, h, upright := lying(width, height)
+	switch {
+	case fits(w, h, lines):
+	case w*9 <= h*16:
+		// No wider than the frame's shape: the height decides.
+		w, h = (w*lines/h)&^1, lines
+	default:
+		w, h = wide(lines), (h*wide(lines)/w)&^1
+	}
+	if upright {
+		return h, w
+	}
+	return w, h
 }
 
 // sizeOf sorts a picture by the smallest frame it fits; "" for unknown.
 // A few lines over 1080 (1088, as some files store 1080p) still count as
 // 1080p.
 func sizeOf(width, height int) Size {
-	switch {
-	case height <= 0:
+	if height <= 0 {
 		return ""
+	}
+	width, height, _ = lying(width, height)
+	switch {
 	case height > 1088 || width > 1920:
 		return Size4K
 	case !fits(width, height, 720):
@@ -534,12 +560,13 @@ func sizeOf(width, height int) Size {
 
 // sizeWord names a picture's size the way people know it.
 func sizeWord(width, height int) string {
-	switch s := sizeOf(width, height); {
+	s := sizeOf(width, height)
+	width, height, _ = lying(width, height)
+	switch {
 	case s == Size4K && (height > 1440 || width > 2560):
 		return "4K"
 	case s == Size4K:
 		return "1440p"
-	default:
-		return string(s)
 	}
+	return string(s)
 }

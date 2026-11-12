@@ -618,6 +618,8 @@ func TestWhereAnUnmeasuredPCStarts(t *testing.T) {
 		{"4K", 3840, 2160, SDR, 3, 720},
 		{"4K HDR", 3840, 2160, PQ, 3, 720},
 		{"a wide 4K film", 3840, 1600, PQ, 3, 532},
+		{"a phone video held upright: 1080p, not 4K, and not shrunk", 1080, 1920, SDR, 1, 1920},
+		{"a 4K phone video held upright", 2160, 3840, SDR, 3, 1280},
 	} {
 		m := media("avi", "mpeg4", 8, "mp3")
 		m.Video[0].Width, m.Video[0].Height, m.Video[0].Transfer = c.width, c.height, c.transfer
@@ -625,6 +627,17 @@ func TestWhereAnUnmeasuredPCStarts(t *testing.T) {
 		if p.Method != Convert || p.Video.Rung != c.rung || p.Video.Height != c.lines {
 			t.Errorf("%s: %s, rung %d, %d lines; want rung %d, %d lines", c.name, p.Method, p.Video.Rung, p.Video.Height, c.rung, c.lines)
 		}
+	}
+	// An upright 1080p video is not "larger than 1080p": a device that
+	// plays its format up to 1080p is sent it as it is.
+	upTo1080p := caps(true, "mp4", "h264", "aac")
+	upright := film("mp4", "h264", 8, "aac", pictureSize{"upright 1080p", 1080, 1920}, colours[0], "")
+	if p := DecideFor(upright, upTo1080p, Want{Audio: -1, Subtitle: -1}, able); p.Method != Direct {
+		t.Errorf("an upright 1080p video on a device that plays nothing larger than 1080p: %+v", p)
+	}
+	upright.Video[0].Width, upright.Video[0].Height = 2160, 3840
+	if p := DecideFor(upright, upTo1080p, Want{Audio: -1, Subtitle: -1}, able); p.Method != Convert || !has(p.Lost, "4K picture shown as 720p.") {
+		t.Errorf("an upright 4K video on that device: %+v", p)
 	}
 }
 
@@ -669,6 +682,11 @@ func TestPictureSizes(t *testing.T) {
 		{0, 2160, 1080, 0, 1080}, // width not read
 		{0, 480, 1080, 0, 480},
 		{0, 0, 720, 0, 720}, // nothing read: taken to fill the frame
+		// A phone held upright: as much picture as the same lying down.
+		{1080, 1920, 1080, 1080, 1920},
+		{1080, 1920, 720, 720, 1280},
+		{2160, 3840, 1080, 1080, 1920},
+		{886, 1920, 480, 394, 854},
 	} {
 		if w, h := fit(c.width, c.height, c.lines); w != c.wantW || h != c.wantH {
 			t.Errorf("%dx%d into %d lines: %dx%d, want %dx%d", c.width, c.height, c.lines, w, h, c.wantW, c.wantH)
@@ -684,6 +702,7 @@ func TestPictureSizes(t *testing.T) {
 		{1920, 1080, Size1080, "1080p"}, {1920, 1088, Size1080, "1080p"},
 		{1440, 1080, Size1080, "1080p"}, {2560, 1440, Size4K, "1440p"}, {3840, 1600, Size4K, "4K"}, {3840, 2160, Size4K, "4K"},
 		{0, 2160, Size4K, "4K"}, {0, 0, "", ""},
+		{1080, 1920, Size1080, "1080p"}, {720, 1280, Size720, "720p"}, {480, 854, Size480, "480p"}, {2160, 3840, Size4K, "4K"}, {1440, 2560, Size4K, "1440p"},
 	} {
 		if got := sizeOf(c.width, c.height); got != c.want {
 			t.Errorf("%dx%d is %q, want %q", c.width, c.height, got, c.want)
