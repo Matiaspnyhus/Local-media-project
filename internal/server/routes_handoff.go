@@ -167,9 +167,42 @@ func oneLine(s string) string {
 // video file inside its library.
 type handedFile struct {
 	id         string // the file's, not the item's
+	library    string // the library folder it is in
+	rel        string // its place in that folder, as the database has it
 	path       string // where it is on this PC
 	title      string
 	durationMs int64
+}
+
+// plainFile reports whether every step from a library folder down to one
+// of its files is what it seems: real folders, then a real file, with no
+// link among them.
+//
+// The scan lists no links, so a link here was put in a film's place
+// afterwards. Sending a film's bytes through one is harmless as long as it
+// stays inside the library (openMedia sees to that). Handing one to the
+// operating system to "open" is not: what then happens is decided by what
+// the link points at, which may be a script lying beside the films.
+func plainFile(libPath, rel string) bool {
+	at := libPath
+	steps := strings.Split(rel, "/")
+	for i, step := range steps {
+		if step == "" || step == "." || step == ".." {
+			return false
+		}
+		at = filepath.Join(at, step)
+		st, err := os.Lstat(at) // Lstat: the thing itself, not what it points at
+		if err != nil {
+			return false
+		}
+		if i == len(steps)-1 {
+			return st.Mode().IsRegular()
+		}
+		if !st.IsDir() {
+			return false
+		}
+	}
+	return false
 }
 
 // fileToHand finds the file an item plays from. Which file that is comes
@@ -202,6 +235,7 @@ func (s *Server) fileToHand(w http.ResponseWriter, r *http.Request) (handedFile,
 		return f, false
 	}
 	file.Close()
+	f.library, f.rel = libPath, rel
 	f.path = filepath.Join(libPath, filepath.FromSlash(rel))
 	if views, _ := s.loadItems(currentUser(r), `i.id = ?`, "", itemID); len(views) == 1 {
 		f.title = views[0].Display()
@@ -222,6 +256,10 @@ func (s *Server) handleOpenLocal(w http.ResponseWriter, r *http.Request) {
 	}
 	f, ok := s.fileToHand(w, r)
 	if !ok {
+		return
+	}
+	if !plainFile(f.library, f.rel) {
+		writeErr(w, http.StatusNotFound, "That file is not available right now.")
 		return
 	}
 	if why, wait := s.opens.begin(f.id); why != "" {

@@ -308,6 +308,57 @@ func TestOpenLocalOpensOnlyVideosInsideTheLibrary(t *testing.T) {
 			}
 		}
 	}
+	// A link put where a film was. The scan lists no links, so this takes
+	// somebody who can write into the library after the scan. Inside the
+	// library a link's bytes may be sent like any film's, but the link is
+	// never handed to the operating system: what "open" does then is
+	// decided by what it points at.
+	os.WriteFile(filepath.Join(e.media, "run.command"), []byte("#!/bin/sh\necho run\n"), 0o755)
+	os.MkdirAll(filepath.Join(e.media, "Real"), 0o755)
+	os.WriteFile(filepath.Join(e.media, "Real", "inside.mkv"), []byte("mkvdata"), 0o644)
+	links := map[string]string{ // the link's place in the library: what it points at
+		"script.mkv":        "run.command",
+		"batch.mp4":         "run.bat",
+		"other-film.mkv":    filepath.Join("Films", "Some.Movie.mkv"),
+		"full-path.mkv":     filepath.Join(e.media, "Films", "Some.Movie.mkv"),
+		"Linked":            "Real", // a folder that is a link: the film in it is real
+		"link-to-link.mkv":  "script.mkv",
+		"Films/climbs.mkv":  filepath.Join("..", "run.command"),
+		"Films/dangles.mkv": "nothing-there.mkv",
+	}
+	linked := []string{}
+	for at, to := range links {
+		if os.Symlink(to, filepath.Join(e.media, filepath.FromSlash(at))) == nil { // not everywhere, see above
+			if at == "Linked" {
+				at = "Linked/inside.mkv"
+			}
+			linked = append(linked, at)
+		}
+	}
+	for _, rel := range linked {
+		if _, err := e.s.db.Exec(`UPDATE files SET rel_path=? WHERE version_id IN (SELECT id FROM versions WHERE item_id=?)`, rel, id); err != nil {
+			t.Fatal(err)
+		}
+		if w := open(id); w.Code != 404 {
+			t.Errorf("a film that is reached through a link (%q): %d %s", rel, w.Code, w.Body)
+		}
+	}
+	// The same film by its real place is opened (and a name with ".." in
+	// it, which no scan writes, is not).
+	e.s.db.Exec(`UPDATE files SET rel_path='Films/../clip.mp4' WHERE version_id IN (SELECT id FROM versions WHERE item_id=?)`, id)
+	if w := open(id); w.Code != 404 {
+		t.Errorf("a file row with .. in it: %d %s", w.Code, w.Body)
+	}
+	if len(*opened) != 0 {
+		t.Fatalf("opened %q", *opened)
+	}
+	e.s.db.Exec(`UPDATE files SET rel_path='Real/inside.mkv' WHERE version_id IN (SELECT id FROM versions WHERE item_id=?)`, id)
+	if w := open(id); w.Code != 200 || len(*opened) != 1 || (*opened)[0] != filepath.Join(e.media, "Real", "inside.mkv") {
+		t.Fatalf("the film in its real folder: %d %s, opened %q", w.Code, w.Body, *opened)
+	}
+	*opened = (*opened)[:0]
+	later(e, time.Minute)
+
 	// A file the library has marked as gone.
 	e.s.db.Exec(`UPDATE files SET rel_path='clip.mp4', missing=1 WHERE version_id IN (SELECT id FROM versions WHERE item_id=?)`, id)
 	if w := open(id); w.Code != 404 {
