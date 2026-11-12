@@ -115,17 +115,25 @@ jobs:
           go vet ./...
           go test ./...
       - name: The list of other people's code built into the program is up to date
+        # (Runs also when a check above failed, so that the other systems
+        # can still be tested with what was built: one failing test on
+        # Linux must not hide what Windows and Safari's engine would say.
+        # The job still ends as failed, and nothing is published.)
+        if: ${{ !cancelled() }}
         run: |
           bash packaging/third-party-licenses.sh
           git diff --exit-code -- packaging/THIRD-PARTY-LICENSES.txt || { echo "Run: bash packaging/third-party-licenses.sh, and commit the result"; exit 1; }
       - name: Build every platform with cgo off
+        if: ${{ !cancelled() }}
         run: make cross VERSION="$LM_VERSION"
       - name: End-to-end test in Chromium (keyboard only, plain HTTP)
+        if: ${{ !cancelled() }}
         run: |
           cp release/localmedia-linux-amd64 localmedia
           cd e2e && npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
           node run.mjs
       - name: Package for Windows with the pinned file inspector and converter
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           . packaging/ffmpeg.env
@@ -140,11 +148,13 @@ jobs:
           cp packaging/THIRD-PARTY.txt package/LocalMedia/THIRD-PARTY.txt
           cp packaging/THIRD-PARTY-LICENSES.txt package/LocalMedia/THIRD-PARTY-LICENSES.txt
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: localmedia-builds
           path: release/
           retention-days: 14
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: LocalMedia-Windows
           path: package/
@@ -152,7 +162,9 @@ jobs:
 
   windows:
     needs: [plan, linux]
-    if: needs.plan.outputs.all_os == 'true'
+    # Runs whether or not the Linux job passed (it needs only what that job
+    # built), so that every system reports on every push.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.all_os == 'true' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -272,7 +284,7 @@ jobs:
 
   macos:
     needs: [plan, linux]
-    if: needs.plan.outputs.all_os == 'true'
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.all_os == 'true' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -311,7 +323,7 @@ jobs:
   linux-arm:
     needs: [plan, linux]
     # ARM machines are only offered free to public repositories.
-    if: needs.plan.outputs.public == 'true'
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.public == 'true' }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -325,7 +337,10 @@ jobs:
 
   release:
     needs: [plan, linux, windows, macos]
-    if: needs.plan.outputs.release != ''
+    # Only when every system passed. (The other jobs now run even after a
+    # failure on Linux, so this is said outright and not left to the rule
+    # that a job is skipped when one it needs failed.)
+    if: ${{ needs.plan.outputs.release != '' && needs.linux.result == 'success' && needs.windows.result == 'success' && needs.macos.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
