@@ -267,11 +267,15 @@ try {
     await focusByText(page, 'Dolby Sound Test')
     await page.keyboard.press('Enter')
     await waitPlaying(page, 30)
+    // Being put at the right place is not yet playing from it: wait for the
+    // film to move on from wherever it resumed.
+    const resumedAt = await page.evaluate(() => document.querySelector('video').currentTime)
+    await page.waitForFunction((t) => document.querySelector('video').currentTime > t + 0.7, resumedAt, { timeout: 20000 })
     const v = await page.evaluate(() => {
       const el = document.querySelector('video')
       return { at: el.currentTime, from: el.buffered.length ? el.buffered.start(0) : -1, sub: document.querySelector('[data-testid=pick-subtitles]').value }
     })
-    assert.ok(v.at >= 30 && v.at < 39, `resumed at ${v.at}`)
+    assert.ok(resumedAt >= 30 && resumedAt < 38 && v.at < 39.5, `resumed at ${resumedAt}, now at ${v.at}`)
     // The first chunk fetched is the one from 30 seconds; the player must
     // place it exactly there, or everything after would be out of step.
     page.off('request', note)
@@ -279,7 +283,7 @@ try {
       const b = document.querySelector('video').buffered
       return Array.from({ length: b.length }, (_, i) => `${b.start(i).toFixed(2)}-${b.end(i).toFixed(2)}`).join(' ')
     })
-    console.log(`      (resumed at ${v.at.toFixed(2)} s; asked for ${asked.join(' ')}; holding ${ranges})`)
+    console.log(`      (resumed at ${resumedAt.toFixed(2)} s and played on to ${v.at.toFixed(2)} s; asked for ${asked.join(' ')}; holding ${ranges})`)
     if (browserName === 'chromium') assert.ok(Math.abs(v.from - 30) < 0.25, `the chunk for 30 s was placed at ${v.from}`)
     assert.notEqual(v.sub, '', 'the subtitle choice was remembered')
     await page.goBack()

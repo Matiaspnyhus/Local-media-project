@@ -241,6 +241,53 @@ func TestCutsAreFoundAtRealKeyFrames(t *testing.T) {
 			keys[int64(f(p[0])*1000+0.5)] = true
 		}
 	}
+	// An MKV file's own index gives the same key frames with one read.
+	index, err := matroskaKeyFrames(src)
+	if err != nil || len(index) != len(keys) {
+		t.Fatalf("the file's own index lists %d key frames (%v), the film has %d", len(index), err, len(keys))
+	}
+	for _, k := range index {
+		if !keys[k] {
+			t.Errorf("the index lists %d ms, which is not a key frame", k)
+		}
+	}
+	if g.From != "index" {
+		t.Errorf("an MKV file with a good index was cut by %q", g.From)
+	}
+	// The index may sit at the end of the file (the usual place) or at the
+	// front; both are found.
+	front := filepath.Join(t.TempDir(), "front.mkv")
+	if out, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-c", "copy", "-cues_to_front", "1", front).CombinedOutput(); err == nil {
+		if again, err := matroskaKeyFrames(front); err != nil || len(again) != len(keys) {
+			t.Errorf("with the index at the front: %d key frames (%v), want %d", len(again), err, len(keys))
+		}
+	} else {
+		t.Logf("this ffmpeg cannot put the index at the front: %s", out)
+	}
+	// A file that is not MKV, or has no usable index, is visited by ffprobe
+	// instead, and the cuts are still real key frames.
+	mp4 := filepath.Join(t.TempDir(), "rough.mp4")
+	if out, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", src, "-c", "copy", mp4).CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	gp := grid(t, ffprobe, mp4, 60000)
+	if gp.From != "probe" || len(gp.Cuts) < 6 {
+		t.Errorf("the MP4 copy was cut by %q into %d chunks", gp.From, len(gp.Cuts))
+	}
+	// An index that lists only one key frame in many is not used.
+	if !denseEnough([]int64{0, 8000, 16000, 24000, 32000}, 0, 40000) || !denseEnough([]int64{0, 5000, 12000, 30000, 36000}, 0, 40000) {
+		t.Error("a good index was judged too sparse")
+	}
+	if denseEnough([]int64{0, 5000, 26000, 31000, 36000}, 0, 40000) || denseEnough([]int64{0, 5000}, 0, 60000) {
+		t.Error("an index with a gap of over 20 seconds was judged good")
+	}
+	for _, junk := range [][]byte{nil, {0x1A}, {0x1A, 0x45, 0xDF, 0xA3}, {0x1A, 0x45, 0xDF, 0xA3, 0x80, 0x18, 0x53, 0x80, 0x67, 0xFF}, bytes.Repeat([]byte{0xFF}, 64), bytes.Repeat([]byte{0x00}, 64)} {
+		p := filepath.Join(t.TempDir(), "junk.mkv")
+		os.WriteFile(p, junk, 0o600)
+		if k, err := matroskaKeyFrames(p); err == nil {
+			t.Errorf("junk %x was read as an index: %v", junk, k)
+		}
+	}
 	if len(g.Cuts) < 6 || len(g.Cuts) > 10 {
 		t.Errorf("a 60-second film was cut into %d chunks: %v", len(g.Cuts), g.Cuts)
 	}
