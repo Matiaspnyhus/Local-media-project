@@ -191,8 +191,19 @@ func TestUnknownWhenFactsAreMissing(t *testing.T) {
 	if p := Decide(Media{}, devices["chrome"], -1); p.Playable != Unknown || p.Method != Direct {
 		t.Errorf("an uninspected file got %+v", p)
 	}
-	if p := Decide(media("mp4", "h264", 8, "aac"), nil, -1); p.Playable != Unknown {
-		t.Errorf("a device that reported nothing got %s", p.Playable)
+	if p := Decide(Media{}, devices["chrome"], -1); p.DeviceUnknown || !strings.Contains(p.Explain(), "not been inspected") {
+		t.Errorf("an uninspected file is explained with %q", p.Explain())
+	}
+	// The file is known and the device is not: say that, not that the file
+	// has not been inspected.
+	for _, dev := range []*Caps{nil, {}} {
+		p := Decide(media("mp4", "h264", 8, "aac"), dev, -1)
+		if p.Playable != Unknown || p.Method != Direct || !p.DeviceUnknown {
+			t.Errorf("a device that reported nothing got %+v", p)
+		}
+		if e := p.Explain(); strings.Contains(e, "inspected") || !strings.Contains(e, "This device has not told the app what it can play") {
+			t.Errorf("a device that reported nothing is explained with %q", e)
+		}
 	}
 	if p := Decide(media("mp4", "h264", 8), devices["chrome"], -1); p.HasAudio || p.AudioTrack != -1 {
 		t.Errorf("a silent file: %+v", p)

@@ -197,6 +197,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if s.hls != nil {
 		s.hls.Drop(u.SessionID) // stop anything being converted for this sign-in
 	}
+	s.forgetCaps(u.SessionID)
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", HttpOnly: true, MaxAge: -1, SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

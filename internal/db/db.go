@@ -205,6 +205,17 @@ CREATE TABLE cuts (
   grid TEXT NOT NULL
 );
 `,
+	// 6: what the review of M3 found. What each signed-in device said it can
+	// play is kept with its sign-in, so a page left open still gets the
+	// right treatment after the program restarts.
+	`
+CREATE TABLE device_reports (
+  session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+  caps TEXT NOT NULL,                   -- the report as the device sent it
+  user_agent TEXT NOT NULL DEFAULT '',  -- how the browser describes itself
+  updated_at INTEGER NOT NULL
+);
+`,
 }
 
 // SchemaVersion is the version this build expects.

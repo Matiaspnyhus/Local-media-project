@@ -105,8 +105,7 @@ type Server struct {
 	// newTMDB builds the lookup client; tests replace it.
 	newTMDB func(key string) *metadata.Client
 	capsMu  sync.Mutex
-	caps    map[string]*playback.Caps // by session
-	capsUA  map[string]string         // by session: how the browser describes itself
+	caps    map[string]*playback.Caps // by session; the database holds them too (see capsFor)
 	ctx     context.Context
 	stop    context.CancelFunc
 	handler http.Handler

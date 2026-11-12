@@ -377,7 +377,8 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		out["url"] = "/stream/" + fileID + "?e=" + strconv.FormatInt(exp, 10) + "&s=" + u.SessionID + "&g=" + sig
 		out["mimeType"] = mediaTypes[ext]
 	}
-	planOut := map[string]any{"playable": plan.Playable, "method": plan.Method, "reasons": plan.Reasons, "audioTrack": plan.AudioTrack, "audioCopy": plan.AudioCopy, "hasAudio": nil}
+	planOut := map[string]any{"playable": plan.Playable, "method": plan.Method, "reasons": plan.Reasons, "audioTrack": plan.AudioTrack, "audioCopy": plan.AudioCopy, "hasAudio": nil,
+		"deviceUnknown": plan.DeviceUnknown}
 	if ft.media.Probed {
 		planOut["hasAudio"] = plan.HasAudio
 	}

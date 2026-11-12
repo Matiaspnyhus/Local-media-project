@@ -81,6 +81,9 @@ type Plan struct {
 	AudioTrack int `json:"audioTrack"`
 	// AudioCopy says the sound is passed through untouched.
 	AudioCopy bool `json:"audioCopy"`
+	// DeviceUnknown says the answer is "unknown" because the device has not
+	// said what it can play, not because the file has not been inspected.
+	DeviceUnknown bool `json:"deviceUnknown"`
 }
 
 // packaged lists what the repackaged format can carry. Anything else in a
@@ -102,7 +105,7 @@ func Decide(m Media, c *Caps, audioTrack int) Plan {
 		return Plan{Playable: No, Method: None, HasAudio: p.HasAudio, AudioTrack: -1, Reasons: []string{"This file has no picture track."}}
 	}
 	if c == nil || c.Containers == nil {
-		p.Playable = Unknown
+		p.Playable, p.DeviceUnknown = Unknown, true
 		return p
 	}
 	natural := BrowserAudio(m.Audio)
@@ -265,6 +268,9 @@ func AudioName(codec string) string {
 func (p Plan) Explain() string {
 	switch p.Method {
 	case Direct:
+		if p.DeviceUnknown {
+			return "Sending the original file. This device has not told the app what it can play yet, so the app cannot say in advance whether it will play. Reloading the page makes the device say it again."
+		}
 		if p.Playable == Unknown {
 			return "Sending the original file. It has not been inspected yet, so the app cannot say in advance whether this browser can play it."
 		}
