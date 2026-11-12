@@ -312,14 +312,22 @@ func (u *updater) install(owner *word) error {
 }
 
 // prepare returns the folder that holds the new version, checked and
-// unpacked: the one an earlier try left ready, if it is untouched, and
-// otherwise a fresh download.
+// unpacked: the one an earlier try left ready, if it is untouched and came
+// from the package the release holds now, and otherwise a fresh download.
 func (u *updater) prepare(rel *update.Release) (string, error) {
-	if staged, ok := update.Ready(u.installDir, rel.Version); ok {
-		return staged, nil
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
+	// The release is asked which package it holds at this moment, not what
+	// it held when the version was made ready, which can be days ago: a
+	// package can be replaced under the same version number. If the release
+	// cannot be asked just now, nothing is installed just now.
+	sum, err := u.src.Sum(ctx, rel)
+	if err != nil {
+		return "", err
+	}
+	if staged, ok := update.Ready(u.installDir, rel.Version, sum); ok {
+		return staged, nil
+	}
 	zipPath, err := u.src.Download(ctx, rel, u.installDir)
 	if err != nil {
 		return "", err
@@ -330,8 +338,11 @@ func (u *updater) prepare(rel *update.Release) (string, error) {
 		return "", err
 	}
 	// Without the note the folder still serves this try; it only cannot be
-	// used by a later one.
-	update.MarkReady(staged, rel.Version)
+	// used by a later one. (Download checked the package against the list
+	// as it read it. Should the list have changed since it was asked above,
+	// the note names a package the release no longer holds, and a later try
+	// fetches afresh.)
+	update.MarkReady(staged, rel.Version, sum)
 	return staged, nil
 }
 

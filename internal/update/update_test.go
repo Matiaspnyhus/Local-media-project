@@ -162,6 +162,32 @@ func TestDownloadKeepsOnlyWhatMatchesItsChecksum(t *testing.T) {
 	}
 }
 
+// The checksum list can be asked by itself, to learn which package a
+// release holds at this moment without fetching the package.
+func TestSumIsWhatTheReleaseListsForItsPackage(t *testing.T) {
+	zipBytes := pkg(t, map[string]string{"LocalMedia/localmedia.exe": "new program"})
+	f := newFeed(t, "v1.1.0", zipBytes)
+	ctx := context.Background()
+	rel, err := f.source().Latest(ctx, "v1.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := sha256.Sum256(zipBytes)
+	if got, err := f.source().Sum(ctx, rel); err != nil || got != hex.EncodeToString(want[:]) {
+		t.Fatalf("Sum = %q, %v; want the package's own checksum", got, err)
+	}
+	// The package is replaced: the list says so at the next asking.
+	f.zip = pkg(t, map[string]string{"LocalMedia/localmedia.exe": "new program, put up again"})
+	want = sha256.Sum256(f.zip)
+	if got, err := f.source().Sum(ctx, rel); err != nil || got != hex.EncodeToString(want[:]) {
+		t.Fatalf("after the package was replaced, Sum = %q, %v", got, err)
+	}
+	f.sums = "not a checksum"
+	if _, err := f.source().Sum(ctx, rel); err == nil {
+		t.Fatal("a list without a checksum for the package was accepted")
+	}
+}
+
 func TestUnpackRefusesAnythingButPlainFilesInOneFolder(t *testing.T) {
 	dir := t.TempDir()
 	good := filepath.Join(dir, "good.zip")
@@ -256,6 +282,9 @@ func listing(dir string) string {
 func TestAnUnpackedVersionIsKeptUntilItCanBeInstalled(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "localmedia.exe"), []byte("v1 program"), 0o755)
+	// The checksum the release lists for its package, and the one it lists
+	// once that package has been replaced under the same version number.
+	first, second := strings.Repeat("a", 64), strings.Repeat("b", 64)
 	unpack := func(version string) string {
 		t.Helper()
 		z := filepath.Join(dir, "download-"+version+".zip")
@@ -269,22 +298,28 @@ func TestAnUnpackedVersionIsKeptUntilItCanBeInstalled(t *testing.T) {
 	}
 
 	staged := unpack("v1.1.0")
-	if _, ok := Ready(dir, "v1.1.0"); ok {
+	if _, ok := Ready(dir, "v1.1.0", first); ok {
 		t.Fatal("a folder that was never noted as whole is called ready")
 	}
-	if err := MarkReady(staged, "v1.1.0"); err != nil {
+	if err := MarkReady(staged, "v1.1.0", first); err != nil {
 		t.Fatal(err)
 	}
-	if got, ok := Ready(dir, "v1.1.0"); !ok || got != staged {
+	if got, ok := Ready(dir, "v1.1.0", first); !ok || got != staged {
 		t.Fatalf("Ready = %q, %v; want the unpacked folder", got, ok)
 	}
-	if _, ok := Ready(dir, "v1.2.0"); ok {
+	if _, ok := Ready(dir, "v1.2.0", first); ok {
 		t.Fatal("the folder for one version was offered for another")
+	}
+	if _, ok := Ready(dir, "v1.1.0", second); ok {
+		t.Fatal("the folder was offered although the release now lists another package for that version")
+	}
+	if _, ok := Ready(dir, "v1.1.0", ""); ok {
+		t.Fatal("the folder was offered without knowing which package the release lists")
 	}
 
 	// The next start tidies up, and must leave the waiting version alone.
 	Tidy(dir, "v1.0.0")
-	if got, ok := Ready(dir, "v1.1.0"); !ok || got != staged {
+	if got, ok := Ready(dir, "v1.1.0", first); !ok || got != staged {
 		t.Fatalf("tidying removed a version that was waiting to be installed (the folder now holds: %s)", listing(dir))
 	}
 	if got := listing(dir); got != "localmedia.exe update-v1.1.0 update-v1.1.0.ready" {
@@ -297,31 +332,35 @@ func TestAnUnpackedVersionIsKeptUntilItCanBeInstalled(t *testing.T) {
 		"a file is missing":  func() { os.Remove(filepath.Join(staged, "ffmpeg.exe")) },
 		"a file was added":   func() { os.WriteFile(filepath.Join(staged, "extra.exe"), []byte("x"), 0o755) },
 		"the note is junk":   func() { os.WriteFile(staged+".ready", []byte("{"), 0o600) },
-		"the note is gone":   func() { os.Remove(staged + ".ready") },
+		"the note does not say which package": func() {
+			b, _ := os.ReadFile(staged + ".ready")
+			os.WriteFile(staged+".ready", bytes.Replace(b, []byte(first), nil, 1), 0o600)
+		},
+		"the note is gone": func() { os.Remove(staged + ".ready") },
 	} {
 		staged = unpack("v1.1.0")
-		if err := MarkReady(staged, "v1.1.0"); err != nil {
+		if err := MarkReady(staged, "v1.1.0", first); err != nil {
 			t.Fatal(err)
 		}
 		change()
-		if _, ok := Ready(dir, "v1.1.0"); ok {
+		if _, ok := Ready(dir, "v1.1.0", first); ok {
 			t.Errorf("%s, and the folder was still called ready", name)
 		}
 	}
 
 	// Unpacking again starts afresh: the old note does not vouch for it.
 	staged = unpack("v1.1.0")
-	if err := MarkReady(staged, "v1.1.0"); err != nil {
+	if err := MarkReady(staged, "v1.1.0", first); err != nil {
 		t.Fatal(err)
 	}
 	staged = unpack("v1.1.0")
-	if _, ok := Ready(dir, "v1.1.0"); ok {
+	if _, ok := Ready(dir, "v1.1.0", first); ok {
 		t.Fatal("a note from an earlier unpacking vouched for a new one")
 	}
 
 	// Once installed, nothing of it is left to tidy; and a folder for a
 	// version that is not newer than the running one is not kept.
-	if err := MarkReady(staged, "v1.1.0"); err != nil {
+	if err := MarkReady(staged, "v1.1.0", first); err != nil {
 		t.Fatal(err)
 	}
 	if err := Swap(dir, staged); err != nil {
@@ -331,7 +370,7 @@ func TestAnUnpackedVersionIsKeptUntilItCanBeInstalled(t *testing.T) {
 		t.Fatalf("after installing: %s", got)
 	}
 	old := unpack("v1.1.0")
-	MarkReady(old, "v1.1.0")
+	MarkReady(old, "v1.1.0", first)
 	half := unpack("v1.3.0") // unpacked, never noted as whole
 	os.WriteFile(filepath.Join(dir, "update-v1.4.0.ready"), []byte(`{"version":"v1.4.0","files":{"a":"b"}}`), 0o600)
 	_ = half

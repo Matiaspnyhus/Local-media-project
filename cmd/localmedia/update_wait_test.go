@@ -38,6 +38,7 @@ type quiet struct {
 	owner   *site
 	install string // the folder the program takes for its own
 	data    string
+	sum     string // the SHA-256 the release lists for its package
 	// The stand-in release page answers only when the test lets it: it says
 	// nothing about a newer version until the owner's account exists, and
 	// hands the package out only when told to, so that things can be made
@@ -46,6 +47,12 @@ type quiet struct {
 	asked     chan struct{} // closed when the package is first asked for
 	release   *gate         // opened to let the download finish
 	downloads atomic.Int32
+}
+
+// sumOf is the SHA-256 of a package, as a release's list writes it.
+func sumOf(pkg []byte) string {
+	sum := sha256.Sum256(pkg)
+	return hex.EncodeToString(sum[:])
 }
 
 // gate holds something back until it is opened; opening twice is harmless.
@@ -108,6 +115,7 @@ func startQuiet(t *testing.T, before func(install string, pkg []byte)) *quiet {
 	w.Write([]byte("the program, version 1.1.0"))
 	zw.Close()
 	pkg := buf.Bytes()
+	q.sum = sumOf(pkg)
 	if before != nil {
 		before(q.install, pkg)
 	}
@@ -124,8 +132,7 @@ func startQuiet(t *testing.T, before func(install string, pkg []byte)) *quiet {
 				{"name": packageName(), "browser_download_url": feed.URL + "/zip"},
 				{"name": "SHA256SUMS.txt", "browser_download_url": feed.URL + "/sums"}}})
 		case "/sums":
-			sum := sha256.Sum256(pkg)
-			fmt.Fprintf(w, "%s  %s\n", hex.EncodeToString(sum[:]), packageName())
+			fmt.Fprintf(w, "%s  %s\n", q.sum, packageName())
 		case "/zip":
 			q.downloads.Add(1)
 			once.Do(func() { close(q.asked) })
@@ -371,7 +378,7 @@ func TestAnUpdateWaitsWhileSomeoneIsWatching(t *testing.T) {
 	if !q.status().Waiting {
 		t.Errorf("the wait is no longer shown: %+v", q.status())
 	}
-	if _, ok := update.Ready(q.install, "v1.1.0"); !ok {
+	if _, ok := update.Ready(q.install, "v1.1.0", q.sum); !ok {
 		t.Error("the downloaded version was not kept for the quiet moment")
 	}
 	if n := q.downloads.Load(); n != 1 {
@@ -511,7 +518,7 @@ func TestAViewerWhoStartsAfterTheOwnerPressedIsNotCutOff(t *testing.T) {
 		time.Sleep(3 * retryEvery)
 		q.stillRunning("while the film that began after the owner pressed is being watched")
 	}
-	if _, ok := update.Ready(q.install, "v1.1.0"); !ok {
+	if _, ok := update.Ready(q.install, "v1.1.0", q.sum); !ok {
 		t.Error("the downloaded version was not kept")
 	}
 	// Pressing again brings the question, and "anyway" still installs.
@@ -549,7 +556,7 @@ func TestWhatTheOwnerAskedForGoesInWhenTheViewerLeaves(t *testing.T) {
 		q.app.upd.mu.Lock()
 		installing := q.app.upd.installing
 		q.app.upd.mu.Unlock()
-		if _, ok := update.Ready(q.install, "v1.1.0"); ok && !installing {
+		if _, ok := update.Ready(q.install, "v1.1.0", q.sum); ok && !installing {
 			break
 		}
 		q.stillRunning("while the version was being unpacked")
@@ -604,13 +611,54 @@ func TestAVersionMadeReadyEarlierIsNotDownloadedAgain(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := update.MarkReady(staged, "v1.1.0"); err != nil {
+		if err := update.MarkReady(staged, "v1.1.0", sumOf(pkg)); err != nil {
 			t.Fatal(err)
 		}
 	})
 	q.untilRestart("with the new version ready from an earlier run")
 	if n := q.downloads.Load(); n != 0 {
 		t.Errorf("the new version was downloaded %d times, although it was ready", n)
+	}
+}
+
+// A release's package can be replaced without its version changing: a
+// build that turned out faulty, taken down and put up again under the same
+// number. A version that was fetched and made ready before that is the
+// package the release no longer holds, and must not be installed. A kept
+// folder is only used if it came from the very package the release lists
+// now; otherwise the version is fetched afresh.
+func TestAKeptVersionIsNotUsedOnceTheReleaseHoldsAnotherPackage(t *testing.T) {
+	q := startQuiet(t, func(install string, pkg []byte) {
+		// What the release held on an earlier evening.
+		var buf bytes.Buffer
+		zw := zip.NewWriter(&buf)
+		w, _ := zw.Create("LocalMedia/" + exeName())
+		w.Write([]byte("the program, version 1.1.0, as it was first put up"))
+		zw.Close()
+		z := filepath.Join(install, "download-v1.1.0.zip")
+		os.WriteFile(z, buf.Bytes(), 0o600)
+		staged, err := update.Unpack(z, install, "v1.1.0")
+		os.Remove(z)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := update.MarkReady(staged, "v1.1.0", sumOf(buf.Bytes())); err != nil {
+			t.Fatal(err)
+		}
+	})
+	q.letDownloadFinish()
+	q.untilRestart("with a version kept from a package the release no longer holds")
+	if n := q.downloads.Load(); n != 1 {
+		t.Errorf("the new version was downloaded %d times; want once, afresh", n)
+	}
+	// The restart itself is not carried out here, so what was lined up for
+	// it is still in its folder.
+	staged, ok := update.Ready(q.install, "v1.1.0", q.sum)
+	if !ok {
+		t.Fatal("what was lined up for the restart is not noted as the package the release holds now")
+	}
+	if lined, err := os.ReadFile(filepath.Join(staged, exeName())); err != nil || string(lined) != "the program, version 1.1.0" {
+		t.Errorf("lined up for the restart: %q (%v); want the package the release holds now", lined, err)
 	}
 }
 
@@ -627,7 +675,7 @@ func TestNothingInstallsByItselfOnceTheOwnerSwitchedThatOff(t *testing.T) {
 	// The version is unpacked and kept...
 	deadline := time.Now().Add(60 * time.Second)
 	for {
-		if _, ok := update.Ready(q.install, "v1.1.0"); ok {
+		if _, ok := update.Ready(q.install, "v1.1.0", q.sum); ok {
 			break
 		}
 		q.stillRunning("while the version was being unpacked")

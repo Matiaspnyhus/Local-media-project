@@ -189,12 +189,9 @@ func Newer(a, b string) bool {
 	return false
 }
 
-// Download fetches the release's package into dir and checks it against
-// the release's checksum list. The file is only kept if it matches.
-func (s *Source) Download(ctx context.Context, rel *Release, dir string) (string, error) {
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
-	}
+// Sum asks the release's checksum list for the SHA-256 of its package, as
+// the list says it at this moment. The list is small.
+func (s *Source) Sum(ctx context.Context, rel *Release) (string, error) {
 	res, err := s.get(ctx, rel.SumsURL)
 	if err != nil {
 		return "", err
@@ -211,7 +208,20 @@ func (s *Source) Download(ctx context.Context, rel *Release, dir string) (string
 	if len(want) != 64 {
 		return "", errors.New("the release does not list a checksum for its package")
 	}
-	res, err = s.get(ctx, rel.AssetURL)
+	return want, nil
+}
+
+// Download fetches the release's package into dir and checks it against
+// the release's checksum list. The file is only kept if it matches.
+func (s *Source) Download(ctx context.Context, rel *Release, dir string) (string, error) {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	want, err := s.Sum(ctx, rel)
+	if err != nil {
+		return "", err
+	}
+	res, err := s.get(ctx, rel.AssetURL)
 	if err != nil {
 		return "", err
 	}
@@ -314,13 +324,17 @@ func stagedDir(installDir, version string) string {
 // the PC may be switched off before that moment comes. So that the version
 // need not be downloaded again every time, its folder is kept, with a note
 // beside it ("update-v1.2.3.ready") that lists what the folder held when it
-// was unpacked from a package that matched the release's checksum. A folder
-// is only used again if it still holds exactly that.
+// was unpacked from a package that matched the release's checksum, and
+// which package that was. A folder is only used again if it still holds
+// exactly that, and if the release still lists that very package: a
+// release's package can be replaced without its version changing, and what
+// was unpacked from the earlier one is then no longer the version.
 const readySuffix = ".ready"
 
 type readyNote struct {
 	Version string            `json:"version"`
-	Files   map[string]string `json:"files"` // each file's SHA-256, by name
+	Package string            `json:"package"` // the SHA-256 of the package it was unpacked from
+	Files   map[string]string `json:"files"`   // each file's SHA-256, by name
 }
 
 func hashFile(path string) (string, error) {
@@ -357,13 +371,14 @@ func holds(staged string) (map[string]string, error) {
 }
 
 // MarkReady writes the note that lets a folder made by Unpack be used
-// later (see Ready). Call it straight after Unpack.
-func MarkReady(staged, version string) error {
+// later (see Ready). Call it straight after Unpack. packageSum is the
+// SHA-256 of the package that was unpacked, as the release listed it.
+func MarkReady(staged, version, packageSum string) error {
 	files, err := holds(staged)
 	if err != nil {
 		return err
 	}
-	b, _ := json.MarshalIndent(readyNote{Version: version, Files: files}, "", "  ")
+	b, _ := json.MarshalIndent(readyNote{Version: version, Package: packageSum, Files: files}, "", "  ")
 	tmp := staged + readySuffix + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return err
@@ -382,13 +397,15 @@ func readNote(staged string) (readyNote, bool) {
 	return note, true
 }
 
-// Ready returns the folder that holds version, unpacked earlier and still
-// exactly as it was then. ok is false when there is none, or when anything
+// Ready returns the folder that holds version, unpacked earlier from the
+// package with the SHA-256 packageSum (what the release lists for it now,
+// see Source.Sum) and still exactly as it was then. ok is false when there
+// is none, when it was unpacked from another package, or when anything
 // about it has changed: a file missing, added or different.
-func Ready(installDir, version string) (staged string, ok bool) {
+func Ready(installDir, version, packageSum string) (staged string, ok bool) {
 	staged = stagedDir(installDir, version)
 	note, ok := readNote(staged)
-	if !ok || note.Version != version {
+	if !ok || note.Version != version || packageSum == "" || note.Package != packageSum {
 		return "", false
 	}
 	files, err := holds(staged)
