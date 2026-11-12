@@ -42,6 +42,12 @@ func (s *Server) routeTable() []Route {
 		{"POST", "/api/items/{id}/play", Session, s.handlePlay},
 		{"GET", "/api/items/{id}/poster", Session, s.handlePoster},
 		{"PUT", "/api/items/{id}/progress", Session, s.handleProgress},
+		{"PUT", "/api/items/{id}/choice", Session, s.handleChoice},
+		{"GET", "/api/files/{fileID}/subtitles/{key}", Session, s.handleSubtitle},
+		{"POST", "/api/hls/{token}/stop", Session, s.handleHLSStop},
+		{"GET", "/api/prefs", Session, s.handleGetPrefs},
+		{"PUT", "/api/prefs", Session, s.handleSetPrefs},
+		{"GET", "/api/diagnostics", Session, s.handleDiagnostics},
 		{"GET", "/api/connect", Session, s.handleConnect},
 		{"GET", "/api/connect/qr.png", Session, s.handleQR},
 		{"POST", "/api/client-events", Session, s.handleClientEvent},
@@ -61,6 +67,9 @@ func (s *Server) routeTable() []Route {
 		{"PUT", "/api/settings/online", Owner, s.handleSetOnline},
 
 		{"GET", "/stream/{fileID}", SignedLink, s.handleStream},
+		{"GET", "/hls/{token}/index.m3u8", SignedLink, s.handleHLSList},
+		{"GET", "/hls/{token}/init.mp4", SignedLink, s.handleHLSInit},
+		{"GET", "/hls/{token}/seg-{n}.m4s", SignedLink, s.handleHLSSegment},
 	}
 }
 
@@ -185,51 +194,11 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
 	s.db.Exec(`UPDATE sessions SET revoked_at=? WHERE id=?`, time.Now().Unix(), u.SessionID)
+	if s.hls != nil {
+		s.hls.Drop(u.SessionID) // stop anything being converted for this sign-in
+	}
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", HttpOnly: true, MaxAge: -1, SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
-}
-
-// handlePlay hands the player a signed link to the file. The link works
-// without the session cookie, so players that fetch media themselves
-// (AirPlay, external players) can use it, and it stops working when the
-// session is signed out or the link expires.
-func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
-	u := currentUser(r)
-	itemID := chi.URLParam(r, "id")
-	if !ids.Valid(itemID) {
-		writeErr(w, http.StatusNotFound, "Not found.")
-		return
-	}
-	var fileID, rel, title string
-	err := s.db.QueryRow(`SELECT f.id, f.rel_path, i.title FROM items i JOIN versions v ON v.item_id=i.id
-		JOIN files f ON f.version_id=v.id WHERE i.id=? AND f.missing=0 ORDER BY f.part_index LIMIT 1`, itemID).Scan(&fileID, &rel, &title)
-	if err != nil {
-		writeErr(w, http.StatusNotFound, "That file is not available right now.")
-		return
-	}
-	var pos, dur int64
-	var played int
-	s.db.QueryRow(`SELECT position_ms, duration_ms, played FROM progress WHERE user_id=? AND item_id=?`, u.ID, itemID).Scan(&pos, &dur, &played)
-	if played != 0 {
-		pos = 0
-	}
-	exp := time.Now().Add(linkLife).Unix()
-	sig := auth.SignLink(s.linkKey, fileID, exp, u.SessionID)
-	ext := strings.ToLower(filepath.Ext(rel))
-	views, _ := s.loadItems(u, `i.id = ?`, "", itemID)
-	plan := map[string]any{"direct": "unknown", "reasons": []string{}, "hasAudio": nil}
-	if len(views) == 1 {
-		title = views[0].Display()
-		plan = map[string]any{"direct": views[0].Playable, "reasons": views[0].Reasons, "hasAudio": views[0].hasAudio}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"plan":       plan,
-		"title":      title,
-		"url":        "/stream/" + fileID + "?e=" + strconv.FormatInt(exp, 10) + "&s=" + u.SessionID + "&g=" + sig,
-		"mimeType":   mediaTypes[ext],
-		"container":  strings.TrimPrefix(ext, "."),
-		"positionMs": pos,
-	})
 }
 
 func (s *Server) handleProgress(w http.ResponseWriter, r *http.Request) {
@@ -496,14 +465,16 @@ func (s *Server) handleSupportBundle(w http.ResponseWriter, r *http.Request) {
 		rows.Close()
 	}
 	info["onlineLookups"] = map[string]any{"keySaved": s.setting("tmdb_key") != "", "on": s.lookupsOn(), "lastProblem": s.lookupErr.Load()}
+	info["converter"] = map[string]any{"found": s.hls != nil, "inspectorFound": s.ffprobe != ""}
 	add("info.json", info)
 	add("not-found-online.json", unmatched)
 	add("playback-problems.json", s.events.all())
+	add("devices.json", s.deviceReports())
 	if f, err := zw.Create("log.txt"); err == nil {
 		f.Write(s.log.tail(512 << 10))
 	}
 	if f, err := zw.Create("README.txt"); err == nil {
-		f.Write([]byte("Local Media support bundle.\r\n\r\nContains: program version, counts of files by type, the names of files that failed to play,\r\nand recent log lines with network addresses and secrets removed.\r\nContains no video, no passwords and no list of your whole library.\r\n\r\nAttach this file to the chat. Do not post it on GitHub.\r\n"))
+		f.Write([]byte("Local Media support bundle.\r\n\r\nContains: program version, counts of files by type, the names of files that failed to play,\r\nwhat each signed-in browser said it can play (devices.json), and recent log lines with\r\nnetwork addresses and secrets removed.\r\nContains no video, no passwords and no list of your whole library.\r\n\r\nAttach this file to the chat. Do not post it on GitHub.\r\n"))
 	}
 }
 

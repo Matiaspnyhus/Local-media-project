@@ -1,10 +1,17 @@
-// Package playback decides how a file can be played on a device. It is a
-// pure function: what ffprobe said about the file and what the device says
-// it can play go in, a decision with reasons in plain words comes out.
+// Package playback decides how a file is played on a device. It is made of
+// pure functions: what ffprobe said about the file, what the device says it
+// can play and what the viewer wants go in; a decision with reasons in
+// plain words comes out.
 //
-// In M1 the only question is "can this browser play the original file as it
-// is?". M3 adds the other answers (repackage, convert the sound, convert
-// everything) to the same function.
+// There are four possible answers, tried in this order because each costs
+// more than the one before:
+//
+//	direct   send the original file as it is
+//	remux    repackage it without touching picture or sound (no quality
+//	         loss, almost no work for the PC)
+//	audio    repackage it and convert only the sound
+//	none     this device cannot play it until the picture is converted too,
+//	         which arrives in M4
 package playback
 
 import "strings"
@@ -16,15 +23,22 @@ type Caps struct {
 	Containers map[string]bool `json:"containers"`
 	Video      map[string]bool `json:"video"`
 	Audio      map[string]bool `json:"audio"`
+	// HLS says the device can play repackaged video (the chunked format
+	// phones and browsers accept), natively or through the page's player.
+	HLS bool `json:"hls"`
 }
 
-// Track is one video or audio track of a file.
+// Track is one video, audio or subtitle track of a file.
 type Track struct {
-	Codec      string
-	BitDepth   int
-	Default    bool
-	Commentary bool
-	Language   string
+	Codec           string
+	BitDepth        int
+	Channels        int
+	Default         bool
+	Forced          bool
+	Commentary      bool
+	HearingImpaired bool
+	Language        string
+	Title           string
 }
 
 // Media is what is known about a file.
@@ -35,72 +49,133 @@ type Media struct {
 	Audio     []Track
 }
 
-// Answer is the decision.
+// Answer says whether a device can play a file today.
 type Answer string
 
 const (
-	Yes     Answer = "yes"     // the browser can play the original file
-	No      Answer = "no"      // it cannot; conversion is needed
-	Unknown Answer = "unknown" // not enough is known to say
+	Yes     Answer = "yes"
+	No      Answer = "no"
+	Unknown Answer = "unknown"
+)
+
+// Method is how a file gets to the device.
+type Method string
+
+const (
+	Direct Method = "direct"
+	Remux  Method = "remux"
+	Audio  Method = "audio"
+	None   Method = "none"
 )
 
 // Plan is a decision and why.
 type Plan struct {
-	Direct   Answer   `json:"direct"`
-	Reasons  []string `json:"reasons"`
-	HasAudio bool     `json:"hasAudio"`
+	Playable Answer `json:"playable"`
+	Method   Method `json:"method"`
+	// Reasons say why the original file is not simply sent as it is.
+	// Empty for direct.
+	Reasons []string `json:"reasons"`
+	// HasAudio is false for a file with no sound track.
+	HasAudio bool `json:"hasAudio"`
+	// AudioTrack is which sound track plays, counted from 0; -1 for none.
+	AudioTrack int `json:"audioTrack"`
+	// AudioCopy says the sound is passed through untouched.
+	AudioCopy bool `json:"audioCopy"`
 }
 
-// Decide answers whether the device can play the original file.
-func Decide(m Media, c *Caps) Plan {
+// packaged lists what the repackaged format can carry. Anything else in a
+// file has to be converted before it can go into it.
+var (
+	packagedVideo = map[string]bool{"h264": true, "hevc": true, "av1": true}
+	packagedAudio = map[string]bool{"aac": true, "ac3": true, "eac3": true}
+)
+
+// Decide chooses how to play a file. audioTrack is the sound track the
+// viewer wants, counted from 0, or -1 to let BrowserAudio's choice stand.
+func Decide(m Media, c *Caps, audioTrack int) Plan {
 	if !m.Probed {
-		return Plan{Direct: Unknown, HasAudio: true}
+		// Nothing is known: send the file and let the player find out.
+		return Plan{Playable: Unknown, Method: Direct, HasAudio: true, AudioTrack: -1, Reasons: []string{}}
 	}
-	p := Plan{Direct: Yes, HasAudio: len(m.Audio) > 0}
+	p := Plan{Playable: Yes, Method: Direct, HasAudio: len(m.Audio) > 0, AudioTrack: -1, Reasons: []string{}}
 	if len(m.Video) == 0 {
-		return Plan{Direct: No, HasAudio: p.HasAudio, Reasons: []string{"This file has no picture track."}}
+		return Plan{Playable: No, Method: None, HasAudio: p.HasAudio, AudioTrack: -1, Reasons: []string{"This file has no picture track."}}
 	}
 	if c == nil || c.Containers == nil {
-		p.Direct = Unknown
+		p.Playable = Unknown
 		return p
 	}
-	if !c.Containers[m.Container] {
-		p.Reasons = append(p.Reasons, "It is packaged as "+containerName(m.Container)+", which this browser cannot open.")
+	natural := BrowserAudio(m.Audio)
+	if audioTrack < 0 || audioTrack >= len(m.Audio) {
+		audioTrack = natural
 	}
+	p.AudioTrack = audioTrack
+
 	v := m.Video[0]
 	key := v.Codec
 	if v.Codec == "hevc" && v.BitDepth > 8 {
 		key = "hevc10"
 	}
-	if !c.Video[key] {
-		p.Reasons = append(p.Reasons, "Its picture is "+VideoName(v)+", which this browser cannot play.")
+	if v.Codec == "h264" && v.BitDepth > 8 {
+		key = "h264-10"
 	}
-	if a := PickAudio(m.Audio); a != nil && !c.Audio[a.Codec] {
+	if !c.Video[key] {
+		return Plan{Playable: No, Method: None, HasAudio: p.HasAudio, AudioTrack: audioTrack,
+			Reasons: []string{"Its picture is " + VideoName(v) + ", which this browser cannot play. Converting the picture arrives in a later version."}}
+	}
+	var a *Track
+	if audioTrack >= 0 {
+		a = &m.Audio[audioTrack]
+	}
+	if !c.Containers[m.Container] {
+		p.Reasons = append(p.Reasons, "It is packaged as "+containerName(m.Container)+", which this browser cannot open.")
+	}
+	if a != nil && !c.Audio[a.Codec] {
 		p.Reasons = append(p.Reasons, "Its sound is "+AudioName(a.Codec)+", which this browser cannot play.")
 	}
-	if len(p.Reasons) > 0 {
-		p.Direct = No
+	if a != nil && audioTrack != natural {
+		p.Reasons = append(p.Reasons, "You chose a sound track other than the one a browser plays by itself.")
+	}
+	if len(p.Reasons) == 0 {
+		p.AudioCopy = true
+		return p
+	}
+	// The original cannot simply be sent. Can it be repackaged?
+	if !c.HLS {
+		p.Playable, p.Method = No, None
+		p.Reasons = append(p.Reasons, "This browser cannot play repackaged video either.")
+		return p
+	}
+	if !packagedVideo[v.Codec] {
+		return Plan{Playable: No, Method: None, HasAudio: p.HasAudio, AudioTrack: audioTrack,
+			Reasons: append(p.Reasons, "Its picture ("+VideoName(v)+") cannot be repackaged without converting it, which arrives in a later version.")}
+	}
+	p.Method = Remux
+	p.AudioCopy = a == nil || (c.Audio[a.Codec] && packagedAudio[a.Codec])
+	if !p.AudioCopy {
+		if !c.Audio["aac"] {
+			p.Playable, p.Method = No, None
+			p.Reasons = append(p.Reasons, "This browser reports no sound format the sound could be converted to.")
+			return p
+		}
+		p.Method = Audio
 	}
 	return p
 }
 
-// PickAudio chooses the track a player would start with: the default one
-// if it is not a commentary, else the first that is not a commentary.
-func PickAudio(tracks []Track) *Track {
+// BrowserAudio is the sound track a browser plays when simply handed the
+// file: the first one flagged as default, else the first. It returns -1
+// for a file with no sound.
+func BrowserAudio(tracks []Track) int {
 	for i := range tracks {
-		if tracks[i].Default && !tracks[i].Commentary {
-			return &tracks[i]
-		}
-	}
-	for i := range tracks {
-		if !tracks[i].Commentary {
-			return &tracks[i]
+		if tracks[i].Default {
+			return i
 		}
 	}
 	if len(tracks) > 0 {
-		return &tracks[0]
+		return 0
 	}
-	return nil
+	return -1
 }
 
 func containerName(c string) string {
@@ -184,4 +259,20 @@ func AudioName(codec string) string {
 		return "uncompressed sound (PCM)"
 	}
 	return strings.ToUpper(codec)
+}
+
+// Explain says in one plain sentence what the server is doing.
+func (p Plan) Explain() string {
+	switch p.Method {
+	case Direct:
+		if p.Playable == Unknown {
+			return "Sending the original file. It has not been inspected yet, so the app cannot say in advance whether this browser can play it."
+		}
+		return "Playing the original file, untouched."
+	case Remux:
+		return "Repackaging the file as it plays. Picture and sound are untouched, so nothing is lost, and it costs the PC almost nothing."
+	case Audio:
+		return "Repackaging the file and converting its sound as it plays. The picture is untouched; the sound becomes stereo AAC."
+	}
+	return "This browser cannot play this file yet."
 }

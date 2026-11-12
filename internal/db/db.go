@@ -180,6 +180,31 @@ CREATE INDEX files_pending ON files(probed) WHERE probed = 0;
 CREATE INDEX items_lookup ON items(lookup_state, kind);
 CREATE INDEX progress_recent ON progress(user_id, updated_at);
 `,
+	// 5: playing files a browser cannot take as they are. What each viewer
+	// prefers, what they last chose for a show (or a film), and where each
+	// file can be cut into chunks, which is worked out once and kept.
+	`
+CREATE TABLE prefs (
+  user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  audio_lang TEXT NOT NULL DEFAULT '',
+  sub_lang TEXT NOT NULL DEFAULT '',
+  subs TEXT NOT NULL DEFAULT 'auto'
+);
+CREATE TABLE track_memory (
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  scope_id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE,  -- the show, or the film itself
+  audio_lang TEXT NOT NULL DEFAULT '',
+  sub_lang TEXT NOT NULL DEFAULT '',
+  subs_on INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, scope_id)
+);
+CREATE TABLE cuts (
+  file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  stamp TEXT NOT NULL,   -- the file's size and date when the cuts were found
+  grid TEXT NOT NULL
+);
+`,
 }
 
 // SchemaVersion is the version this build expects.

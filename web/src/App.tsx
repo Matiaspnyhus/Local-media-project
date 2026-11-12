@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
-import { api, ApiError, type Folders, type Home, type Item, type PlayInfo, type Season, type Settings, type Show, type State, type UpdateStatus } from './api'
-import { measureCaps } from './caps'
+import { api, ApiError, type Folders, type Home, type Item, type Diagnostics, type PlayInfo, type Prefs, type Season, type Settings, type Show, type State, type UpdateStatus } from './api'
+import { builtInChunks, measureCaps } from './caps'
 
 type Screen = { name: 'library' } | { name: 'watch'; id: string } | { name: 'show'; id: string }
 
@@ -308,14 +308,13 @@ function Library({
             Export support bundle
           </a>
         )}
-        {isOwner && (
-          <button onClick={() => setShowSettings((v) => !v)} aria-expanded={showSettings}>
-            Settings
-          </button>
-        )}
+        <button onClick={() => setShowSettings((v) => !v)} aria-expanded={showSettings}>
+          Settings
+        </button>
         <button onClick={signOut}>Sign out</button>
       </div>
 
+      {showSettings && <PlaybackCard />}
       {showSettings && isOwner && <SettingsCard onChanged={load} />}
       {showSettings && isOwner && <UpdateCard />}
       {showConnect && (
@@ -744,16 +743,33 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
   const [error, setError] = useState('')
   const [problem, setProblem] = useState('')
   const [tryAnyway, setTryAnyway] = useState(false)
+  const [subKey, setSubKey] = useState('') // which subtitles are on; '' for none
   const videoRef = useRef<HTMLVideoElement | null>(null)
   const lastSent = useRef(0)
   const reported = useRef<Record<string, boolean>>({})
+  const carryOn = useRef<number | null>(null) // where to pick up after switching sound, in seconds
+  const first = useRef(true)
+  const chunkPlayer = useRef(false)
 
+  const load = useCallback(
+    (audio?: number) => {
+      api
+        .play(id, audio)
+        .then((p) => {
+          if (carryOn.current !== null) p.positionMs = Math.floor(carryOn.current * 1000)
+          carryOn.current = null
+          if (first.current) setSubKey(p.subtitles.find((s) => s.selected)?.key || '')
+          first.current = false
+          setInfo(p)
+        })
+        .catch((e: ApiError) => (e.status === 401 ? onSignedOut() : setError(e.message)))
+    },
+    [id, onSignedOut],
+  )
   useEffect(() => {
-    api
-      .play(id)
-      .then(setInfo)
-      .catch((e: ApiError) => (e.status === 401 ? onSignedOut() : setError(e.message)))
-  }, [id, onSignedOut])
+    first.current = true
+    load()
+  }, [load])
 
   const report = useCallback(
     (kind: string, detail: string) => {
@@ -787,13 +803,104 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     }
   }, [save])
 
+  const showPlayer = !!info && (info.plan.playable !== 'no' || tryAnyway)
+
+  // Hand the address to the player. The original file, and a list of
+  // chunks where the browser plays those by itself (Safari, every iPhone),
+  // go straight in. Elsewhere the chunks are played by hls.js, which is
+  // only downloaded when it is needed.
+  useEffect(() => {
+    const v = videoRef.current
+    if (!info || !showPlayer || !v) return
+    const token = info.hls
+    const stop = () => token && api.hlsStop(token)
+    window.addEventListener('pagehide', stop)
+    chunkPlayer.current = false
+    if (!token || builtInChunks()) {
+      v.src = info.url
+      return () => {
+        window.removeEventListener('pagehide', stop)
+        stop()
+        v.removeAttribute('src')
+        v.load()
+      }
+    }
+    chunkPlayer.current = true
+    let gone = false
+    let player: { destroy: () => void } | null = null
+    import('hls.js/light')
+      .then(({ default: Hls }) => {
+        if (gone) return
+        const hls = new Hls({
+          // Resume, unless that would land in the last few seconds.
+          startPosition: info.positionMs > 0 && info.positionMs < info.durationMs - 5000 ? info.positionMs / 1000 : -1,
+          maxBufferLength: 30,
+          maxMaxBufferLength: 60,
+        })
+        player = hls
+        let recovered = false
+        hls.on(Hls.Events.ERROR, (_e, data) => {
+          if (!data.fatal) return
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recovered) {
+            recovered = true
+            hls.recoverMediaError()
+            return
+          }
+          setProblem('This film stopped while it was being repackaged for this browser. Go back and try again; if it keeps happening, export a support bundle.')
+          report('convert-error', `${info.container} ${info.plan.method} ${data.type} ${data.details}`)
+        })
+        hls.loadSource(info.url)
+        hls.attachMedia(v)
+      })
+      .catch(() => setProblem('The part of the app that plays repackaged video could not be loaded. Reload the page and try again.'))
+    return () => {
+      gone = true
+      window.removeEventListener('pagehide', stop)
+      if (player) player.destroy()
+      stop()
+    }
+  }, [info, showPlayer, report])
+
+  // Switch the chosen subtitles on and every other off. A track that is
+  // off is not even downloaded.
+  useEffect(() => {
+    const v = videoRef.current
+    if (!info || !showPlayer || !v) return
+    const apply = () => {
+      for (let i = 0; i < v.textTracks.length; i++) {
+        const want = info.subtitles[i] && info.subtitles[i].key === subKey ? 'showing' : 'disabled'
+        if (v.textTracks[i].mode !== want) v.textTracks[i].mode = want
+      }
+    }
+    apply()
+    v.addEventListener('loadedmetadata', apply)
+    return () => v.removeEventListener('loadedmetadata', apply)
+  }, [info, showPlayer, subKey])
+
+  const remember = (audioIndex: number, sub: string) => {
+    if (!info) return
+    const s = info.subtitles.find((x) => x.key === sub)
+    api.choice(id, info.audio[audioIndex]?.language || '', s?.language || '', !!s)
+  }
+  const pickAudio = (index: number) => {
+    const v = videoRef.current
+    carryOn.current = v && v.currentTime > 0 ? v.currentTime : null
+    remember(index, subKey)
+    load(index)
+  }
+  const pickSub = (key: string) => {
+    setSubKey(key)
+    remember(info ? info.plan.audioTrack : -1, key)
+  }
+
   const onLoaded = () => {
     const v = videoRef.current
     if (!v || !info) return
-    if (info.positionMs > 0 && info.positionMs / 1000 < v.duration - 5) v.currentTime = info.positionMs / 1000
+    // hls.js was told where to start; everything else is told here.
+    if (!chunkPlayer.current && info.positionMs > 0 && info.positionMs / 1000 < v.duration - 5) v.currentTime = info.positionMs / 1000
     if (v.videoWidth === 0) {
       setProblem(
-        "This browser can play this file's sound but not its picture. Converting such files arrives in a later version (M4).",
+        "This browser can play this file's sound but not its picture. Converting the picture of such files arrives in a later version (M4).",
       )
       report('no-picture', `${info.container} videoWidth=0`)
     }
@@ -803,12 +910,11 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     save(false)
     const v = videoRef.current as (HTMLVideoElement & { webkitAudioDecodedByteCount?: number }) | null
     // Chrome can tell us that no sound has been decoded: the usual sign of
-    // Dolby or DTS sound, which Chrome cannot play.
-    // Only when the server could not tell us: if it inspected the file it
-    // already knows whether there is sound, and said so before playing.
+    // Dolby or DTS sound, which Chrome cannot play. Only when the server
+    // could not tell us: a file it has inspected is handled before playing.
     if (v && info?.plan.hasAudio === null && v.currentTime > 3 && v.webkitAudioDecodedByteCount === 0 && !v.muted) {
       setProblem(
-        "If you hear no sound: this file's sound format (probably Dolby or DTS) is one this browser cannot play. Converting it arrives in a later version (M3).",
+        'If you hear no sound: this file has not been inspected yet, so the app could not tell that its sound (probably Dolby or DTS) needs converting for this browser. Go back and try again in a minute.',
       )
       report('no-sound', `${info?.container} webkitAudioDecodedByteCount=0`)
     }
@@ -816,11 +922,12 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
 
   const onError = () => {
     const v = videoRef.current
+    if (chunkPlayer.current) return // hls.js reports its own errors, with more detail
     const code = v?.error?.code || 0
     setProblem(
-      'This browser cannot play this file by itself. That is expected for many files in this early version; converting them arrives in a later version (M3).',
+      'This browser could not play this file. If the app said it could, that is a mistake worth reporting: export a support bundle from the library page.',
     )
-    report('play-error', `${info?.container} ${mediaErrors[code] || 'code ' + code} ${v?.error?.message || ''}`.trim())
+    report('play-error', `${info?.container} ${info?.plan.method} ${mediaErrors[code] || 'code ' + code} ${v?.error?.message || ''}`.trim())
   }
 
   return (
@@ -831,36 +938,187 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       </div>
       {error && <p className="error" role="alert">{error}</p>}
       {problem && <p className="note" role="alert" data-testid="play-problem">{problem}</p>}
-      {info && info.plan.direct === 'no' && !tryAnyway && (
+      {info && info.plan.playable === 'no' && !tryAnyway && (
         <div className="card" role="alert" data-testid="play-problem">
-          <p>This browser cannot play this file as it is.</p>
+          <p>This browser cannot play this file yet.</p>
           <ul>
             {info.plan.reasons.map((r) => (
               <li key={r}>{r}</li>
             ))}
           </ul>
-          <p className="dim">
-            Converting files like this one while you watch arrives in a later version (M3). Another browser or device
-            may be able to play it today.
-          </p>
+          <p className="dim">Another browser or device may be able to play it today.</p>
           <button onClick={() => setTryAnyway(true)}>Try anyway</button>
         </div>
       )}
-      {info && (info.plan.direct !== 'no' || tryAnyway) && (
-        <video
-          ref={videoRef}
-          src={info.url}
-          controls
-          autoPlay
-          playsInline
-          preload="metadata"
-          onLoadedMetadata={onLoaded}
-          onTimeUpdate={onTime}
-          onPause={() => save(true)}
-          onEnded={() => save(true)}
-          onError={onError}
-        />
+      {info && showPlayer && (
+        <>
+          <video
+            ref={videoRef}
+            controls
+            autoPlay
+            playsInline
+            preload="metadata"
+            data-method={info.plan.method}
+            onLoadedMetadata={onLoaded}
+            onTimeUpdate={onTime}
+            onPause={() => save(true)}
+            onEnded={() => save(true)}
+            onError={onError}
+          >
+            {info.subtitles.map((s) => (
+              <track key={s.key} kind="subtitles" src={s.url} srcLang={s.language || 'und'} label={s.label} />
+            ))}
+          </video>
+          <div className="bar picks">
+            {info.audio.length > 1 && (
+              <label>
+                Sound{' '}
+                <select data-testid="pick-sound" value={info.plan.audioTrack} onChange={(e) => pickAudio(Number(e.target.value))}>
+                  {info.audio.map((a) => (
+                    <option key={a.index} value={a.index}>
+                      {a.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {info.subtitles.length > 0 && (
+              <label>
+                Subtitles{' '}
+                <select data-testid="pick-subtitles" value={subKey} onChange={(e) => pickSub(e.target.value)}>
+                  <option value="">Off</option>
+                  {info.subtitles.map((s) => (
+                    <option key={s.key} value={s.key}>
+                      {s.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
+          </div>
+          {info.pictureSubtitles > 0 && (
+            <p className="dim">
+              This file also has {info.pictureSubtitles} subtitle {info.pictureSubtitles === 1 ? 'track' : 'tracks'} stored as pictures
+              (as on discs). Showing those arrives in a later version (M4).
+            </p>
+          )}
+          <details className="how" data-testid="how-playing">
+            <summary>{info.plan.method === 'direct' ? 'How is this playing?' : 'Why is this converting?'}</summary>
+            <p data-testid="how-text">{info.explain}</p>
+            {info.plan.reasons.length > 0 && (
+              <>
+                <p className="dim">Why the original file is not simply sent to this browser:</p>
+                <ul>
+                  {info.plan.reasons.map((r) => (
+                    <li key={r}>{r}</li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </details>
+        </>
       )}
     </main>
+  )
+}
+
+const LANGUAGES: [string, string][] = [
+  ['en', 'English'], ['no', 'Norwegian'], ['sv', 'Swedish'], ['da', 'Danish'], ['fi', 'Finnish'], ['de', 'German'],
+  ['fr', 'French'], ['es', 'Spanish'], ['it', 'Italian'], ['pt', 'Portuguese'], ['nl', 'Dutch'], ['pl', 'Polish'],
+  ['ja', 'Japanese'], ['ko', 'Korean'], ['zh', 'Chinese'],
+]
+
+// PlaybackCard holds each viewer's own sound and subtitle preferences, and
+// says what this device and this PC can do: the facts behind every
+// "why is this converting?".
+function PlaybackCard() {
+  const [prefs, setPrefs] = useState<Prefs | null>(null)
+  const [diag, setDiag] = useState<Diagnostics | null>(null)
+  const [msg, setMsg] = useState('')
+  useEffect(() => {
+    api.prefs().then(setPrefs).catch(() => undefined)
+    api.diagnostics().then(setDiag).catch(() => undefined)
+  }, [])
+  if (!prefs) return null
+  const save = (p: Prefs) => {
+    setPrefs(p)
+    api
+      .setPrefs(p)
+      .then(() => setMsg('Saved.'))
+      .catch((e: ApiError) => setMsg(e.message))
+  }
+  const list = (m: Record<string, boolean> | undefined) =>
+    Object.keys(m || {})
+      .filter((k) => m![k])
+      .join(', ') || 'none'
+  return (
+    <div className="card" data-testid="playback-card">
+      <h2 style={{ marginTop: 0 }}>Sound and subtitles</h2>
+      <p className="dim">
+        Your own choices, used wherever you sign in. What you pick while watching is remembered for that show or film.
+      </p>
+      <p>
+        <label>
+          Sound in{' '}
+          <select data-testid="pref-sound" value={prefs.audioLang} onChange={(e) => save({ ...prefs, audioLang: e.target.value })}>
+            <option value="">whatever the file marks as its main sound</option>
+            {LANGUAGES.map(([code, name]) => (
+              <option key={code} value={code}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </p>
+      <p>
+        <label>
+          Subtitles in{' '}
+          <select data-testid="pref-subtitles" value={prefs.subLang} onChange={(e) => save({ ...prefs, subLang: e.target.value })}>
+            <option value="">the same language as the sound</option>
+            {LANGUAGES.map(([code, name]) => (
+              <option key={code} value={code}>
+                {name}
+              </option>
+            ))}
+          </select>
+        </label>
+      </p>
+      <p>
+        <label>
+          Show subtitles{' '}
+          <select data-testid="pref-when" value={prefs.subs} onChange={(e) => save({ ...prefs, subs: e.target.value as Prefs['subs'] })}>
+            <option value="auto">when the sound is in another language</option>
+            <option value="always">always</option>
+            <option value="off">never</option>
+          </select>
+        </label>
+      </p>
+      {msg && <p className="dim" role="status">{msg}</p>}
+      {diag && (
+        <details className="how" data-testid="diagnostics">
+          <summary>What this device can play</summary>
+          <p>
+            {diag.converter
+              ? 'This PC can repackage files, and convert their sound, for devices that cannot play them as they are.'
+              : 'This PC has no converter (ffmpeg was not found beside the program), so only files a device can play as they are will play.'}
+            {diag.running > 0 && ` Being converted right now: ${diag.running}.`}
+          </p>
+          {diag.device ? (
+            <ul>
+              <li>File types it opens: {list(diag.device.containers)}</li>
+              <li>Picture formats: {list(diag.device.video)}</li>
+              <li>Sound formats: {list(diag.device.audio)}</li>
+              <li>
+                Repackaged video:{' '}
+                {!diag.device.hls ? 'no' : builtInChunks() ? 'yes, built into this browser' : "yes, through the app's own player"}
+              </li>
+            </ul>
+          ) : (
+            <p className="dim">This device has not reported what it can play yet. Reload the page.</p>
+          )}
+          <p className="dim">The support bundle includes this list for each device that has signed in.</p>
+        </details>
+      )}
+    </div>
   )
 }

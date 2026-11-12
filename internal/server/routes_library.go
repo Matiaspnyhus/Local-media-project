@@ -32,6 +32,7 @@ type itemView struct {
 	PositionMs int64    `json:"positionMs"`
 	Played     bool     `json:"played"`
 	Playable   string   `json:"playable"` // yes, no, unknown
+	Method     string   `json:"method"`   // direct, remux, audio, none
 	Reasons    []string `json:"reasons"`
 	Overview   string   `json:"overview,omitempty"`
 	Poster     bool     `json:"poster"`
@@ -39,7 +40,6 @@ type itemView struct {
 	fileID    string
 	probed    bool
 	updatedAt int64
-	hasAudio  any
 }
 
 // Display is the name shown above the player.
@@ -82,8 +82,25 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		s.caps = map[string]*playback.Caps{}
 	}
 	s.caps[u.SessionID] = &c
+	if s.capsUA == nil || len(s.capsUA) > 5000 {
+		s.capsUA = map[string]string{}
+	}
+	s.capsUA[u.SessionID] = r.UserAgent()
 	s.capsMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// deviceReports lists, for the support bundle, what each signed-in device
+// said it can play, with the browser's own description of itself. No
+// names, addresses or sign-in details.
+func (s *Server) deviceReports() []map[string]any {
+	s.capsMu.Lock()
+	defer s.capsMu.Unlock()
+	out := []map[string]any{}
+	for id, c := range s.caps {
+		out = append(out, map[string]any{"browser": s.capsUA[id], "canPlay": c})
+	}
+	return out
 }
 
 // applyOverrides corrects the cases where a browser is known to claim more
@@ -186,16 +203,14 @@ func (s *Server) decide(u *User, items []itemView) error {
 		}
 		rows.Close()
 	}
-	caps := s.capsFor(u)
+	caps := s.playCaps(u)
 	for i := range items {
 		m := tracks[items[i].fileID]
-		plan := playback.Decide(*m, caps)
-		items[i].Playable = string(plan.Direct)
+		plan := playback.Decide(*m, caps, -1)
+		items[i].Playable = string(plan.Playable)
+		items[i].Method = string(plan.Method)
 		if plan.Reasons != nil {
 			items[i].Reasons = plan.Reasons
-		}
-		if m.Probed {
-			items[i].hasAudio = plan.HasAudio
 		}
 	}
 	return nil

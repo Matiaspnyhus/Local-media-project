@@ -51,12 +51,16 @@ type Result struct {
 
 // Find locates ffprobe: the LOCALMEDIA_FFPROBE variable, then beside the
 // program, then on the PATH. It returns "" when there is none.
-func Find() string {
-	name := "ffprobe"
+func Find() string { return find("ffprobe", "LOCALMEDIA_FFPROBE") }
+
+// FindFFmpeg locates ffmpeg, the converter, the same way.
+func FindFFmpeg() string { return find("ffmpeg", "LOCALMEDIA_FFMPEG") }
+
+func find(name, env string) string {
 	if runtime.GOOS == "windows" {
 		name += ".exe"
 	}
-	if p := os.Getenv("LOCALMEDIA_FFPROBE"); p != "" {
+	if p := os.Getenv(env); p != "" {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}

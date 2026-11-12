@@ -105,13 +105,55 @@ export interface Folders {
   parent: string
   dirs: { name: string; path: string }[]
 }
+export interface AudioTrack {
+  index: number
+  label: string
+  language: string
+  selected: boolean
+}
+export interface SubtitleTrack {
+  key: string
+  label: string
+  language: string
+  forced: boolean
+  selected: boolean
+  url: string
+}
 export interface PlayInfo {
   title: string
   url: string
   mimeType: string
   container: string
   positionMs: number
-  plan: { direct: 'yes' | 'no' | 'unknown'; reasons: string[]; hasAudio: boolean | null }
+  durationMs: number
+  // Set when the film reaches the player as a list of chunks (repackaged,
+  // perhaps with its sound converted) rather than as the original file.
+  hls?: string
+  explain: string
+  plan: {
+    playable: 'yes' | 'no' | 'unknown'
+    method: 'direct' | 'remux' | 'audio' | 'none'
+    reasons: string[]
+    hasAudio: boolean | null
+    audioTrack: number
+    audioCopy: boolean
+  }
+  audio: AudioTrack[]
+  subtitles: SubtitleTrack[]
+  pictureSubtitles: number
+}
+export interface Prefs {
+  audioLang: string
+  subLang: string
+  subs: 'auto' | 'always' | 'off'
+}
+export interface Diagnostics {
+  device: Caps | null
+  inspector: boolean
+  converter: boolean
+  running: number
+  open: number
+  userAgent: string
 }
 export interface Scan {
   added: number
@@ -123,6 +165,7 @@ export interface Caps {
   containers: Record<string, boolean>
   video: Record<string, boolean>
   audio: Record<string, boolean>
+  hls: boolean
 }
 
 export const api = {
@@ -147,7 +190,24 @@ export const api = {
   setAutoUpdate: (on: boolean) => call<{ ok: boolean }>('PUT', '/api/settings/auto-update', { on }),
   health: () => call<{ status: string; version: string }>('GET', '/health'),
   capabilities: (c: Caps) => call<{ ok: boolean }>('POST', '/api/capabilities', c),
-  play: (id: string) => call<PlayInfo>('POST', `/api/items/${id}/play`),
+  play: (id: string, audio?: number) =>
+    call<PlayInfo>('POST', `/api/items/${id}/play`, audio === undefined ? {} : { audio }),
+  choice: (id: string, audioLang: string, subLang: string, subsOn: boolean) =>
+    call<{ ok: boolean }>('PUT', `/api/items/${id}/choice`, { audioLang, subLang, subsOn }).catch(() => undefined),
+  // Tells the PC to stop converting at once. Sent in a way that still
+  // goes out while the page is being closed.
+  hlsStop: (token: string) => {
+    fetch(`/api/hls/${token}/stop`, {
+      method: 'POST',
+      headers: { 'X-Requested-With': 'localmedia', 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: '{}',
+      keepalive: true,
+    }).catch(() => undefined)
+  },
+  prefs: () => call<Prefs>('GET', '/api/prefs'),
+  setPrefs: (p: Prefs) => call<Prefs>('PUT', '/api/prefs', p),
+  diagnostics: () => call<Diagnostics>('GET', '/api/diagnostics'),
   progress: (id: string, positionMs: number, durationMs: number) =>
     call<{ ok: boolean }>('PUT', `/api/items/${id}/progress`, { positionMs, durationMs }),
   connect: () => call<{ urls: string[] }>('GET', '/api/connect'),

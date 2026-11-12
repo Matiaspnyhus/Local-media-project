@@ -148,3 +148,34 @@ Getting there needed three things: each episode now stores its show directly (sc
 - Updates download from the project's release page, which only answers without a login once the repository is public.
 - Publishing a release means pushing a version tag, which is outside the one branch the build environment may push to.
 Until both are settled the updater has nothing to fetch; the settings screen says so in plain words.
+
+## 2026-11-12: M3 — plays most things
+
+**What exists now.** A file a device cannot play as it is no longer stops at "this browser cannot play this file". If its picture is one the device can show (H.264, HEVC or AV1), the file is repackaged while it plays, and its sound is converted to stereo AAC when the device cannot play the sound either. The picture is never touched in this milestone. Sound tracks and text subtitles can be chosen in the player, the choice is remembered for the show (or the film), each viewer has their own language preferences, and a panel under the player says in one sentence what is being done and why.
+
+**How it works** (`internal/playback` decides, `internal/hls` does it):
+
+1. The decision is still a pure function: play the original, repackage, repackage and convert the sound, or cannot play. 1,890 combinations of file and device are checked against rules that must always hold, plus track-choice cases (commentary, a dub in another language, forced subtitles, a remembered choice).
+2. The player is given a list of chunks for the whole film at once, so the timeline is complete and it can jump anywhere. ffmpeg is started at the chunk the player asks for; a jump beyond what it has made restarts it there.
+3. **The server cuts the chunks itself.** ffmpeg writes one continuous stream (a fragment per key frame), and the server puts each fragment into the chunk its start time belongs to. Where the cuts are is decided beforehand from the film's real key frames (`hls.FindCuts`), so a chunk holds exactly the same frames whether ffmpeg played through to it or was started there.
+
+**Why the server cuts, which is a change from the first design.** The first version let ffmpeg's own chunk writer do the cutting, with a list that assumed a cut every 6 seconds. Tests against the real ffmpeg showed two faults: a run started after a jump wrote its times from zero and a different header, and its chunks began at whatever key frame was nearest, up to several seconds from where the list said. A player trusts the list for the first chunk it fetches, so after resuming or jumping the whole timeline would have been off by that much: subtitles out of step and resume positions wrong. Cutting on known key frames makes the list exact. `TestEveryChunkBeginsWhereTheListSays` checks every chunk both ways, with copied and with converted sound, on a film with irregular key frames.
+
+**Choices.**
+- *Finding the key frames.* ffprobe is asked to jump to every sixth second and report the key frame it lands on (the same jump ffmpeg makes later). 1,200 jumps took 0.1 seconds on a fast disk; on a slow hard disk a long film may take several seconds, once. The result is kept in the database (`cuts`), tied to the file's size and date. Reading the key-frame index of MKV files directly would make this instant; not done, worth doing if the owner's support bundle shows slow first starts.
+- *One second is added to every time ffmpeg writes.* Sound often starts a few hundredths of a second before zero, which the chunk format cannot express. Players only use the differences, so it is invisible; it is the same in every run.
+- *The app's own player (hls.js) is used wherever it can run, except on Apple devices*, which play chunk lists themselves and always have. The end-to-end test found that the test browser (a recent Chromium) has started to play chunk lists itself; that path is new and untested by this project, so it is not used.
+- *One run's chunks are never mixed with another's*, and a restart deletes the earlier run's. Disk use per viewer is bounded: ffmpeg is made to wait when it is 50 chunks ahead, and chunks more than 20 behind the viewer are deleted.
+- *Stopping.* Leaving the player tells the server, which stops ffmpeg at once. If the browser simply vanishes, ffmpeg is stopped after 75 seconds without a request and its chunks deleted. Signing out stops everything for that sign-in. At start, anything a previous run left behind is deleted.
+- *Chunk addresses need no cookie* (phones and TVs fetch media with players that do not send one). They are reachable only through a random 128-bit token, die when their sign-in is signed out, and one sign-in can hold at most six films open.
+- *Subtitles are text only.* Files beside the video (.srt, .vtt) are converted by the server itself, whatever encoding they were saved in. Tracks inside the video are taken out by ffmpeg, sent to the browser while that happens, and kept for next time. Taking a track out means reading the whole file once, so on a long film the first use can lag behind a jump far ahead; the second use is instant. Picture subtitles (as on discs) and styled ones are M4.
+- *If the preferred sound track cannot be reached* (no converter on this PC, or the device cannot play repackaged video), the film plays with its own main track instead of not playing.
+- *ffmpeg.exe is now shipped* beside ffprobe.exe, from the same pinned build. The download grows accordingly. Linux and macOS test machines fetch the same version, checked against a fixed checksum, and a test that needs the converter fails rather than being skipped there.
+- *The page's security header* now allows media and helper scripts from `blob:` addresses, which is how hls.js hands video to the browser. Nothing else was loosened.
+
+**Departures from the plan, and what was not done.**
+- *No second player (mpv) in the tests.* The plan asks for headless mpv to play every test stream. mpv is not available in the build environment. In its place every produced stream is decoded from end to end by ffmpeg with errors fatal, which catches a broken stream but is not an independent player.
+- *The stricter numbers are checked on made-up films, not a library of real ones.* Picture and sound start within 50 ms at the beginning of a stream and within 100 ms at the start of any single chunk (sound comes in frames of about 23 ms and is not cut at exactly the same instant as the picture). Frame counts are compared exactly, which is stricter than the plan's "duration within 0.1 s".
+- *Built with a different ffmpeg than is shipped.* The build environment has ffmpeg 6.1; what ships is jellyfin-ffmpeg 8.1.3. The tests at GitHub run on the shipped version on all three systems.
+- *Files that start far from zero* (some TV recordings) are handled by design but not tested.
+- Still open from M1: the Chromium 87 check, and Huma/sqlc.

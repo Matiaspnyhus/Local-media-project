@@ -6,8 +6,8 @@
 //   E2E_BROWSER=webkit node e2e/run.mjs
 //
 // Needs the program built at ./localmedia (or LOCALMEDIA_BIN).
-import { spawn } from 'node:child_process'
-import { mkdtempSync, cpSync, rmSync, existsSync, mkdirSync, copyFileSync } from 'node:fs'
+import { spawn, spawnSync } from 'node:child_process'
+import { mkdtempSync, cpSync, rmSync, existsSync, mkdirSync, copyFileSync, writeFileSync } from 'node:fs'
 import { tmpdir, networkInterfaces } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -81,6 +81,17 @@ cpSync(join(here, 'fixtures'), media, { recursive: true })
 const season = join(media, 'TV', 'Good Show', 'Season 01')
 mkdirSync(season, { recursive: true })
 for (const n of [1, 2]) copyFileSync(join(here, 'fixtures', 'Test Clip.mp4'), join(season, `Good Show - S01E0${n}.mp4`))
+// From M3 the film with Dolby sound is played through the converter, so the
+// test needs ffmpeg, and a film long enough to jump around in: 40 seconds,
+// with subtitles in a file beside it.
+const ffmpeg = process.env.LOCALMEDIA_FFMPEG || 'ffmpeg'
+const made = spawnSync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
+  '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=24:duration=40', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=40',
+  '-c:v', 'libx264', '-preset', 'ultrafast', '-g', '48', '-pix_fmt', 'yuv420p', '-c:a', 'ac3', '-b:a', '96k',
+  join(media, 'Dolby.Sound.Test.mkv')], { encoding: 'utf8' })
+assert.equal(made.status, 0, `ffmpeg is needed for this test (set LOCALMEDIA_FFMPEG and LOCALMEDIA_FFPROBE, or put both on the PATH): ${made.error || made.stderr}`)
+writeFileSync(join(media, 'Dolby.Sound.Test.en.srt'),
+  '1\n00:00:00,500 --> 00:00:20,000\nThe subtitle is showing\n\n2\n00:00:20,000 --> 00:00:39,000\nStill in step after a jump\n')
 
 const server = spawn(bin, ['--data', data, '--port', String(port), '--no-browser'], { stdio: ['ignore', 'pipe', 'pipe'] })
 let serverLog = ''
@@ -193,19 +204,87 @@ try {
     await page.waitForSelector('text=Films (2)')
   })
 
-  if (browserName === 'chromium') {
-    await step('a file with Dolby sound says why it is silent', async () => {
-      // With the file inspector present the list already marks it; without
-      // one, the player notices while playing. Either way the page says why.
-      await focusByText(page, 'Dolby Sound Test')
-      await page.keyboard.press('Enter')
-      await page.waitForSelector('video, [data-testid=play-problem]')
-      await page.evaluate(() => document.querySelector('video')?.play().catch(() => {}))
-      await page.waitForSelector('[data-testid=play-problem]', { timeout: 20000 })
-      await page.goBack()
-      await page.waitForSelector('text=Films (2)')
+  // How many films the PC holds open for conversion.
+  const converters = () => page.evaluate(async () => (await (await fetch('/api/diagnostics')).json()).open)
+
+  await step('a film this browser cannot play as it is plays anyway: repackaged as it plays', async () => {
+    await focusByText(page, 'Dolby Sound Test')
+    await page.keyboard.press('Enter')
+    await waitPlaying(page, 2)
+    const v = await page.evaluate(() => {
+      const el = document.querySelector('video')
+      return { method: el.dataset.method, width: el.videoWidth, duration: el.duration, sound: el.webkitAudioDecodedByteCount }
     })
-  }
+    // Chromium cannot play Dolby sound, so it is converted. Safari's engine
+    // can, so there the file is only repackaged.
+    assert.ok(v.method === 'audio' || v.method === 'remux', `played by method ${v.method}`)
+    if (browserName === 'chromium') {
+      assert.equal(v.method, 'audio')
+      assert.ok(v.sound > 0, 'the converted sound is being decoded')
+    }
+    assert.equal(v.width, 320, 'the picture is decoded')
+    assert.ok(Math.abs(v.duration - 40) < 0.5, `the timeline is the whole film: ${v.duration}`)
+    const why = await page.textContent('[data-testid=how-text]')
+    assert.match(why, /Repackaging the file/)
+    assert.equal(await converters(), 1, 'the PC holds one film open for conversion')
+  })
+
+  await step('subtitles show, and are still in step after a jump far ahead', async () => {
+    await pressUntilFocused(page, '[data-testid=pick-subtitles]')
+    await page.keyboard.press('ArrowDown')
+    if ((await page.inputValue('[data-testid=pick-subtitles]')) === '') await page.selectOption('[data-testid=pick-subtitles]', { index: 1 })
+    const cue = () => page.evaluate(() => {
+      const t = document.querySelector('video').textTracks[0]
+      return t && t.mode === 'showing' && t.activeCues && t.activeCues.length ? t.activeCues[0].text : ''
+    })
+    await page.waitForFunction(() => {
+      const t = document.querySelector('video').textTracks[0]
+      return t && t.activeCues && t.activeCues.length > 0
+    }, null, { timeout: 15000 })
+    assert.equal(await cue(), 'The subtitle is showing')
+    const before = Date.now()
+    await page.evaluate(() => (document.querySelector('video').currentTime = 31))
+    await page.waitForFunction(() => document.querySelector('video').currentTime > 31.5, null, { timeout: 20000 })
+    console.log(`      (the jump took ${Date.now() - before} ms including half a second of playing)`)
+    assert.equal(await cue(), 'Still in step after a jump')
+    await page.evaluate(() => document.querySelector('video').pause())
+  })
+
+  await step('leaving the player stops the converter', async () => {
+    await focusByText(page, '← Back')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('text=Continue watching')
+    for (let i = 0; (await converters()) > 0; i++) {
+      assert.ok(i < 50, 'the film is still held open for conversion 5 seconds after leaving')
+      await new Promise((r) => setTimeout(r, 100))
+    }
+  })
+
+  await step('a repackaged film resumes where it stopped, with its subtitles', async () => {
+    const asked = []
+    const note = (r) => /\/hls\//.test(r.url()) && asked.push(r.url().split('/').pop())
+    page.on('request', note)
+    await focusByText(page, 'Dolby Sound Test')
+    await page.keyboard.press('Enter')
+    await waitPlaying(page, 30)
+    const v = await page.evaluate(() => {
+      const el = document.querySelector('video')
+      return { at: el.currentTime, from: el.buffered.length ? el.buffered.start(0) : -1, sub: document.querySelector('[data-testid=pick-subtitles]').value }
+    })
+    assert.ok(v.at >= 30 && v.at < 39, `resumed at ${v.at}`)
+    // The first chunk fetched is the one from 30 seconds; the player must
+    // place it exactly there, or everything after would be out of step.
+    page.off('request', note)
+    const ranges = await page.evaluate(() => {
+      const b = document.querySelector('video').buffered
+      return Array.from({ length: b.length }, (_, i) => `${b.start(i).toFixed(2)}-${b.end(i).toFixed(2)}`).join(' ')
+    })
+    console.log(`      (resumed at ${v.at.toFixed(2)} s; asked for ${asked.join(' ')}; holding ${ranges})`)
+    if (browserName === 'chromium') assert.ok(Math.abs(v.from - 30) < 0.25, `the chunk for 30 s was placed at ${v.from}`)
+    assert.notEqual(v.sub, '', 'the subtitle choice was remembered')
+    await page.goBack()
+    await page.waitForSelector('text=Films (2)')
+  })
 
   await step('a show: open it, finish episode 1, and episode 2 is next up', async () => {
     await focusByText(page, 'Shows (1)')
@@ -240,14 +319,22 @@ try {
   await step('the stream link stops working after signing out', async () => {
     const link = await page.evaluate(async () => {
       const items = (await (await fetch('/api/movies')).json()).items
-      const r = await fetch(`/api/items/${items[0].id}/play`, { method: 'POST', headers: { 'X-Requested-With': 'localmedia', 'Content-Type': 'application/json' }, body: '{}' })
-      return (await r.json()).url
+      const play = async (title) => {
+        const it = items.find((x) => x.title === title)
+        const r = await fetch(`/api/items/${it.id}/play`, { method: 'POST', headers: { 'X-Requested-With': 'localmedia', 'Content-Type': 'application/json' }, body: '{}' })
+        return (await r.json()).url
+      }
+      return { file: await play('Test Clip'), chunks: await play('Dolby Sound Test') }
     })
-    assert.equal((await fetch(base + link, { headers: { Range: 'bytes=0-9' } })).status, 206, 'link works with no cookie')
+    assert.match(link.file, /^\/stream\//)
+    assert.match(link.chunks, /^\/hls\//)
+    assert.equal((await fetch(base + link.file, { headers: { Range: 'bytes=0-9' } })).status, 206, 'the file link works with no cookie')
+    assert.equal((await fetch(base + link.chunks)).status, 200, 'the chunk list works with no cookie')
     await focusByText(page, 'Sign out')
     await page.keyboard.press('Enter')
     await page.waitForSelector('text=Sign in to Local Media')
-    assert.equal((await fetch(base + link)).status, 403)
+    assert.equal((await fetch(base + link.file)).status, 403)
+    assert.equal((await fetch(base + link.chunks)).status, 403)
   })
 
   await step('the support bundle downloads for the owner', async () => {

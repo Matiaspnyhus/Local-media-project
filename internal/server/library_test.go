@@ -197,19 +197,19 @@ func TestPlayableMarksFollowTheDeviceReport(t *testing.T) {
 		t.Fatal(w.Body)
 	}
 	it := get()
-	if it.Playable != "no" || len(it.Reasons) != 1 || !strings.Contains(it.Reasons[0], "Dolby Digital") {
+	if it.Playable != "no" || it.Method != "none" || len(it.Reasons) == 0 || !strings.Contains(it.Reasons[0], "Dolby Digital") {
 		t.Fatalf("in a browser without Dolby: %+v", it)
 	}
 	// The play call carries the same answer, and says the file has sound.
 	var p struct {
 		Plan struct {
-			Direct   string
+			Playable string
 			HasAudio *bool
 			Reasons  []string
 		}
 	}
 	decode(t, e.do("POST", "/api/items/"+film+"/play", remote, c, nil), &p)
-	if p.Plan.Direct != "no" || p.Plan.HasAudio == nil || !*p.Plan.HasAudio {
+	if p.Plan.Playable != "no" || p.Plan.HasAudio == nil || !*p.Plan.HasAudio {
 		t.Fatalf("play plan %+v", p.Plan)
 	}
 	// Another device, signed in separately, has its own answer.

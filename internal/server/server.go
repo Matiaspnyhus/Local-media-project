@@ -27,6 +27,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/Matiaspnyhus/Local-media-project/internal/auth"
+	"github.com/Matiaspnyhus/Local-media-project/internal/hls"
 	"github.com/Matiaspnyhus/Local-media-project/internal/library"
 	"github.com/Matiaspnyhus/Local-media-project/internal/metadata"
 	"github.com/Matiaspnyhus/Local-media-project/internal/playback"
@@ -74,6 +75,7 @@ type Config struct {
 	Assets  fs.FS // the built web app
 	LogOut  io.Writer
 	FFprobe string  // path to ffprobe; "" means files are not inspected
+	FFmpeg  string  // path to ffmpeg; "" means nothing can be repackaged or converted
 	Update  Updater // nil when this copy cannot update itself
 }
 
@@ -91,6 +93,8 @@ type Server struct {
 	events     *eventLog
 	scanMu     sync.Mutex
 	ffprobe    string
+	ffmpeg     string
+	hls        *hls.Manager // nil when there is no ffmpeg
 	inspectMu  sync.Mutex
 	inspecting atomic.Bool
 	background sync.WaitGroup
@@ -102,6 +106,7 @@ type Server struct {
 	newTMDB func(key string) *metadata.Client
 	capsMu  sync.Mutex
 	caps    map[string]*playback.Caps // by session
+	capsUA  map[string]string         // by session: how the browser describes itself
 	ctx     context.Context
 	stop    context.CancelFunc
 	handler http.Handler
@@ -142,6 +147,13 @@ func New(cfg Config) (*Server, error) {
 	if s.linkKey, err = s.loadOrCreateKey("link_key"); err != nil {
 		return nil, err
 	}
+	if cfg.FFmpeg != "" {
+		s.ffmpeg = cfg.FFmpeg
+		if s.hls, err = hls.New(cfg.FFmpeg, filepath.Join(cfg.DataDir, "cache", "chunks")); err != nil {
+			return nil, err
+		}
+		s.hls.Log = s.log.Printf
+	}
 	var users int
 	if err := s.db.QueryRow(`SELECT count(*) FROM users`).Scan(&users); err != nil {
 		return nil, err
@@ -174,6 +186,9 @@ func checkRoutes(routes []Route) error {
 // Close releases the log file. The database belongs to the caller.
 func (s *Server) Close() error {
 	s.stop()
+	if s.hls != nil {
+		s.hls.Close() // stops every conversion and removes its chunks
+	}
 	s.background.Wait() // let running inspection and lookups notice
 	return s.log.file.Close()
 }
@@ -286,7 +301,7 @@ func (s *Server) guard(rt Route) http.HandlerFunc {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("X-Frame-Options", "DENY")
-		h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; media-src 'self'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
+		h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
 
 		local := isLoopback(r)
 		// Until the owner has finished setup, the server answers only the

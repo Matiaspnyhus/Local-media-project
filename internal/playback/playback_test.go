@@ -1,11 +1,12 @@
 package playback
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
 
-func caps(containers, video, audio string) *Caps {
+func caps(hls bool, containers, video, audio string) *Caps {
 	set := func(s string) map[string]bool {
 		m := map[string]bool{}
 		for _, k := range strings.Fields(s) {
@@ -13,16 +14,17 @@ func caps(containers, video, audio string) *Caps {
 		}
 		return m
 	}
-	return &Caps{Containers: set(containers), Video: set(video), Audio: set(audio)}
+	return &Caps{Containers: set(containers), Video: set(video), Audio: set(audio), HLS: hls}
 }
 
 // What the browsers this project targets report, as measured or documented.
-var (
-	chrome  = caps("mp4 mov webm matroska", "h264 vp9 vp8 av1", "aac mp3 opus flac vorbis")
-	chromeH = caps("mp4 mov webm matroska", "h264 hevc hevc10 vp9 vp8 av1", "aac mp3 opus flac vorbis")
-	safari  = caps("mp4 mov", "h264 hevc hevc10", "aac mp3 ac3 eac3 flac")
-	firefox = caps("mp4 mov webm", "h264 vp9 vp8 av1", "aac mp3 opus flac vorbis")
-)
+var devices = map[string]*Caps{
+	"chrome":      caps(true, "mp4 mov webm matroska", "h264 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
+	"chrome+hevc": caps(true, "mp4 mov webm matroska", "h264 hevc hevc10 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
+	"safari":      caps(true, "mp4 mov", "h264 hevc hevc10", "aac mp3 ac3 eac3 flac"),
+	"firefox":     caps(true, "mp4 mov webm", "h264 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
+	"old-tv":      caps(false, "mp4", "h264", "aac mp3"),
+}
 
 func media(container, video string, depth int, audio ...string) Media {
 	m := Media{Probed: true, Container: container}
@@ -37,90 +39,191 @@ func media(container, video string, depth int, audio ...string) Media {
 
 func TestDecide(t *testing.T) {
 	cases := []struct {
-		name   string
-		m      Media
-		c      *Caps
-		want   Answer
-		reason string // a phrase each "no" must contain
+		name, device string
+		m            Media
+		want         Method
+		reason       string // a phrase the reasons must contain ("" = no reasons)
 	}{
-		{"mp4 h264 aac in chrome", media("mp4", "h264", 8, "aac"), chrome, Yes, ""},
-		{"mp4 h264 aac in safari", media("mp4", "h264", 8, "aac"), safari, Yes, ""},
-		{"mp4 h264 aac in firefox", media("mp4", "h264", 8, "aac"), firefox, Yes, ""},
-		{"iphone video (mov hevc aac) in safari", media("mov", "hevc", 8, "aac"), safari, Yes, ""},
-		{"iphone video in chrome without hevc", media("mov", "hevc", 8, "aac"), chrome, No, "HEVC"},
-		{"iphone video in chrome with hevc", media("mov", "hevc", 8, "aac"), chromeH, Yes, ""},
-		{"mkv h264 aac in chrome", media("matroska", "h264", 8, "aac"), chrome, Yes, ""},
-		{"mkv h264 aac in safari", media("matroska", "h264", 8, "aac"), safari, No, "MKV"},
-		{"mkv h264 aac in firefox", media("matroska", "h264", 8, "aac"), firefox, No, "MKV"},
-		{"mkv h264 ac3 in chrome", media("matroska", "h264", 8, "ac3"), chrome, No, "Dolby Digital"},
-		{"mp4 h264 ac3 in safari", media("mp4", "h264", 8, "ac3"), safari, Yes, ""},
-		{"mp4 h264 eac3 in safari", media("mp4", "h264", 8, "eac3"), safari, Yes, ""},
-		{"mp4 h264 eac3 in chrome", media("mp4", "h264", 8, "eac3"), chrome, No, "Dolby Digital Plus"},
-		{"mkv h264 dts in chrome", media("matroska", "h264", 8, "dts"), chrome, No, "DTS"},
-		{"mkv hevc10 truehd in safari", media("matroska", "hevc", 10, "truehd"), safari, No, "TrueHD"},
-		{"mp4 hevc10 aac in safari", media("mp4", "hevc", 10, "aac"), safari, Yes, ""},
-		{"mp4 hevc10 aac in chrome with 8-bit hevc only", media("mp4", "hevc", 10, "aac"), caps("mp4", "h264 hevc", "aac"), No, "10-bit HEVC"},
-		{"mp4 av1 opus in chrome", media("mp4", "av1", 8, "opus"), chrome, Yes, ""},
-		{"mp4 av1 aac in safari without av1", media("mp4", "av1", 8, "aac"), safari, No, "AV1"},
-		{"webm vp9 opus in chrome", media("webm", "vp9", 8, "opus"), chrome, Yes, ""},
-		{"webm vp9 opus in safari", media("webm", "vp9", 8, "opus"), safari, No, "WebM"},
-		{"avi xvid mp3 anywhere", media("avi", "mpeg4", 8, "mp3"), chrome, No, "AVI"},
-		{"avi xvid mp3 names the picture too", media("avi", "mpeg4", 8, "mp3"), chrome, No, "DivX"},
-		{"wmv anywhere", media("asf", "wmv3", 8, "wmav2"), chrome, No, "WMV"},
-		{"mpeg2 ts", media("mpegts", "mpeg2video", 8, "mp2"), chrome, No, "MPEG-2"},
-		{"silent clip plays and is known to be silent", media("mp4", "h264", 8), chrome, Yes, ""},
-		{"sound only", media("mp4", "", 0, "aac"), chrome, No, "no picture"},
-		{"mkv with flac in chrome", media("matroska", "h264", 8, "flac"), chrome, Yes, ""},
-		{"10-bit h264 is not claimed playable when the browser lacks it", media("matroska", "h264", 10, "aac"), caps("matroska", "", "aac"), No, "10-bit H.264"},
+		{"mp4 h264 aac", "chrome", media("mp4", "h264", 8, "aac"), Direct, ""},
+		{"mp4 h264 aac", "safari", media("mp4", "h264", 8, "aac"), Direct, ""},
+		{"mp4 h264 aac", "firefox", media("mp4", "h264", 8, "aac"), Direct, ""},
+		{"mp4 h264 aac", "old-tv", media("mp4", "h264", 8, "aac"), Direct, ""},
+		{"iphone video (mov hevc aac)", "safari", media("mov", "hevc", 8, "aac"), Direct, ""},
+		{"iphone video", "chrome", media("mov", "hevc", 8, "aac"), None, "HEVC"},
+		{"iphone video", "chrome+hevc", media("mov", "hevc", 8, "aac"), Direct, ""},
+		{"mkv h264 aac", "chrome", media("matroska", "h264", 8, "aac"), Direct, ""},
+		// The owner's iPhone: Safari cannot open MKV, so it is repackaged.
+		{"mkv h264 aac", "safari", media("matroska", "h264", 8, "aac"), Remux, "MKV"},
+		{"mkv h264 aac", "firefox", media("matroska", "h264", 8, "aac"), Remux, "MKV"},
+		{"mkv h264 aac", "old-tv", media("matroska", "h264", 8, "aac"), None, "repackaged"},
+		// Dolby in Chrome: only the sound is converted.
+		{"mkv h264 ac3", "chrome", media("matroska", "h264", 8, "ac3"), Audio, "Dolby Digital"},
+		{"mp4 h264 eac3", "chrome", media("mp4", "h264", 8, "eac3"), Audio, "Dolby Digital Plus"},
+		// Dolby in Safari: MKV is repackaged and the Dolby sound is kept.
+		{"mkv h264 ac3", "safari", media("matroska", "h264", 8, "ac3"), Remux, "MKV"},
+		{"mkv h264 eac3", "safari", media("matroska", "h264", 8, "eac3"), Remux, "MKV"},
+		{"mp4 h264 ac3", "safari", media("mp4", "h264", 8, "ac3"), Direct, ""},
+		{"mkv h264 dts", "chrome", media("matroska", "h264", 8, "dts"), Audio, "DTS"},
+		{"mkv h264 dts", "safari", media("matroska", "h264", 8, "dts"), Audio, "DTS"},
+		{"mkv h264 truehd", "firefox", media("matroska", "h264", 8, "truehd"), Audio, "TrueHD"},
+		{"mkv hevc10 truehd", "safari", media("matroska", "hevc", 10, "truehd"), Audio, "TrueHD"},
+		{"mkv hevc10 eac3", "safari", media("matroska", "hevc", 10, "eac3"), Remux, "MKV"},
+		{"mp4 hevc10 aac", "safari", media("mp4", "hevc", 10, "aac"), Direct, ""},
+		{"mkv hevc10 aac", "chrome", media("matroska", "hevc", 10, "aac"), None, "10-bit HEVC"},
+		{"mp4 hevc10 aac, 8-bit hevc only", "", media("mp4", "hevc", 10, "aac"), None, "10-bit HEVC"},
+		{"mp4 av1 opus", "chrome", media("mp4", "av1", 8, "opus"), Direct, ""},
+		{"mp4 av1 aac", "safari", media("mp4", "av1", 8, "aac"), None, "AV1"},
+		{"webm vp9 opus", "chrome", media("webm", "vp9", 8, "opus"), Direct, ""},
+		// VP9 cannot go into the repackaged format, and Safari lacks it anyway.
+		{"webm vp9 opus", "safari", media("webm", "vp9", 8, "opus"), None, "VP9"},
+		{"avi xvid mp3", "chrome", media("avi", "mpeg4", 8, "mp3"), None, "DivX"},
+		{"wmv", "chrome", media("asf", "wmv3", 8, "wmav2"), None, "WMV"},
+		{"mpeg2 ts", "chrome", media("mpegts", "mpeg2video", 8, "mp2"), None, "MPEG-2"},
+		{"ts h264 aac", "chrome", media("mpegts", "h264", 8, "aac"), Remux, "MPEG-TS"},
+		{"avi h264 mp3", "chrome", media("avi", "h264", 8, "mp3"), Audio, "AVI"},
+		{"silent clip", "chrome", media("mp4", "h264", 8), Direct, ""},
+		{"silent mkv", "safari", media("matroska", "h264", 8), Remux, "MKV"},
+		{"sound only", "chrome", media("mp4", "", 0, "aac"), None, "no picture"},
+		{"mkv h264 flac", "chrome", media("matroska", "h264", 8, "flac"), Direct, ""},
+		// FLAC plays in Safari but cannot be passed through when repackaging.
+		{"mkv h264 flac", "safari", media("matroska", "h264", 8, "flac"), Audio, "MKV"},
+		{"10-bit h264", "chrome", media("matroska", "h264", 10, "aac"), None, "10-bit H.264"},
 	}
 	for _, c := range cases {
-		got := Decide(c.m, c.c)
-		if got.Direct != c.want {
-			t.Errorf("%s: %s %v, want %s", c.name, got.Direct, got.Reasons, c.want)
+		dev := devices[c.device]
+		if dev == nil {
+			dev = caps(true, "mp4", "h264 hevc", "aac")
+		}
+		got := Decide(c.m, dev, -1)
+		name := c.name + " on " + c.device
+		if got.Method != c.want {
+			t.Errorf("%s: %s %v, want %s", name, got.Method, got.Reasons, c.want)
 			continue
 		}
-		if c.want == No && !strings.Contains(strings.Join(got.Reasons, " "), c.reason) {
-			t.Errorf("%s: reasons %v do not mention %q", c.name, got.Reasons, c.reason)
+		joined := strings.Join(got.Reasons, " ")
+		if c.reason == "" && len(got.Reasons) != 0 {
+			t.Errorf("%s: playing the original came with reasons %v", name, got.Reasons)
 		}
-		if c.want == Yes && len(got.Reasons) != 0 {
-			t.Errorf("%s: a yes came with reasons %v", c.name, got.Reasons)
+		if c.reason != "" && !strings.Contains(joined, c.reason) {
+			t.Errorf("%s: reasons %v do not mention %q", name, got.Reasons, c.reason)
+		}
+		if (got.Method == None) != (got.Playable == No) {
+			t.Errorf("%s: method %s but playable %s", name, got.Method, got.Playable)
 		}
 	}
 }
 
+// Every combination of package, picture, sound and device must obey the
+// rules below, whatever the answer is. This is where most of the cases are.
+func TestDecideRulesHoldForEveryCombination(t *testing.T) {
+	containers := []string{"mp4", "mov", "matroska", "webm", "avi", "mpegts"}
+	videos := []struct {
+		codec string
+		depth int
+	}{{"h264", 8}, {"h264", 10}, {"hevc", 8}, {"hevc", 10}, {"av1", 8}, {"vp9", 8}, {"mpeg4", 8}}
+	audios := []string{"", "aac", "ac3", "eac3", "dts", "truehd", "flac", "opus", "mp3"}
+	n := 0
+	for dname, dev := range devices {
+		for _, cont := range containers {
+			for _, v := range videos {
+				for _, a := range audios {
+					var m Media
+					if a == "" {
+						m = media(cont, v.codec, v.depth)
+					} else {
+						m = media(cont, v.codec, v.depth, a)
+					}
+					p := Decide(m, dev, -1)
+					n++
+					id := fmt.Sprintf("%s %s/%d %s on %s -> %s", cont, v.codec, v.depth, a, dname, p.Method)
+					key := v.codec
+					if v.depth > 8 {
+						key = map[string]string{"hevc": "hevc10", "h264": "h264-10"}[v.codec]
+					}
+					videoOK := dev.Video[key]
+					audioOK := a == "" || dev.Audio[a]
+					switch p.Method {
+					case Direct:
+						if !dev.Containers[cont] || !videoOK || !audioOK {
+							t.Errorf("%s: the original was sent to a device that cannot play it", id)
+						}
+					case Remux, Audio:
+						if !dev.HLS || !videoOK || !packagedVideo[v.codec] {
+							t.Errorf("%s: repackaged for a device that cannot take it", id)
+						}
+						if dev.Containers[cont] && audioOK {
+							t.Errorf("%s: repackaged although the original would have played", id)
+						}
+						if p.Method == Remux && a != "" && !(dev.Audio[a] && packagedAudio[a]) {
+							t.Errorf("%s: sound passed through that the device or the format cannot take", id)
+						}
+						if p.Method == Audio && dev.Audio[a] && packagedAudio[a] {
+							t.Errorf("%s: sound converted although it could have been passed through", id)
+						}
+					case None:
+						if dev.Containers[cont] && videoOK && audioOK {
+							t.Errorf("%s: refused although the original would have played", id)
+						}
+						if dev.HLS && videoOK && packagedVideo[v.codec] && dev.Audio["aac"] {
+							t.Errorf("%s: refused although repackaging would have worked", id)
+						}
+					}
+					if p.Method != Direct && len(p.Reasons) == 0 {
+						t.Errorf("%s: no reason given", id)
+					}
+					if p.HasAudio != (a != "") || p.AudioCopy != (p.Method == Direct || p.Method == Remux) && p.Method != None {
+						t.Errorf("%s: hasAudio=%v audioCopy=%v", id, p.HasAudio, p.AudioCopy)
+					}
+					if p.Explain() == "" {
+						t.Errorf("%s: nothing to tell the viewer", id)
+					}
+				}
+			}
+		}
+	}
+	if n < 200 {
+		t.Fatalf("only %d combinations checked", n)
+	}
+	t.Logf("%d combinations checked", n)
+}
+
 func TestUnknownWhenFactsAreMissing(t *testing.T) {
-	if p := Decide(Media{}, chrome); p.Direct != Unknown {
-		t.Errorf("an uninspected file got %s", p.Direct)
+	if p := Decide(Media{}, devices["chrome"], -1); p.Playable != Unknown || p.Method != Direct {
+		t.Errorf("an uninspected file got %+v", p)
 	}
-	if p := Decide(media("mp4", "h264", 8, "aac"), nil); p.Direct != Unknown {
-		t.Errorf("a device that reported nothing got %s", p.Direct)
+	if p := Decide(media("mp4", "h264", 8, "aac"), nil, -1); p.Playable != Unknown {
+		t.Errorf("a device that reported nothing got %s", p.Playable)
 	}
-	if p := Decide(media("mp4", "h264", 8), chrome); p.HasAudio {
-		t.Error("a silent file was reported as having sound")
+	if p := Decide(media("mp4", "h264", 8), devices["chrome"], -1); p.HasAudio || p.AudioTrack != -1 {
+		t.Errorf("a silent file: %+v", p)
 	}
 }
 
 func TestEveryProblemIsNamed(t *testing.T) {
-	p := Decide(media("matroska", "hevc", 10, "dts"), firefox)
-	if p.Direct != No || len(p.Reasons) != 3 {
-		t.Fatalf("want three reasons (package, picture, sound), got %v", p.Reasons)
+	p := Decide(media("matroska", "h264", 8, "dts"), devices["firefox"], -1)
+	if p.Method != Audio || len(p.Reasons) != 2 {
+		t.Fatalf("want two reasons (package and sound), got %s %v", p.Method, p.Reasons)
 	}
 }
 
-func TestPickAudioSkipsCommentary(t *testing.T) {
-	tracks := []Track{{Codec: "ac3", Default: true, Commentary: true}, {Codec: "aac"}, {Codec: "dts"}}
-	if a := PickAudio(tracks); a == nil || a.Codec != "aac" {
-		t.Fatalf("picked %+v", a)
+func TestChoosingAnotherSoundTrack(t *testing.T) {
+	m := Media{Probed: true, Container: "mp4", Video: []Track{{Codec: "h264", BitDepth: 8}},
+		Audio: []Track{{Codec: "aac", Default: true, Language: "eng"}, {Codec: "aac", Language: "jpn"}, {Codec: "dts", Language: "nor"}}}
+	if p := Decide(m, devices["chrome"], -1); p.Method != Direct || p.AudioTrack != 0 {
+		t.Fatalf("by default: %+v", p)
 	}
-	m := Media{Probed: true, Container: "mp4", Video: []Track{{Codec: "h264", BitDepth: 8}}, Audio: tracks}
-	if p := Decide(m, chrome); p.Direct != Yes {
-		t.Errorf("a commentary track in Dolby made the file unplayable: %v", p.Reasons)
+	// A browser handed the file plays its first track, so another track
+	// means repackaging, which costs nothing.
+	if p := Decide(m, devices["chrome"], 1); p.Method != Remux || p.AudioTrack != 1 || !strings.Contains(strings.Join(p.Reasons, " "), "sound track") {
+		t.Fatalf("second track: %+v", p)
 	}
-	if PickAudio(nil) != nil {
-		t.Error("picked a track from nothing")
+	if p := Decide(m, devices["chrome"], 2); p.Method != Audio || p.AudioTrack != 2 {
+		t.Fatalf("a DTS track: %+v", p)
 	}
-	only := []Track{{Codec: "ac3", Commentary: true}}
-	if a := PickAudio(only); a == nil || a.Codec != "ac3" {
-		t.Error("with only a commentary track, that track is the sound")
+	if p := Decide(m, devices["chrome"], 9); p.AudioTrack != 0 {
+		t.Fatalf("a track that does not exist: %+v", p)
+	}
+	if p := Decide(m, devices["old-tv"], 1); p.Method != None {
+		t.Fatalf("another track on a device that cannot take repackaged video: %+v", p)
 	}
 }

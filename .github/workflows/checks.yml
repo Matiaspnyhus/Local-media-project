@@ -44,6 +44,20 @@ jobs:
           node-version: 22
       - name: Build the web app
         run: cd web && npm ci --no-audit --no-fund && npm run build
+      - name: Fetch the pinned converter, the same build that is shipped
+        run: |
+          set -euo pipefail
+          . packaging/ffmpeg.env
+          curl -sSL --retry 3 -o ffmpeg-linux64.tar.xz "$FFMPEG_LINUX64_URL"
+          echo "$FFMPEG_LINUX64_SHA256  ffmpeg-linux64.tar.xz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/ffmpeg"
+          tar -xJf ffmpeg-linux64.tar.xz -C "$RUNNER_TEMP/ffmpeg"
+          "$RUNNER_TEMP/ffmpeg/ffmpeg" -version | head -1
+          echo "LOCALMEDIA_FFMPEG=$RUNNER_TEMP/ffmpeg/ffmpeg" >> "$GITHUB_ENV"
+          echo "LOCALMEDIA_FFPROBE=$RUNNER_TEMP/ffmpeg/ffprobe" >> "$GITHUB_ENV"
+          # With this set, a test that needs the converter fails instead of
+          # being skipped when the converter is missing.
+          echo "LM_REQUIRE_FFMPEG=1" >> "$GITHUB_ENV"
       - name: Go checks
         run: |
           go vet ./...
@@ -55,14 +69,14 @@ jobs:
           cp release/localmedia-linux-amd64 localmedia
           cd e2e && npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
           node run.mjs
-      - name: Package for Windows with the pinned file inspector
+      - name: Package for Windows with the pinned file inspector and converter
         run: |
           set -euo pipefail
           . packaging/ffmpeg.env
           curl -sSL --retry 3 -o ffmpeg-win64.zip "$FFMPEG_WIN64_URL"
           echo "$FFMPEG_WIN64_SHA256  ffmpeg-win64.zip" | sha256sum -c -
           mkdir -p package/LocalMedia
-          unzip -q -j ffmpeg-win64.zip ffprobe.exe -d package/LocalMedia
+          unzip -q -j ffmpeg-win64.zip ffprobe.exe ffmpeg.exe -d package/LocalMedia
           # The packaged program has no console window: its sign of life is
           # the icon beside the clock.
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=${GITHUB_REF_NAME}" -o package/LocalMedia/localmedia.exe ./cmd/localmedia
@@ -88,19 +102,27 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - name: Go tests on Windows (database crash-safe mode, text search, file access)
-        run: go test ./...
       - uses: actions/download-artifact@v4
         with:
           name: LocalMedia-Windows
           path: package
-      - name: The Windows package starts, answers and has a working file inspector
+      - name: Go tests on Windows, converting with the very ffmpeg.exe that is shipped
+        shell: pwsh
+        run: |
+          $env:LOCALMEDIA_FFMPEG = (Resolve-Path "package\LocalMedia\ffmpeg.exe").Path
+          $env:LOCALMEDIA_FFPROBE = (Resolve-Path "package\LocalMedia\ffprobe.exe").Path
+          $env:LM_REQUIRE_FFMPEG = "1"
+          go test ./...
+          if ($LASTEXITCODE -ne 0) { throw "tests failed" }
+      - name: The Windows package starts, answers and has a working file inspector and converter
         shell: pwsh
         run: |
           $dir = "package\LocalMedia"
-          foreach ($f in "localmedia.exe", "ffprobe.exe", "LICENSE.txt", "THIRD-PARTY.txt") {
+          foreach ($f in "localmedia.exe", "ffprobe.exe", "ffmpeg.exe", "LICENSE.txt", "THIRD-PARTY.txt") {
             if (-not (Test-Path (Join-Path $dir $f))) { throw "the package lacks $f" }
           }
+          $fver = & "$dir\ffmpeg.exe" -version | Out-String
+          if ($LASTEXITCODE -ne 0 -or $fver -notmatch "ffmpeg version") { throw "the bundled ffmpeg does not run" }
           $ver = & "$dir\ffprobe.exe" -version | Out-String
           if ($LASTEXITCODE -ne 0 -or $ver -notmatch "ffprobe version") { throw "the bundled ffprobe does not run" }
           Write-Host ($ver -split "`n")[0]
@@ -123,6 +145,7 @@ jobs:
           if ($state.setupDone) { throw "a fresh install claims to be set up" }
           Stop-Process -Id $p.Id -Force
           if ((Get-Content $out -Raw) -match "ffprobe was not found") { throw "the program did not find the ffprobe beside it" }
+          if ((Get-Content $out -Raw) -match "ffmpeg was not found") { throw "the program did not find the ffmpeg beside it" }
           Write-Host "Windows program started, served the web app and answered. Version: $($r.version)"
 
       - name: Build the installer
@@ -149,7 +172,7 @@ jobs:
 
           $i = Start-Process installer\LocalMedia-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/TASKS=autostart,firewall" -Wait -PassThru
           if ($i.ExitCode -ne 0) { throw "the installer failed with $($i.ExitCode)" }
-          foreach ($f in "localmedia.exe", "ffprobe.exe", "LICENSE.txt", "THIRD-PARTY.txt", "unins000.exe") {
+          foreach ($f in "localmedia.exe", "ffprobe.exe", "ffmpeg.exe", "LICENSE.txt", "THIRD-PARTY.txt", "unins000.exe") {
             if (-not (Test-Path (Join-Path $app $f))) { throw "after installing, $f is missing" }
           }
           if (-not (Rule)) { throw "the firewall rule was not added" }
@@ -200,6 +223,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Fetch the pinned converter for macOS
+        run: |
+          set -euo pipefail
+          . packaging/ffmpeg.env
+          curl -sSL --retry 3 -o ffmpeg-mac.tar.xz "$FFMPEG_MACARM64_URL"
+          echo "$FFMPEG_MACARM64_SHA256  ffmpeg-mac.tar.xz" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/ffmpeg"
+          tar -xJf ffmpeg-mac.tar.xz -C "$RUNNER_TEMP/ffmpeg"
+          "$RUNNER_TEMP/ffmpeg/ffmpeg" -version | head -1
+          echo "LOCALMEDIA_FFMPEG=$RUNNER_TEMP/ffmpeg/ffmpeg" >> "$GITHUB_ENV"
+          echo "LOCALMEDIA_FFPROBE=$RUNNER_TEMP/ffmpeg/ffprobe" >> "$GITHUB_ENV"
+          echo "LM_REQUIRE_FFMPEG=1" >> "$GITHUB_ENV"
       - name: Go tests on macOS
         run: go test ./...
       - uses: actions/download-artifact@v4

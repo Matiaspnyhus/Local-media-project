@@ -1,9 +1,13 @@
-Local Media ships with one separate program that it runs but does not contain:
+Local Media ships with two separate programs that it runs but does not contain:
 
-ffprobe.exe
-  What it is:  the file inspector from FFmpeg, in the build published by the
-               Jellyfin project (jellyfin-ffmpeg 8.1.3-2, Windows 64-bit, GPL build).
-  Used for:    reading what is inside each video file (length, picture and sound formats).
+ffprobe.exe and ffmpeg.exe
+  What they are: the file inspector and the converter from FFmpeg, in the build
+               published by the Jellyfin project (jellyfin-ffmpeg 8.1.3-2, Windows
+               64-bit, GPL build).
+  Used for:    ffprobe reads what is inside each video file (length, picture and
+               sound formats). ffmpeg repackages files, and converts their sound,
+               for devices that cannot play them as they are, and takes subtitles
+               out of video files.
   Licence:     GNU General Public License, version 3 or later. The full text is in
                LICENSE.txt in this folder.
   Source code: https://github.com/jellyfin/jellyfin-ffmpeg/tree/v8.1.3-2

@@ -112,9 +112,9 @@ func (a *app) run() (err error) {
 	defer d.Close()
 
 	a.upd = newUpdater(a, d)
-	ffprobe := probe.Find()
+	ffprobe, ffmpeg := probe.Find(), probe.FindFFmpeg()
 	srv, err := server.New(server.Config{
-		DB: d, DataDir: o.dataDir, Version: version, Port: o.port, Assets: web.Assets(), LogOut: os.Stdout, FFprobe: ffprobe,
+		DB: d, DataDir: o.dataDir, Version: version, Port: o.port, Assets: web.Assets(), LogOut: os.Stdout, FFprobe: ffprobe, FFmpeg: ffmpeg,
 		Update: a.upd.forServer(),
 	})
 	if err != nil {
@@ -135,6 +135,9 @@ func (a *app) run() (err error) {
 	}
 	if ffprobe == "" {
 		fmt.Println("\nNote: ffprobe was not found, so files cannot be inspected. The app will not\nknow in advance which files your browser can play.")
+	}
+	if ffmpeg == "" {
+		fmt.Println("\nNote: ffmpeg was not found, so files cannot be repackaged or have their sound\nconverted. Only files a device can play as they are will play.")
 	}
 	fmt.Printf("\nData folder: %s\n\n", o.dataDir)
 

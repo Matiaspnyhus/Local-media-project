@@ -8,6 +8,7 @@ export function measureCaps(): Caps {
   const can = (...types: string[]) => types.some((t) => v.canPlayType(t) !== '')
   const mp4 = can('video/mp4')
   return {
+    hls: nativeHLS() || canUseChunkPlayer(),
     containers: {
       mp4,
       mov: mp4 || can('video/quicktime'),
@@ -32,4 +33,27 @@ export function measureCaps(): Caps {
       vorbis: can('audio/webm; codecs="vorbis"', 'audio/ogg; codecs="vorbis"'),
     },
   }
+}
+
+// nativeHLS: the browser plays a list of chunks by itself (Safari, and
+// every browser on an iPhone or iPad).
+export function nativeHLS(): boolean {
+  return document.createElement('video').canPlayType('application/vnd.apple.mpegurl') !== ''
+}
+
+// canUseChunkPlayer: the browser lets a page feed video to the player piece
+// by piece, which is how the built-in chunk player (hls.js) works.
+export function canUseChunkPlayer(): boolean {
+  const w = window as unknown as { MediaSource?: unknown; ManagedMediaSource?: unknown }
+  return typeof w.MediaSource !== 'undefined' || typeof w.ManagedMediaSource !== 'undefined'
+}
+
+// builtInChunks says whether to let the browser play a list of chunks by
+// itself. On Apple devices that is the well-worn path (and on older iPhones
+// the only one). Elsewhere the app's own player is used wherever it can
+// run: some other browsers have begun to play chunk lists themselves, but
+// that is newer and less proven than the player this app is tested with.
+export function builtInChunks(): boolean {
+  if (!nativeHLS()) return false
+  return /Apple/.test(navigator.vendor || '') || !canUseChunkPlayer()
 }
