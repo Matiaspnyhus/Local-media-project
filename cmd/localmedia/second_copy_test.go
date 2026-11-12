@@ -79,8 +79,7 @@ func TestASecondCopyStopsBeforeItTouchesAnything(t *testing.T) {
 }
 
 // snapshot lists every file in a folder with its size, apart from the
-// database's own working files and the log, which the running copy writes
-// to as it goes.
+// database and the log, which the running copy writes to as it goes.
 func snapshot(t *testing.T, dir string) string {
 	t.Helper()
 	var b strings.Builder
@@ -89,7 +88,7 @@ func snapshot(t *testing.T, dir string) string {
 			return nil
 		}
 		rel, _ := filepath.Rel(dir, p)
-		if strings.HasPrefix(rel, "logs") || strings.HasSuffix(rel, "-wal") || strings.HasSuffix(rel, "-shm") {
+		if strings.HasPrefix(rel, "logs") || strings.HasPrefix(rel, "localmedia.db") {
 			return nil
 		}
 		if info.IsDir() {

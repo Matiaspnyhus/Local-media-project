@@ -107,7 +107,7 @@ func TestOneSubtitleAskedForManyTimesAtOnceIsMadeOnce(t *testing.T) {
 // that is given up while waiting starts nothing.
 func TestOnlyAFewSubtitlesAreTakenOutAtOnce(t *testing.T) {
 	e := newConvertEnv(t)
-	langs := []string{"en", "de", "fr", "sv", "da", "fi", "es"}
+	langs := []string{"en", "de", "fr", "sv", "da"}
 	for _, l := range langs {
 		os.WriteFile(filepath.Join(e.media, "Test Film (2020)."+l+".ass"), []byte(strings.Replace(styledFile, "styled file", "styled file in "+l, 1)), 0o644)
 	}
@@ -138,19 +138,14 @@ func TestOnlyAFewSubtitlesAreTakenOutAtOnce(t *testing.T) {
 		t.Errorf("%d subtitles: ffmpeg started %d times, %d at once; want %d runs and at most %d at once", len(first), n, most, len(first), maxSubtitleJobs)
 	}
 
-	// Two more are being made, which fills the places. A third request
-	// waits, and its viewer leaves before its turn comes.
-	busy := make(chan []*httptest.ResponseRecorder)
-	go func() {
-		busy <- together(2, func(i int) *httptest.ResponseRecorder { return e.do("GET", address[langs[4+i]], remote, c, nil) })
-	}()
-	for deadline := time.Now().Add(5 * time.Second); ffmpeg.runs() < len(first)+2; time.Sleep(10 * time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("the two subtitle jobs never started")
-		}
+	// Every place is taken (here by the test itself, which makes "taken"
+	// certain). A request for another subtitle waits, and its viewer
+	// leaves before its turn comes.
+	for i := 0; i < maxSubtitleJobs; i++ {
+		e.s.helpers.subSlots <- struct{}{}
 	}
 	ctx, leave := context.WithCancel(context.Background())
-	r := httptest.NewRequest("GET", address[langs[6]], nil).WithContext(ctx)
+	r := httptest.NewRequest("GET", address[langs[4]], nil).WithContext(ctx)
 	r.RemoteAddr, r.Host = remote, "192.168.1.10:8177"
 	r.AddCookie(c)
 	gone := make(chan struct{})
@@ -165,14 +160,16 @@ func TestOnlyAFewSubtitlesAreTakenOutAtOnce(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("a request given up while waiting for its turn did not end")
 	}
-	for _, w := range <-busy {
-		if w.Code != 200 {
-			t.Errorf("a subtitle being made while another request left: %d", w.Code)
-		}
+	e.s.background.Wait() // whatever it had started in the background has ended too
+	for i := 0; i < maxSubtitleJobs; i++ {
+		<-e.s.helpers.subSlots
 	}
-	e.s.background.Wait()
-	if n := ffmpeg.runs(); n != len(first)+2 {
-		t.Errorf("ffmpeg started %d times in all; the request that left should not have started one (want %d)", n, len(first)+2)
+	if n := ffmpeg.runs(); n != len(first) {
+		t.Errorf("ffmpeg started %d times in all; the request that left should not have started one (want %d)", n, len(first))
+	}
+	// With the places free again, the same subtitle is made as usual.
+	if w := e.do("GET", address[langs[4]], remote, c, nil); w.Code != 200 || !strings.Contains(w.Body.String(), "styled file in "+langs[4]) || ffmpeg.runs() != len(first)+1 {
+		t.Errorf("asking again once there is room: %d %q, ffmpeg started %d times in all", w.Code, w.Body, ffmpeg.runs())
 	}
 }
 

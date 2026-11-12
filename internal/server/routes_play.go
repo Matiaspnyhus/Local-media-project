@@ -545,9 +545,9 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 func (s *Server) hlsFailed(w http.ResponseWriter, what string, err error) {
 	if !errors.Is(err, hls.ErrNoSession) && !errors.Is(err, hls.ErrPastEnd) && !errors.Is(err, hls.ErrSuperseded) && !errors.Is(err, context.Canceled) {
 		// The error quotes ffmpeg, which names files by their full path.
-		detail := s.pathless(what + ": " + err.Error())
-		s.log.Printf("converting: %s failed", detail)
-		s.events.add(clientEvent{Time: time.Now().UTC().Format(time.RFC3339), Kind: "convert-failed", Detail: detail})
+		why := s.pathless(err.Error())
+		s.log.Printf("converting: %s failed: %s", what, why)
+		s.events.add(clientEvent{Time: time.Now().UTC().Format(time.RFC3339), Kind: "convert-failed", Detail: what + ": " + why})
 	}
 	hlsError(w, err)
 }
