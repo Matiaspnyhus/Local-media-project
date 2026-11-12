@@ -115,17 +115,25 @@ jobs:
           go vet ./...
           go test ./...
       - name: The list of other people's code built into the program is up to date
+        # (Runs also when a check above failed, so that the other systems
+        # can still be tested with what was built: one failing test on
+        # Linux must not hide what Windows and Safari's engine would say.
+        # The job still ends as failed, and nothing is published.)
+        if: ${{ !cancelled() }}
         run: |
           bash packaging/third-party-licenses.sh
           git diff --exit-code -- packaging/THIRD-PARTY-LICENSES.txt || { echo "Run: bash packaging/third-party-licenses.sh, and commit the result"; exit 1; }
       - name: Build every platform with cgo off
+        if: ${{ !cancelled() }}
         run: make cross VERSION="$LM_VERSION"
       - name: End-to-end test in Chromium (keyboard only, plain HTTP)
+        if: ${{ !cancelled() }}
         run: |
           cp release/localmedia-linux-amd64 localmedia
           cd e2e && npm ci --no-audit --no-fund && npx playwright install --with-deps chromium
           node run.mjs
       - name: Package for Windows with the pinned file inspector and converter
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           . packaging/ffmpeg.env
@@ -140,11 +148,13 @@ jobs:
           cp packaging/THIRD-PARTY.txt package/LocalMedia/THIRD-PARTY.txt
           cp packaging/THIRD-PARTY-LICENSES.txt package/LocalMedia/THIRD-PARTY-LICENSES.txt
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: localmedia-builds
           path: release/
           retention-days: 14
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: LocalMedia-Windows
           path: package/
@@ -152,7 +162,9 @@ jobs:
 
   windows:
     needs: [plan, linux]
-    if: needs.plan.outputs.all_os == 'true'
+    # Runs whether or not the Linux job passed (it needs only what that job
+    # built), so that every system reports on every push.
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.all_os == 'true' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -174,6 +186,9 @@ jobs:
           go test ./...
           if ($LASTEXITCODE -ne 0) { throw "tests failed" }
       - name: The Windows package starts, answers and has a working file inspector and converter
+        # (Runs also when the tests above failed, so that one failing
+        # test does not hide what this step would have found.)
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $dir = "package\LocalMedia"
@@ -208,6 +223,7 @@ jobs:
           Write-Host "Windows program started, served the web app and answered. Version: $($r.version)"
 
       - name: Build the installer
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
@@ -218,6 +234,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "the installer did not build" }
           Get-Item installer\LocalMedia-Setup.exe | Format-List Name, Length
       - name: Install, start, and uninstall on a real Windows machine
+        if: ${{ !cancelled() }}
         shell: pwsh
         run: |
           $app = Join-Path $env:LOCALAPPDATA "Programs\LocalMedia"
@@ -249,22 +266,51 @@ jobs:
           if ($p.HasExited) { throw "the installed program stopped by itself" }
           if (-not (Test-Path (Join-Path $data "localmedia.db"))) { throw "the installed program did not use the existing data folder" }
 
+          # A helper program still busy when the installer or the uninstaller
+          # runs (the converter taking a subtitle out of a long film, say)
+          # must be stopped by it, or its file cannot be replaced or removed.
+          # A converter that plays an endless test picture stands in for one.
+          function Helper {
+            $h = Start-Process (Join-Path $app "ffmpeg.exe") -ArgumentList "-hide_banner", "-nostdin", "-loglevel", "error", "-re", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=5", "-f", "null", "-" -PassThru -WindowStyle Hidden
+            Start-Sleep -Seconds 2
+            if ($h.HasExited) { throw "the stand-in helper did not keep running" }
+            $h
+          }
+          function HelperWasStopped($h, $log, $when) {
+            if (-not $h.WaitForExit(10000)) { throw "$when left a helper running from the install folder" }
+            $text = Get-Content $log -Raw
+            if ($text -notmatch "Stopping a helper program that was still running") { throw "$when did not say that it stopped the helper. Its log: $text" }
+            foreach ($bad in "Could not look for helper programs", "Could not stop the helper program", "Could not tell where a helper program") {
+              if ($text -match $bad) { throw "$when said: $bad. Its log: $text" }
+            }
+          }
+
           # Installing again over a running copy (what a manual update is).
-          $i = Start-Process installer\LocalMedia-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/TASKS=autostart,firewall" -Wait -PassThru
+          $helper = Helper
+          $log = Join-Path $env:RUNNER_TEMP "setup-over.log"
+          $i = Start-Process installer\LocalMedia-Setup.exe -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/TASKS=autostart,firewall", "/LOG=$log" -Wait -PassThru
           if ($i.ExitCode -ne 0) { throw "installing over a running copy failed with $($i.ExitCode)" }
+          HelperWasStopped $helper $log "installing over the top"
           if (-not (Test-Path (Join-Path $data "kept-from-before.txt"))) { throw "installing again touched the data folder" }
 
-          $u = Start-Process (Join-Path $app "unins000.exe") -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait -PassThru
+          $helper = Helper
+          $log = Join-Path $env:RUNNER_TEMP "uninstall.log"
+          $u = Start-Process (Join-Path $app "unins000.exe") -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$log" -Wait -PassThru
           Start-Sleep -Seconds 2
+          HelperWasStopped $helper $log "uninstalling"
+          foreach ($f in "ffmpeg.exe", "ffprobe.exe") {
+            if (Test-Path (Join-Path $app $f)) { throw "uninstalling left $f behind" }
+          }
           if (Test-Path (Join-Path $app "localmedia.exe")) { throw "uninstalling left the program behind" }
           if (Rule) { throw "uninstalling left the firewall rule behind" }
           if ((Get-ItemProperty $run -ErrorAction SilentlyContinue).LocalMedia) { throw "uninstalling left start-with-Windows behind" }
           if (-not (Test-Path (Join-Path $data "kept-from-before.txt")) -or -not (Test-Path (Join-Path $data "localmedia.db"))) { throw "uninstalling removed the owner's data" }
-          Write-Host "Installed, started, installed again over a running copy, and uninstalled. The data folder was never touched."
+          Write-Host "Installed, started, installed again over a running copy with a helper still busy, and uninstalled with a helper still busy. The data folder was never touched."
           # "Rule not found" is the answer wanted above, but netsh reports it
           # as an error code, which would otherwise fail this step.
           exit 0
       - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: LocalMedia-Setup
           path: installer/LocalMedia-Setup.exe
@@ -272,7 +318,7 @@ jobs:
 
   macos:
     needs: [plan, linux]
-    if: needs.plan.outputs.all_os == 'true'
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.all_os == 'true' }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -299,10 +345,14 @@ jobs:
       - name: Go tests on macOS
         run: go test ./...
       - uses: actions/download-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: localmedia-builds
           path: release
       - name: End-to-end test in Safari's engine (the owner's phone is an iPhone)
+        # (Runs also when the tests above failed, so that one failing
+        # test does not hide what this step would have found.)
+        if: ${{ !cancelled() }}
         run: |
           cp release/localmedia-darwin-arm64 localmedia && chmod +x localmedia
           cd e2e && npm ci --no-audit --no-fund && npx playwright install webkit
@@ -311,7 +361,7 @@ jobs:
   linux-arm:
     needs: [plan, linux]
     # ARM machines are only offered free to public repositories.
-    if: needs.plan.outputs.public == 'true'
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.public == 'true' }}
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
@@ -325,7 +375,10 @@ jobs:
 
   release:
     needs: [plan, linux, windows, macos]
-    if: needs.plan.outputs.release != ''
+    # Only when every system passed. (The other jobs now run even after a
+    # failure on Linux, so this is said outright and not left to the rule
+    # that a job is skipped when one it needs failed.)
+    if: ${{ needs.plan.outputs.release != '' && needs.linux.result == 'success' && needs.windows.result == 'success' && needs.macos.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
