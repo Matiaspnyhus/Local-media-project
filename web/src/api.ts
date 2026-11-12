@@ -155,20 +155,6 @@ export interface Diagnostics {
   open: number
   userAgent: string
 }
-// What the PC gives a film's way out to another player (see OpenElsewhere).
-export interface Handoff {
-  // A complete address for the film's original file. It plays without
-  // signing in, so a video player outside the browser can use it.
-  url: string
-  expiresAt: number // when the link stops working, in Unix seconds
-  validSeconds: number // how long a link lasts from the moment it is made
-  thisPC: boolean // this browser is on the PC that runs Local Media
-}
-// vlcFile is the address of a small playlist file for VLC that plays one
-// film, starting at the given second.
-export function vlcFile(id: string, atSeconds: number): string {
-  return `/api/items/${id}/handoff.xspf` + (atSeconds > 0 ? `?at=${Math.floor(atSeconds)}` : '')
-}
 export interface Scan {
   added: number
   moved: number
@@ -223,10 +209,6 @@ export const api = {
       keepalive: true,
     }).catch(() => undefined)
   },
-  handoff: (id: string) => call<Handoff>('GET', `/api/items/${id}/handoff`),
-  // Opens the film in the video player of the PC that runs Local Media.
-  // The PC only does this for the browser on the PC itself.
-  openLocal: (id: string) => call<{ ok: boolean }>('POST', `/api/items/${id}/open-local`),
   prefs: () => call<Prefs>('GET', '/api/prefs'),
   setPrefs: (p: Prefs) => call<Prefs>('PUT', '/api/prefs', p),
   diagnostics: () => call<Diagnostics>('GET', '/api/diagnostics'),
