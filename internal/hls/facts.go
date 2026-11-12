@@ -200,7 +200,7 @@ type probedPicture struct {
 			Duration string `json:"DURATION"`
 		} `json:"tags"`
 		SideData []struct {
-			Rotation *float64 `json:"rotation"`
+			Rotation any `json:"rotation"` // a number, though not every version need write it as one
 		} `json:"side_data_list"`
 	} `json:"streams"`
 	Format struct {
@@ -288,9 +288,14 @@ func parsePicture(out []byte) (f PictureFacts, pictureEnd int64, err error) {
 		f.Matrix = s.Matrix
 	}
 	for _, d := range s.SideData {
-		if d.Rotation != nil && !math.IsNaN(*d.Rotation) && math.Abs(*d.Rotation) <= 360 {
+		turn, ok := d.Rotation.(float64)
+		if text, isText := d.Rotation.(string); isText {
+			v, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+			turn, ok = v, err == nil
+		}
+		if ok && !math.IsNaN(turn) && math.Abs(turn) <= 360 {
 			// ffprobe gives the turn as anything from -180 to 180.
-			f.Rotation = ((int(math.Round(*d.Rotation/90))*90)%360 + 360) % 360
+			f.Rotation = ((int(math.Round(turn/90))*90)%360 + 360) % 360
 		}
 	}
 	f.RateNum, f.RateDen = snapRate(rate(s.AvgRate), rate(s.BaseRate))
@@ -366,7 +371,8 @@ const tailMs = 8000
 // at the file twice: once for what the file says about itself, and once at
 // its last few seconds for the last frame (and, where it matters, at its
 // first minute for how far apart the key frames are). Neither look reads
-// the film through.
+// the film through, unless the film is a few seconds long or does not say
+// how long it is.
 func ProbePicture(ctx context.Context, ffprobe, path string) (PictureFacts, error) {
 	if ffprobe == "" {
 		return PictureFacts{}, errors.New("ffprobe is not available")
@@ -380,9 +386,16 @@ func ProbePicture(ctx context.Context, ffprobe, path string) (PictureFacts, erro
 		}
 		return out, nil
 	}
-	out, err := run("-read_intervals", "%+#1", "-show_entries",
-		"packet=pts_time:stream=width,height,sample_aspect_ratio,field_order,color_space,r_frame_rate,avg_frame_rate,start_time,duration"+
-			":stream_tags=DURATION:stream_side_data=rotation:format=format_name,start_time,duration")
+	const entries = "packet=pts_time:stream=width,height,sample_aspect_ratio,field_order,color_space,r_frame_rate,avg_frame_rate,start_time,duration" +
+		":stream_tags=DURATION:format=format_name,start_time,duration"
+	out, err := run("-read_intervals", "%+#1", "-show_entries", entries+":stream_side_data=rotation")
+	if err != nil && ctx.Err() == nil {
+		// ffprobe stops when asked for something it has no name for. Should a
+		// version call the note that says how a picture is turned something
+		// else, every film must not fail for it: ask again without. (A file
+		// that cannot be read fails again, the same way.)
+		out, err = run("-read_intervals", "%+#1", "-show_entries", entries)
+	}
 	if err != nil {
 		return PictureFacts{}, err
 	}

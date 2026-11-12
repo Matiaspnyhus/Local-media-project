@@ -93,7 +93,8 @@ func TestPictureFactsFromOddAnswers(t *testing.T) {
 			t.Errorf("a pixel shape given as %q was read as %d:%d (%v), want %d:%d", sar, f.SarNum, f.SarDen, err, want[0], want[1])
 		}
 	}
-	for turn, want := range map[string]int{"90": 90, "-90": 270, "180": 180, "-180": 180, "270": 90 + 180, "0": 0, "-0": 0, "89.6": 90, "360": 0, "1e9": 0} {
+	for turn, want := range map[string]int{"90": 90, "-90": 270, "180": 180, "-180": 180, "270": 90 + 180, "0": 0, "-0": 0, "89.6": 90, "360": 0, "1e9": 0,
+		`"-90"`: 270, `"90.000"`: 90, `"sideways"`: 0, `null`: 0, `true`: 0, `[90]`: 0, `{"degrees":90}`: 0} {
 		f, _, err := parsePicture([]byte(stream(`"start_time":"0","side_data_list":[{},{"rotation":` + turn + `}]`)))
 		if err != nil || f.Rotation != want {
 			t.Errorf("a picture turned by %s was read as turned by %d (%v), want %d", turn, f.Rotation, err, want)
