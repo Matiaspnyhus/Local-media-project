@@ -38,6 +38,7 @@ import (
 //	long:   two minutes, a key frame every second: twenty chunks to jump
 //	        about in.
 //	hush:   60 seconds of picture whose sound stops after 50.
+//	wide:   60 seconds as MP4 with a key frame every 25 seconds.
 //	sparse: 60 seconds as MP4 with a key frame every 12 seconds.
 //	trimmed: the last 43 seconds of sparse, cut out without re-encoding. The
 //	        cut is 5 seconds after a key frame; those 5 seconds are still in
@@ -74,7 +75,7 @@ func source(t *testing.T, ffmpeg, name string) string {
 	switch name {
 	case "recording", "capture":
 		p = filepath.Join(filmDir, name+".ts")
-	case "sparse", "trimmed":
+	case "sparse", "trimmed", "wide":
 		p = filepath.Join(filmDir, name+".mp4")
 	}
 	picture := func(seconds string) []string {
@@ -129,6 +130,10 @@ func source(t *testing.T, ffmpeg, name string) string {
 			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
 	case "trimmed":
 		recipes = [][]string{{"-ss", "17", "-i", source(t, ffmpeg, "sparse"), "-c", "copy", p}}
+	case "wide":
+		recipes = [][]string{append(picture("60"),
+			"-c:v", "libx264", "-preset", "ultrafast", "-g", "600", "-keyint_min", "600", "-sc_threshold", "0",
+			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
 	}
 	var out []byte
 	var err error
@@ -495,6 +500,14 @@ func TestAFilmThatCannotBeCutIsNotGivenAListAsIfItCould(t *testing.T) {
 	// What comes back with the error is the grid to fall back on.
 	if !g.Valid() || g.From != "uniform" || len(g.Cuts) != 15 {
 		t.Errorf("the grid to fall back on: %+v", g)
+	}
+	// Key frames 25 seconds apart make long chunks, but chunks that can be
+	// used. Every jump in such a file landed on a key frame, so there are
+	// no others to look for: it is not read through, which for a long film
+	// on a slow disk would take minutes.
+	wide := grid(t, ffprobe, source(t, ffmpeg, "wide"), 60000)
+	if wide.From != "probe" || len(wide.Cuts) != 3 || wide.Cuts[1] != 25000 || wide.Cuts[2] != 50000 {
+		t.Errorf("a film with a key frame every 25 seconds: %+v", wide)
 	}
 	// A list like that kept from an earlier version is not played from
 	// either: the film is cut evenly instead, on the same clock.

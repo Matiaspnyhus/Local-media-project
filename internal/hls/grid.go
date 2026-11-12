@@ -176,20 +176,23 @@ func FindCuts(ctx context.Context, ffprobe, path string, durationMs int64) (Grid
 		if iv.Len() == 0 {
 			return g, nil
 		}
-		keys, err := keyFrames(ctx, ffprobe, path, iv.String())
+		keys, missed, err := keyFrames(ctx, ffprobe, path, iv.String())
 		if err != nil {
 			return even(), fmt.Errorf("ffprobe could not find the key frames: %w", err)
 		}
 		// Skip repeats (two places that share a key frame) and cuts that would
 		// make a chunk too short to be worth a request.
 		g.addCuts(keys, 2000)
-		if denseEnough(g.Cuts, g.StartMs, g.EndMs) {
+		// Good enough if no chunk is too long to use, and if either every
+		// jump landed on a key frame (then the long stretches there are
+		// have no key frame in them) or there are no long stretches.
+		if g.Valid() && (missed == 0 || denseEnough(g.Cuts, g.StartMs, g.EndMs)) {
 			return g, nil
 		}
-		// Long stretches without a cut: either jumps in this file do not land
-		// on key frames, or it really has few. Reading it through tells.
+		// Otherwise jumps in this file do not land on key frames, or its
+		// own list of them is thin. Reading it through tells.
 	}
-	keys, err := keyFrames(ctx, ffprobe, path, "")
+	keys, _, err := keyFrames(ctx, ffprobe, path, "")
 	if err != nil {
 		return even(), fmt.Errorf("ffprobe could not read the film through for its key frames: %w", err)
 	}
@@ -241,8 +244,10 @@ func clockStart(ctx context.Context, ffprobe, path string) (startMs, leadMs int6
 
 // keyFrames asks ffprobe when the picture's key frames are shown, in
 // milliseconds, in order. With intervals it looks only where they say (see
-// ffprobe's -read_intervals); without, it reads the whole film.
-func keyFrames(ctx context.Context, ffprobe, path, intervals string) ([]int64, error) {
+// ffprobe's -read_intervals); without, it reads the whole film. others is
+// how many of the frames it was shown were not key frames: when jumping,
+// how many jumps did not land on one.
+func keyFrames(ctx context.Context, ffprobe, path, intervals string) (keys []int64, others int, err error) {
 	a := []string{"-v", "error", "-select_streams", "v:0"}
 	if intervals != "" {
 		a = append(a, "-read_intervals", intervals)
@@ -251,13 +256,16 @@ func keyFrames(ctx context.Context, ffprobe, path, intervals string) ([]int64, e
 	hideWindow(cmd)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	var keys []int64
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
 		f := strings.Split(sc.Text(), ",")
-		if len(f) < 2 || !strings.HasPrefix(f[1], "K") {
+		if len(f) < 2 {
+			continue
+		}
+		if !strings.HasPrefix(f[1], "K") {
+			others++
 			continue
 		}
 		if v, err := strconv.ParseFloat(f[0], 64); err == nil {
@@ -265,7 +273,7 @@ func keyFrames(ctx context.Context, ffprobe, path, intervals string) ([]int64, e
 		}
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	return keys, nil
+	return keys, others, nil
 }
 
 // denseEnough says whether a file's own list of key frames is fit to cut
