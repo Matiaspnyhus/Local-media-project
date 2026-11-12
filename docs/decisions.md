@@ -227,6 +227,7 @@ Before the first release, the M3 code was read by seven independent reviewers, e
 - The installer and uninstaller stop only the program itself; a subtitle or key-frame helper still running can block replacing ffmpeg.exe. Low (reasoned, not run on Windows).
 - A forced end leaves temporary files that nothing removes (cache/subtitles/making-*.tmp; the chunk folder if the program is never started again). Low.
 - Two versions of one film: the list judges the largest file while Play opens the first one found, so the list can say "plays" for a film that Play then refuses. Low.
+- When a player asks for the header and a chunk at the same moment at a point where the film's sound has already ended, one of the two can fail and has to be asked for again. A repair for this passed on ffmpeg 6.1 but its test failed on the shipped 8.1.3 (the chunk was answered "try again"), so the repair was taken out again rather than shipped unproven. Low.
 - For a clip trimmed without re-encoding (see above), the saved position is a few seconds off between a device that gets it repackaged and one that plays it as it is.
 
 ## 2026-11-12: M4 — started, not finished (stopped to save the owner's usage)

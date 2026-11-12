@@ -116,8 +116,7 @@ type session struct {
 	// sound, found no sound left in the film (0 if that has not happened).
 	// Runs started there or later carry the picture alone. header is the
 	// header of the first run that carried the sound, which is the one a
-	// player must be given whatever is running; until there is one, no run
-	// without the sound is started. See wait.
+	// player must be given whatever is running: see wait.
 	quietFrom int
 	header    []byte
 	// edit is what the first run's header gave as the tick of the picture's
@@ -388,10 +387,8 @@ func (m *Manager) reach() int {
 
 func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error) {
 	deadline := time.Now().Add(30 * time.Second)
-	launched := false   // this request has started ffmpeg, and may not again unless it learns something new
+	launched := false
 	var unreadable *run // the run whose file for this request could not be read
-	var met *run        // the last run this request found to have had no sound left to send
-	owed := false       // this request is waiting for a header with the sound in it
 	for {
 		m.mu.Lock()
 		s := m.sessions[token]
@@ -421,44 +418,13 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 		}
 		r := s.run
 		alive := r != nil && r.alive()
-		// ffmpeg sends nothing until it has the first piece of every track.
-		// Started with the sound at a point where the sound track has
-		// already ended (in many films it stops a little before the picture
-		// does), it reads to the end of the film and has sent nothing: it
-		// ends having made no chunk, or says it cannot write the header.
-		silent := r != nil && !alive && !r.quiet && s.spec.AudioTrack >= 0 && r.first > 0 && r.next == r.first &&
-			(r.ended || strings.Contains(r.stderr.String(), "Cannot write moov atom before"))
-		if silent && r != met {
-			// Remembered for every later jump: a run started there or later
-			// carries the picture alone, which is what a viewer who plays
-			// through to that point gets too. And it is news to this request:
-			// whatever it started before, it may start what the news calls for.
-			if s.quietFrom == 0 || r.first < s.quietFrom {
-				s.quietFrom = r.first
-			}
-			met, launched = r, false
-		}
-		if n < 0 && r != nil && (r.quiet || silent) && s.header != nil {
+		if n < 0 && r != nil && r.quiet && s.header != nil {
 			// What is running leaves the sound out, and its header says the
-			// film has none; or it found no sound left and made no header at
-			// all. A player goes by the header it is given, so it gets the
-			// one an earlier run made, with the sound in it.
+			// film has none. A player goes by the header it is given, so it
+			// gets the one an earlier run made, with the sound in it.
 			b := s.header
 			m.mu.Unlock()
 			return b, nil
-		}
-		// A run without the sound is not started before the session has a
-		// header with the sound in it, or there would be none to give a
-		// player. A request for a chunk in the silent end that comes before
-		// there is one sees to the header first, and then to its chunk.
-		needHeader := n >= 0 && s.spec.AudioTrack >= 0 && s.quietFrom > 0 && n >= s.quietFrom && s.header == nil
-		if needHeader {
-			owed = true
-		} else if owed {
-			// The header has come. The run that made it is at the top of the
-			// film for nobody's sake any more, so moving it from there is
-			// not held against this request either.
-			owed, launched = false, false
 		}
 		lost := false
 		if r != nil && (n < 0 && r.header && !r.quiet || n >= r.low && n < r.next) {
@@ -480,6 +446,14 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 			// cleaning tool), and waiting will not bring it back.
 			lost = true
 		}
+		// ffmpeg sends nothing until it has the first piece of every track.
+		// Started with the sound at a point where the sound track has
+		// already ended (in many films it stops a little before the picture
+		// does), it reads to the end of the film and has sent nothing: it
+		// ends having made no chunk, or says it cannot write the header.
+		dry := r != nil && !alive && !r.quiet && s.spec.AudioTrack >= 0 && r.first > 0 && r.next == r.first &&
+			n >= r.first && n < r.first+m.reach() &&
+			(r.ended || strings.Contains(r.stderr.String(), "Cannot write moov atom before"))
 		startAt := -1
 		switch {
 		case lost:
@@ -489,28 +463,24 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 			if n < 0 {
 				startAt = r.first
 			}
-		case needHeader:
-			// Only a run with the sound makes that header. If one is on its
-			// way (a request for the header started it, or this one did),
-			// wait for it; if not, start one at the top of the film.
-			if !alive || r.quiet {
-				startAt = 0
+		case dry:
+			// Start again here with the picture alone, which is what a
+			// viewer who plays through to this point gets too, and remember
+			// it for the next jump. This request may start ffmpeg twice.
+			if s.quietFrom == 0 || r.first < s.quietFrom {
+				s.quietFrom = r.first
 			}
+			startAt, launched = n, false
 		case n < 0:
 			// The header was asked for and nothing is running: start at the
-			// top, or where the stopped run began. At the top as well when
-			// the stopped run found no sound left where it began, or when
-			// what is running leaves the sound out: a header with the sound
-			// in it is made where there is sound.
-			if r == nil || r.quiet || silent {
+			// top, or where the stopped run began. The same when what is
+			// running leaves the sound out and no run has yet made a header
+			// with the sound in it.
+			if r == nil || r.quiet {
 				startAt = 0
 			} else if !alive && !r.header {
 				startAt = r.first
 			}
-		case silent:
-			// Start again at this chunk: in the silent end, where that is
-			// now known to be, with the picture alone.
-			startAt = n
 		case r == nil || n < r.low || n >= r.next+m.reach() || !alive && !r.ended:
 			// Not started, behind this run, too far ahead of it, or the run
 			// was stopped: start ffmpeg at this chunk.
