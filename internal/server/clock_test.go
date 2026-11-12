@@ -95,10 +95,19 @@ func TestWhereAViewerStoppedIsTheFilmsOwnTime(t *testing.T) {
 	}
 	seconds, _ := strconv.ParseFloat(m[1], 64)
 	ahead := int64(seconds * 1000)
-	if ahead != 5000 || p.DurationMs < 42000 || p.DurationMs > 44000 || p.PositionMs != 0 {
-		t.Fatalf("the clip runs %d ms ahead and Play says it is %d ms long, starting at %d; want 5000, about 43000 and 0", ahead, p.DurationMs, p.PositionMs)
+	long := listed().DurationMs // the film's own length
+	if ahead != 5000 || long < 42000 || long > 44000 || p.PositionMs != 0 {
+		t.Fatalf("the clip runs %d ms ahead, the list says it is %d ms long, and Play starts it at %d; want 5000, about 43000 and 0", ahead, long, p.PositionMs)
 	}
-	long := p.DurationMs
+	// A player is told the length of its own timeline, as it is told the
+	// place on its own clock: the repackaged clip's timeline is longer than
+	// the film by what its clock runs ahead.
+	if got := play("as it is").DurationMs; got != long {
+		t.Errorf("the device that plays the file as it is is told the film is %d ms long, want %d", got, long)
+	}
+	if p.DurationMs != long+ahead {
+		t.Errorf("the repackaged clip's player is told its timeline is %d ms long, want %d: the film's %d and the %d its clock runs ahead", p.DurationMs, long+ahead, long, ahead)
+	}
 
 	// Twenty seconds into the film, the repackaged clip's player reads 25
 	// seconds, and its timeline is five seconds longer than the film.
@@ -129,9 +138,47 @@ func TestWhereAViewerStoppedIsTheFilmsOwnTime(t *testing.T) {
 		}
 	}
 
+	// The page's player for chunks carries on from the place it is given
+	// unless that is within the last five seconds of the length it is given,
+	// and the page plays a file sent as it is by the same rule. (This is the
+	// page's own arithmetic, repeated here; -1 is "from the beginning".) So a
+	// place and a length on different clocks go wrong near the end: stopped
+	// nine to five seconds before the end on one device, the clip started
+	// from the beginning on the device that gets it repackaged. Wherever it
+	// was stopped, both devices must do the same.
+	carriesOn := func(p answer) int64 {
+		if p.PositionMs > 0 && p.PositionMs < p.DurationMs-5000 {
+			return p.PositionMs
+		}
+		return -1
+	}
+	for _, c := range []struct {
+		film    int64 // where it was stopped, in the film's own time
+		resumes bool
+	}{{long - 12000, true}, {long - 9000, true}, {long - 7000, true}, {long - 5500, true}, {long - 4500, false}} {
+		for _, savedOn := range []string{"as it is", "repackaged"} {
+			runs := map[string]int64{"as it is": 0, "repackaged": ahead}
+			play(savedOn)
+			save(savedOn, c.film+runs[savedOn], long+runs[savedOn])
+			if it := listed(); it.PositionMs != c.film || it.Played {
+				t.Fatalf("stopped %d ms before the end on the device that plays the clip %s: the list says %d ms, watched %v", long-c.film, savedOn, it.PositionMs, it.Played)
+			}
+			for as, clock := range runs {
+				want := int64(-1)
+				if c.resumes {
+					want = c.film + clock
+				}
+				if got := carriesOn(play(as)); got != want {
+					t.Errorf("stopped %d ms before the end on the device that plays the clip %s: the device that plays it %s carries on at %d, want %d", long-c.film, savedOn, as, got, want)
+				}
+			}
+		}
+	}
+
 	// The last thing a page does when its player is closed is to save the
 	// place and to tell the PC to stop converting, and the two can arrive
 	// in either order. The place must be read rightly after the stop too.
+	p = play("repackaged")
 	if w := e.do("POST", "/api/hls/"+p.HLS+"/stop", remote, device["repackaged"], nil); w.Code != 200 {
 		t.Fatalf("stop: %d", w.Code)
 	}

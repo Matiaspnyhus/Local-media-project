@@ -376,3 +376,227 @@ n=0; while [ ! -e '`+die+`' ] && [ $n -lt 600 ]; do sleep 0.1; n=$((n+1)); done;
 		t.Errorf("after a good run %d subtitles are kept, want 1: %v", len(kept), kept)
 	}
 }
+
+// twoBytesBare saves text two bytes a letter (UTF-16) without the mark at
+// its start that says so and says which of the two bytes comes first.
+func twoBytesBare(text string, bigEnd bool) string {
+	var b []byte
+	for _, u := range utf16.Encode([]rune(text)) {
+		if bigEnd {
+			b = append(b, byte(u>>8), byte(u))
+		} else {
+			b = append(b, byte(u), byte(u>>8))
+		}
+	}
+	return string(b)
+}
+
+// addressesBeside gives the address of every subtitle file beside the film,
+// by the file's name. (Not every kind of file is offered on the page, but
+// each has an address.)
+func addressesBeside(t *testing.T, e trackEnv) map[string]string {
+	t.Helper()
+	rows, err := e.s.db.Query(`SELECT rel_path FROM sidecars WHERE file_id=?`, e.fileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var rel string
+		rows.Scan(&rel)
+		out[filepath.Base(rel)] = "/api/files/" + e.fileID + "/subtitles/" + sidecarKey(rel)
+	}
+	return out
+}
+
+// A subtitle file saved two bytes a letter says so with a mark at its
+// start, usually. Without the mark ffmpeg takes a styled file for another
+// kind of file altogether, finds no captions in it, says nothing and
+// reports success: every line was lost, and the empty result was kept and
+// sent as a success from then on. The server's own reading of .srt files
+// came out just as empty. Such files are read by the server now, whichever
+// of the two bytes comes first, and every line arrives: the first time,
+// and from the kept copy.
+func TestSubtitleFilesInTwoBytesALetterKeepEveryLine(t *testing.T) {
+	ffmpeg := needFFmpeg(t)
+	e := filmWith(t, []string{`0,'video','h264',1,0,0,0,'',''`, `1,'audio','aac',1,0,0,0,'eng',''`}, map[string]string{
+		"Track Film (2019).no.ass": twoBytesBare(styled(readCaptions), false),
+		"Track Film (2019).sv.ass": twoBytesBare(styled(readCaptions), true),
+		"Track Film (2019).da.ssa": twoBytesBare(styledOlder(readCaptions), false),
+		"Track Film (2019).fi.sub": twoBytesBare(byFrames(readCaptions), false),
+		"Track Film (2019).is.sub": twoBytes(byFrames(readCaptions)), // with the mark: ffmpeg reads styled files so, but not this kind
+		"Track Film (2019).de.srt": twoBytesBare(numbered(readCaptions), false),
+		"Track Film (2019).fr.srt": twoBytesBare(numbered(readCaptions), true),
+		"Track Film (2019).en.vtt": twoBytesBare("WEBVTT\n\n00:01.000 --> 00:02.000\n"+strings.Join(readCaptions, "\n")+"\n", false),
+	})
+	e.s.ffmpeg = ffmpeg
+	address := addressesBeside(t, e)
+	if len(address) != 8 {
+		t.Fatalf("the scan found %d of the 8 subtitle files: %v", len(address), address)
+	}
+	for name, url := range address {
+		for _, when := range []string{"the first time", "the second time"} {
+			w := e.do("GET", url, remote, e.c, nil)
+			if missing := lacking(w.Body.String(), readCaptions); w.Code != 200 || len(missing) > 0 {
+				t.Errorf("%s, %s: answered %d without %q:\n%q", name, when, w.Code, missing, w.Body)
+			}
+		}
+	}
+	// The five that go through ffmpeg are kept, each whole.
+	kept := keptSubtitles(e.env)
+	if len(kept) != 5 {
+		t.Errorf("%d subtitles were kept for next time, want 5: %v", len(kept), kept)
+	}
+	for _, k := range kept {
+		b, _ := os.ReadFile(k)
+		if missing := lacking(string(b), readCaptions); len(missing) > 0 {
+			t.Errorf("the kept copy %s lacks %q", filepath.Base(k), missing)
+		}
+	}
+}
+
+// A subtitle file beside a film is there because it holds captions. When
+// ffmpeg finds none in it, ffmpeg has misread the file (it guesses what
+// kind of file it has, and says nothing when the guess is wrong), so the
+// answer is an error that is not kept, and never an empty success. Shown
+// with a styled file that holds no caption at all, and with one saved four
+// bytes a letter, which ffmpeg takes for another kind of file.
+func TestASubtitleFileWithoutASingleCaptionIsAnError(t *testing.T) {
+	ffmpeg := needFFmpeg(t)
+	fourBytes := ""
+	for _, r := range styled(readCaptions) {
+		fourBytes += string([]byte{byte(r), byte(r >> 8), byte(r >> 16), 0})
+	}
+	e := filmWith(t, []string{`0,'video','h264',1,0,0,0,'',''`, `1,'audio','aac',1,0,0,0,'eng',''`}, map[string]string{
+		"Track Film (2019).no.ass": styled(nil),
+		"Track Film (2019).sv.ass": fourBytes,
+	})
+	e.s.ffmpeg = ffmpeg
+	address := addressesBeside(t, e)
+	if len(address) != 2 {
+		t.Fatalf("the scan found %d of the 2 subtitle files: %v", len(address), address)
+	}
+	for name, url := range address {
+		for round := 1; round <= 2; round++ {
+			w := e.do("GET", url, remote, e.c, nil)
+			if w.Code != 500 || w.Header().Get("Cache-Control") != "no-store" || !strings.Contains(w.Body.String(), `"error"`) {
+				t.Errorf("%s, request %d: answered %d %q with Cache-Control %q; want an error that is not kept", name, round, w.Code, w.Body, w.Header().Get("Cache-Control"))
+			}
+		}
+		onDisk, _ := os.ReadFile(filepath.Join(e.s.dataDir, "logs", "localmedia.log"))
+		if !strings.Contains(string(onDisk), "the subtitles of "+name+" could not be prepared") || strings.Contains(string(onDisk), e.media) {
+			t.Errorf("the log should say that the subtitles of %s could not be prepared, without the folder:\n%s", name, onDisk)
+		}
+	}
+	if kept := keptSubtitles(e.env); len(kept) != 0 {
+		t.Errorf("a subtitle without a single caption was kept for next time: %v", kept)
+	}
+}
+
+// A subtitle track inside a film is another matter: the film says the track
+// is there, and one with nothing in it is simply empty. That is not an
+// error, and it is kept like any other.
+func TestAnEmptySubtitleTrackInsideAFilmIsNotAnError(t *testing.T) {
+	e := filmWith(t, []string{`0,'video','h264',1,0,0,0,'',''`, `1,'audio','aac',1,0,0,0,'eng',''`, `2,'subtitle','subrip',0,0,0,0,'eng',''`}, nil)
+	subs := e.play(t).Subtitles
+	if len(subs) != 1 {
+		t.Fatalf("subtitles: %+v", subs)
+	}
+	e.s.ffmpeg = script(t, `printf 'WEBVTT\n\n'`)
+	for i, want := range []string{"no-store", "private, max-age=3600"} {
+		w := e.do("GET", subs[0].URL, remote, e.c, nil)
+		if w.Code != 200 || w.Body.String() != "WEBVTT\n\n" || w.Header().Get("Cache-Control") != want {
+			t.Errorf("request %d: %d %q with Cache-Control %q, want an empty subtitle with %q", i+1, w.Code, w.Body, w.Header().Get("Cache-Control"), want)
+		}
+	}
+}
+
+// How the server tells which encoding a subtitle file is in.
+func TestWhichEncodingASubtitleFileIsIn(t *testing.T) {
+	text := "1\r\n00:00:01,000 --> 00:00:02,000\r\nJeg liker blåbær\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\n“Åse” sa ça va\r\n"
+	oldText := "1\r\n00:00:01,000 --> 00:00:02,000\r\nJeg liker bl\xe5b\xe6r\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\n\x93\xc5se\x94 sa \xe7a va\r\n"
+	// A language written without Latin letters still has the digits and the
+	// punctuation of its times to tell two bytes a letter by.
+	chinese := "1\r\n00:00:01,000 --> 00:00:02,000\r\n你好，我的朋友们，今天天气很好\r\n\r\n2\r\n00:00:03,000 --> 00:00:04,000\r\n一二三四五六七八九十，再见\r\n"
+	for _, c := range []struct{ name, in, want string }{
+		{"today's encoding", text, text},
+		{"today's encoding with its mark", "\xEF\xBB\xBF" + text, text},
+		{"the old Western European encoding", oldText, text},
+		{"two bytes a letter with the mark", twoBytes(text), text},
+		{"two bytes a letter without the mark", twoBytesBare(text, false), text},
+		{"two bytes a letter the other way round without the mark", twoBytesBare(text, true), text},
+		{"Chinese, two bytes a letter without the mark", twoBytesBare(chinese, false), chinese},
+		{"Chinese the other way round", twoBytesBare(chinese, true), chinese},
+		{"Chinese in today's encoding", chinese, chinese},
+		// One stray byte in a file that is otherwise in today's encoding (a
+		// damaged file, or one put together from two) used to have the
+		// whole file read as the old encoding: every accented letter in it
+		// became two wrong ones.
+		{"today's encoding with a stray byte", strings.Replace(text, "Jeg", "Jeg\xff", 1), strings.Replace(text, "Jeg", "Jegÿ", 1)},
+		// The old encoding can by chance hold a pair of bytes that reads as
+		// one letter of today's ("ß…" is such a pair). The file is still in
+		// the old encoding throughout.
+		{"the old encoding with a pair that looks like today's", oldText + "\r\n3\r\n00:00:05,000 --> 00:00:06,000\r\nIch wei\xdf\x85\r\n", text + "\r\n3\r\n00:00:05,000 --> 00:00:06,000\r\nIch weiß…\r\n"},
+		{"nothing", "", ""},
+		{"one letter", "a", "a"},
+	} {
+		if got := string(decodeText([]byte(c.in))); got != c.want {
+			t.Errorf("%s:\n got %q\nwant %q", c.name, got, c.want)
+		}
+	}
+	// Text with a stray zero byte in it is not two bytes a letter.
+	if _, _, ok := inTwoBytes([]byte("Plain text with a stray \x00 byte, and no more of them than that one.")); ok {
+		t.Error("text with one zero byte in it was taken for two bytes a letter")
+	}
+}
+
+// The first version kept every subtitle ffmpeg had made, the ones that had
+// lost lines among them, and a kept copy is served for good. Copies are
+// kept under another name now (see keptName), so that none of those is
+// used again: each subtitle is made afresh once.
+func TestSubtitlesKeptByTheFirstVersionAreMadeAfresh(t *testing.T) {
+	e := filmWith(t, []string{`0,'video','h264',1,0,0,0,'',''`, `1,'audio','aac',1,0,0,0,'eng',''`, `2,'subtitle','subrip',0,0,0,0,'eng',''`},
+		map[string]string{"Track Film (2019).no.ass": styledFile})
+	subs := e.play(t).Subtitles
+	if len(subs) != 2 {
+		t.Fatalf("subtitles: %+v", subs)
+	}
+	var size, mtime int64
+	e.s.db.QueryRow(`SELECT size, mtime FROM files WHERE id=?`, e.fileID).Scan(&size, &mtime)
+	var rel string
+	e.s.db.QueryRow(`SELECT rel_path FROM sidecars WHERE file_id=?`, e.fileID).Scan(&rel)
+	beside, err := os.Stat(filepath.Join(e.media, filepath.FromSlash(rel)))
+	if err != nil || size == 0 || mtime == 0 {
+		t.Fatalf("the film (%d bytes, changed at %d) or the file beside it (%q) was not found: %v", size, mtime, rel, err)
+	}
+	// What the first version would have left behind: for a track inside the
+	// film, the film's id, the track, the film's size and date; for a file
+	// beside it, the same with that file's date and without a size. And, to
+	// be sure, each name in the other's form.
+	dir := filepath.Join(e.s.dataDir, "cache", "subtitles")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const old = "WEBVTT\n\n00:01.000 --> 00:02.000\nKept by the first version\n\n"
+	key := sidecarKey(rel)
+	for _, name := range []string{
+		fmt.Sprintf("%s-e0-%d-%d", e.fileID, size, mtime),
+		fmt.Sprintf("%s-e0-%d", e.fileID, mtime),
+		fmt.Sprintf("%s-%s-%d", e.fileID, key, beside.ModTime().Unix()),
+		fmt.Sprintf("%s-%s-%d-%d", e.fileID, key, beside.Size(), beside.ModTime().Unix()),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name+".vtt"), []byte(old), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.s.ffmpeg = script(t, `printf 'WEBVTT\n\n00:01.000 --> 00:02.000\nMade afresh\n\n'`)
+	for _, s := range subs {
+		for _, when := range []string{"the first time", "the second time"} {
+			w := e.do("GET", s.URL, remote, e.c, nil)
+			if w.Code != 200 || !strings.Contains(w.Body.String(), "Made afresh") || strings.Contains(w.Body.String(), "Kept by the first version") {
+				t.Errorf("subtitle %s, %s: answered %d %q; want it made afresh, not the copy the first version kept", s.Key, when, w.Code, w.Body)
+			}
+		}
+	}
+}

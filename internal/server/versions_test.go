@@ -220,8 +220,13 @@ func TestTheOrderOfVersions(t *testing.T) {
 	plan := func(a playback.Answer, m playback.Method) playback.Plan { return playback.Plan{Playable: a, Method: m} }
 	inOrder := []*version{
 		{rel: "direct, 4K", plan: plan(playback.Yes, playback.Direct), pixels: 3840 * 2160, size: 10},
-		{rel: "direct, 1080p, bigger file", plan: plan(playback.Yes, playback.Direct), pixels: 1920 * 1080, size: 30},
-		{rel: "direct, 1080p, smaller file", plan: plan(playback.Yes, playback.Direct), pixels: 1920 * 1080, size: 20},
+		// These two differ in the size of the file alone. Their names are in
+		// the other order, so that it is the size that is seen to decide.
+		{rel: "direct, 1080p, the larger file", plan: plan(playback.Yes, playback.Direct), pixels: 1920 * 1080, size: 30},
+		{rel: "direct, 1080p, a smaller file", plan: plan(playback.Yes, playback.Direct), pixels: 1920 * 1080, size: 20},
+		// And these two in nothing but their names.
+		{rel: "direct, 720p, copy 1", plan: plan(playback.Yes, playback.Direct), pixels: 1280 * 720, size: 20},
+		{rel: "direct, 720p, copy 2", plan: plan(playback.Yes, playback.Direct), pixels: 1280 * 720, size: 20},
 		{rel: "repackaged", plan: plan(playback.Yes, playback.Remux), pixels: 3840 * 2160, size: 90},
 		{rel: "sound converted", plan: plan(playback.Yes, playback.Audio), pixels: 3840 * 2160, size: 90},
 		{rel: "picture converted", plan: plan(playback.Yes, playback.Convert), pixels: 3840 * 2160, size: 90},
@@ -329,5 +334,120 @@ func TestProgressAndPicksCarryOverBetweenVersions(t *testing.T) {
 	choose(tv, map[string]any{"audioLang": "en", "subLang": "no", "subsOn": true, "audioIndex": 1, "subKey": "e0"})
 	if _, onPhone = v.answers(t, phone); !strings.HasPrefix(picked(onPhone), "sound 0 en,") {
 		t.Errorf("after English sound was picked on the TV the phone starts with %v", picked(onPhone))
+	}
+}
+
+// A copy that does not say how long it is cannot be handed out as chunks,
+// so it cannot be repackaged or have its sound converted. That rule was
+// known to Play alone. The lists ranked such a copy as one that plays
+// repackaged: it was preferred to a copy that really plays, the list said
+// "plays", and Play then refused the film.
+func TestACopyThatCannotBeRepackagedIsNotPreferredToOneThatPlays(t *testing.T) {
+	onlyMP4 := map[string]any{"containers": map[string]bool{"mp4": true}, "video": map[string]bool{"h264": true}, "audio": map[string]bool{"aac": true}, "hls": true}
+	h264, h264Large := picture("h264", 8, 1920, 1080), picture("h264", 8, 3840, 2160)
+	aac, dts := sound("aac", "eng", "", true, false), sound("dts", "eng", "", true, false)
+	const noLength = "does not say how long it is"
+	// reasons asks Play again for the reasons it gives.
+	reasons := func(v versionsEnv) string {
+		var p struct{ Plan struct{ Reasons []string } }
+		decode(t, v.do("POST", "/api/items/"+v.film+"/play", remote, v.c, nil), &p)
+		return strings.Join(p.Plan.Reasons, " ")
+	}
+
+	// The other copy plays with its sound converted: that one is chosen.
+	v := twoVersions(t)
+	v.pretendConverter(t)
+	v.do("POST", "/api/capabilities", remote, v.c, onlyMP4)
+	v.inspected(t, "1080p", "matroska", h264, dts)
+	v.inspected(t, "2160p", "matroska", h264Large, aac)                       // would only need repackaging,
+	v.s.db.Exec(`UPDATE files SET duration_ms=0 WHERE id=?`, v.file["2160p"]) // but does not say how long it is
+	list, play := v.answers(t, v.c)
+	if list.Playable != "yes" || list.Method != "audio" || which(list.DurationMs) != "1080p" {
+		t.Errorf("the list says %s/%s, judging the %s copy; want the 1080p copy, which plays with its sound converted", list.Playable, list.Method, which(list.DurationMs))
+	}
+	if play.Plan.Playable != "yes" || play.Plan.Method != "audio" || which(play.DurationMs) != "1080p" {
+		t.Errorf("Play answers %s/%s with the %s copy; want the 1080p copy, which plays with its sound converted", play.Plan.Playable, play.Plan.Method, which(play.DurationMs))
+	}
+
+	// No copy plays: the list and Play both say so, and both say why.
+	v = twoVersions(t)
+	v.pretendConverter(t)
+	v.do("POST", "/api/capabilities", remote, v.c, onlyMP4)
+	v.inspected(t, "1080p", "matroska", picture("hevc", 10, 1920, 1080), aac) // this device cannot show it
+	v.inspected(t, "2160p", "matroska", h264Large, aac)
+	v.s.db.Exec(`UPDATE files SET duration_ms=0 WHERE id=?`, v.file["2160p"])
+	list, play = v.answers(t, v.c)
+	if list.Playable != "no" || list.Method != "none" || !strings.Contains(strings.Join(list.Reasons, " "), noLength) {
+		t.Errorf("the list says %s/%s because %q; want no, because the copy %s", list.Playable, list.Method, list.Reasons, noLength)
+	}
+	if why := reasons(v); play.Plan.Playable != "no" || play.Plan.Method != "none" || !strings.Contains(why, noLength) {
+		t.Errorf("Play answers %s/%s because %q; want no, because the copy %s", play.Plan.Playable, play.Plan.Method, why, noLength)
+	}
+
+	// A copy of unknown length that this device plays as it is. The viewer
+	// prefers its second sound track, which only repackaging can reach. The
+	// film's own main sound is better than no film: that is the rule for
+	// every other obstacle to the preferred sound, and it holds for this one.
+	v = twoVersions(t)
+	v.pretendConverter(t)
+	v.do("POST", "/api/capabilities", remote, v.c, onlyMP4)
+	v.inspected(t, "1080p", "matroska", picture("hevc", 10, 1920, 1080), aac)
+	v.inspected(t, "2160p", "mp4", h264Large, aac, sound("aac", "nor", "", false, false))
+	v.s.db.Exec(`UPDATE files SET duration_ms=0 WHERE id=?`, v.file["2160p"])
+	if w := v.do("PUT", "/api/prefs", remote, v.c, map[string]any{"audioLang": "no", "subLang": "", "subs": "auto"}); w.Code != 200 {
+		t.Fatalf("preferences: %d %s", w.Code, w.Body)
+	}
+	list, play = v.answers(t, v.c)
+	if list.Playable != "yes" || list.Method != "direct" {
+		t.Errorf("the list says %s/%s of a copy that plays as it is", list.Playable, list.Method)
+	}
+	if play.Plan.Playable != "yes" || play.Plan.Method != "direct" || !strings.HasPrefix(play.URL, "/stream/"+v.file["2160p"]+"?") {
+		t.Errorf("Play answers %s/%s (%s) because %q; want the file as it is, with its main sound", play.Plan.Playable, play.Plan.Method, play.URL, reasons(v))
+	}
+}
+
+// The library is looked over every quarter of an hour. A copy deleted from
+// the disk since then is still in the lists, and Play used to hand it out,
+// though it could not be fetched, while the film's other copy was there.
+func TestACopyThatIsGoneFromTheDiskIsNotHandedOut(t *testing.T) {
+	v := twoVersions(t)
+	v.do("POST", "/api/capabilities", remote, v.c, phoneLike)
+	v.inspected(t, "1080p", "matroska", picture("h264", 8, 1920, 1080), sound("aac", "eng", "", true, false), sound("aac", "nor", "", false, false))
+	v.inspected(t, "2160p", "matroska", picture("h264", 8, 3840, 2160), sound("aac", "eng", "", true, false))
+	fetched := func(p versionAnswer) int { return v.do("GET", p.URL, remote, nil, nil).Code }
+	dir := filepath.Join(v.media, "Films", "Two Sizes (2019)")
+
+	_, play := v.answers(t, v.c)
+	if which(play.DurationMs) != "2160p" || fetched(play) != 200 {
+		t.Fatalf("with both copies there Play hands out the %s copy, and fetching it answers %d; want the 2160p copy and 200", which(play.DurationMs), fetched(play))
+	}
+	if err := os.Remove(filepath.Join(dir, "Two Sizes (2019) - 2160p.mkv")); err != nil {
+		t.Fatal(err)
+	}
+	_, play = v.answers(t, v.c)
+	if which(play.DurationMs) != "1080p" || fetched(play) != 200 {
+		t.Errorf("with the 2160p copy gone from the disk Play hands out the %s copy, and fetching it answers %d; want the 1080p copy, which is there", which(play.DurationMs), fetched(play))
+	}
+	// A pick of sound is read against the copy that plays now: the second
+	// sound track is one only the 1080p copy has.
+	if w := v.do("PUT", "/api/items/"+v.film+"/choice", remote, v.c, map[string]any{"audioLang": "no", "subLang": "", "subsOn": false, "audioIndex": 1, "subKey": ""}); w.Code != 200 {
+		t.Fatalf("choice: %d %s", w.Code, w.Body)
+	}
+	var lang, kind string
+	var index int
+	v.s.db.QueryRow(`SELECT audio_lang, audio_index, audio_kind FROM track_memory`).Scan(&lang, &index, &kind)
+	if lang != "no" || index != 1 {
+		t.Errorf("the pick of the 1080p copy's second sound track was remembered as language %q, track %d", lang, index)
+	}
+
+	// With every copy gone nothing is left to choose from, and the answer is
+	// what it always was for a film whose file is gone: an address that
+	// answers "not available".
+	if err := os.Remove(filepath.Join(dir, "Two Sizes (2019) - 1080p.mkv")); err != nil {
+		t.Fatal(err)
+	}
+	_, play = v.answers(t, v.c)
+	if code := fetched(play); which(play.DurationMs) != "2160p" || code != 404 {
+		t.Errorf("with both copies gone Play hands out the %s copy, and fetching it answers %d; want the 2160p copy as before, and 404", which(play.DurationMs), code)
 	}
 }

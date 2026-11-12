@@ -348,9 +348,9 @@ func (s *Server) loadMemory(userID, scope string) *playback.Memory {
 // it is given, is that much later than the same moment in the file played
 // as it is. The page knows nothing of this, and does not need to. Play
 // notes how far ahead the player it has just answered will run, and gives
-// that player the place to carry on from on the player's clock. What the
-// player then reports is moved back by as much before it is saved (see
-// handleProgress).
+// that player the place to carry on from on the player's clock, with the
+// length of the player's timeline. What the player then reports is moved
+// back by as much before it is saved (see handleProgress).
 //
 // A note is kept by sign-in and film, in memory, and only for a clock that
 // does run ahead, which few do. It outlives the conversion it was made
@@ -459,23 +459,22 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	// The viewer picked the sound for this play only if the request names
 	// it; otherwise it comes from their settings or an earlier pick.
 	want := playback.Want{Audio: choice.Audio, AudioAuto: in.Audio == nil, Subtitle: -1, Lower: in.Lower}
-	plan := playback.DecideFor(ft.media, caps, want, limits)
+	plan := withLength(playback.DecideFor(ft.media, caps, want, limits), durationMs)
 	if plan.Playable == playback.No {
 		// The preferred sound track may be what stands in the way (it takes
-		// repackaging to switch). The file's own main track is better than
-		// nothing.
+		// repackaging to switch, which a file that does not say how long it
+		// is cannot have). The file's own main track is better than nothing.
+		// This second plan is the one the copy was judged by (see judge),
+		// with this viewer's wish for a lighter picture and the PC as busy
+		// as it is now, so a copy the lists say plays is not refused here
+		// for its sound.
 		main := want
 		main.Audio, main.AudioAuto = -1, false
-		if alt := playback.DecideFor(ft.media, caps, main, limits); alt.Playable != playback.No {
+		if alt := withLength(playback.DecideFor(ft.media, caps, main, limits), durationMs); alt.Playable != playback.No {
 			plan = alt
 		}
 	}
 
-	if (plan.Method == playback.Remux || plan.Method == playback.Audio) && durationMs <= 0 {
-		// The list of chunks a player is given covers the whole film, so
-		// its length has to be known.
-		plan = unplayable(plan, "The file does not say how long it is, so it cannot be repackaged for this device.")
-	}
 	path := filepath.Join(libPath, filepath.FromSlash(rel))
 	var grid hls.Grid
 	var convert *hls.Convert
@@ -547,6 +546,13 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	if pos > 0 {
 		out["positionMs"] = pos + subtitleShift
 	}
+	// The length goes with the place: it is the length of this player's
+	// timeline, which is longer than the film by what its clock runs ahead.
+	// The page compares the two, so as not to carry on within the last few
+	// seconds of a film, and two times on different clocks made it start
+	// such a clip from the beginning when it had been stopped a little
+	// before that.
+	out["durationMs"] = durationMs + subtitleShift
 	// For the page, should it ever need the film's own time from its
 	// player's clock: it is the player's time less this.
 	out["clockAheadMs"] = subtitleShift
@@ -798,9 +804,10 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		format = strings.ToLower(format)
 		if format != "srt" && format != "subrip" && format != "vtt" && format != "webvtt" {
 			// Every other format goes through ffmpeg, which reads the file
-			// itself.
+			// itself (but for a file saved two bytes a letter, which is read
+			// for it: see runSubtitleJob).
 			f.Close()
-			s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(subRel)), 0, keptName(fileID, key, st.Size(), st.ModTime().Unix()))
+			s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(subRel)), 0, true, keptName(fileID, key, st.Size(), st.ModTime().Unix()))
 			return
 		}
 		raw, err := io.ReadAll(f)
@@ -828,7 +835,7 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
 	}
-	s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(rel)), n, keptName(fileID, key, size, mtime))
+	s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(rel)), n, false, keptName(fileID, key, size, mtime))
 }
 
 // handleDiagnostics says what this device reported it can play and what the

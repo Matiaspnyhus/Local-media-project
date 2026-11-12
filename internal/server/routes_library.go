@@ -242,6 +242,22 @@ func preferred(copies []*version) *version {
 	return best
 }
 
+// withLength finishes the plan for a copy by asking whether the copy says
+// how long it is. One that does not can only be sent as it is: the list of
+// chunks a player is given covers the whole film, so its length has to be
+// known. The lists and Play both ask here, as they both ask preferred, so
+// that such a copy is not chosen while another plays, and a list does not
+// say "plays" of a film that Play then refuses.
+func withLength(p playback.Plan, durationMs int64) playback.Plan {
+	if durationMs > 0 || p.Playable == playback.No || p.Method == playback.Direct {
+		return p
+	}
+	p.Playable, p.Method = playback.No, playback.None
+	// (A new list, in case the plan shares the one it was made with.)
+	p.Reasons = append(append([]string{}, p.Reasons...), "The file does not say how long it is, so it cannot be repackaged for this device.")
+	return p
+}
+
 // judge works out how this device would get each copy (see version.plan).
 func (s *Server) judge(u *User, copies []*version) error {
 	byFile := make(map[string]*version, len(copies))
@@ -293,7 +309,7 @@ func (s *Server) judge(u *User, copies []*version) error {
 	// converting for someone else at this moment.
 	caps, limits := s.playCaps(u), s.limits(nil)
 	for _, v := range copies {
-		v.plan = playback.DecideFor(*media[v.fileID], caps, playback.Want{Audio: -1, Subtitle: -1}, limits)
+		v.plan = withLength(playback.DecideFor(*media[v.fileID], caps, playback.Want{Audio: -1, Subtitle: -1}, limits), v.durationMs)
 	}
 	return nil
 }
@@ -324,15 +340,42 @@ func (s *Server) copiesOf(itemID string) ([]*version, error) {
 // or nil if no copy is there. Playing a film and remembering a pick of
 // sound and subtitles both ask here, so a pick is always read against the
 // file it was made on.
+//
+// Unlike the lists, it looks at the disk when there are several copies (see
+// onDisk). So until the library is next looked over, a list may still speak
+// of a copy that has just been deleted while Play opens another.
 func (s *Server) playedVersion(u *User, itemID string) (*version, error) {
 	copies, err := s.copiesOf(itemID)
 	if err != nil || len(copies) == 0 {
 		return nil, err
 	}
+	if len(copies) > 1 {
+		copies = onDisk(copies)
+	}
 	if err := s.judge(u, copies); err != nil {
 		return nil, err
 	}
 	return preferred(copies), nil
+}
+
+// onDisk leaves out the copies whose file cannot be opened at this moment:
+// deleted or moved since the library was last looked over, which is done
+// every quarter of an hour. Such a copy is still listed, and handed out it
+// could not be fetched, while another copy of the film is there to play.
+// When none can be opened (a drive that is switched off) all are kept, and
+// the answer is what it is for any film whose file is away.
+func onDisk(copies []*version) []*version {
+	var there []*version
+	for _, v := range copies {
+		if f, _, err := openMedia(v.libPath, v.rel); err == nil {
+			f.Close()
+			there = append(there, v)
+		}
+	}
+	if len(there) == 0 {
+		return copies
+	}
+	return there
 }
 
 // loadItems reads films and episodes matching where, with this user's
