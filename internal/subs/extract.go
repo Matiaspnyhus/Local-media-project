@@ -164,12 +164,12 @@ func (j job) args(film string) []string {
 			a = append(a, "-c", "webvtt", "-f", "webvtt")
 		case formSUP:
 			a = append(a, "-c", "copy", "-f", "sup")
-		case formMKS:
+		case formTXT, formMKS:
 			// A Matroska file would also be given the film's title and
 			// chapters, which have no business in a subtitle track.
 			a = append(a, "-c", "copy", "-map_metadata", "-1", "-map_chapters", "-1", "-f", "matroska")
 		}
-		a = append(a, f.file(n))
+		a = append(a, f.made(n))
 	}
 	// The clock: one more output, which is nothing but the time of each
 	// piece of sound (or picture) as ffmpeg passes it, one number a line,
@@ -276,7 +276,7 @@ func (e *extraction) run(ctx context.Context) (Result, error) {
 			continue
 		}
 		name := f.file(n)
-		facts, size, err := check(f, filepath.Join(work, name))
+		facts, size, err := check(f, work, n)
 		if err != nil {
 			return Result{}, fmt.Errorf("subtitle track %d was not written whole: %w", n, err)
 		}
@@ -411,12 +411,20 @@ func (e *extraction) follow(out io.Reader, seen inventory, reading bool) (reache
 	return reachedMs, timed
 }
 
-// check looks at one file ffmpeg wrote for a track. It returns what the
-// file says about the track and its size, or an error if it is missing or
-// not complete. The file is also made sure to be on the disk and not just
-// on its way there, so that a full disk is found out now.
-func check(f form, path string) (PictureFacts, int64, error) {
+// check looks at what ffmpeg wrote for track n in the working folder. It
+// returns what the track's file says about the track and the file's size,
+// or an error if it is missing or not complete. The file is also made sure
+// to be on the disk and not just on its way there, so that a full disk is
+// found out now.
+func check(f form, work string, n int) (PictureFacts, int64, error) {
 	facts := PictureFacts{FirstMs: -1}
+	path := filepath.Join(work, f.file(n))
+	if f == formTXT {
+		// The track's file is yet to be written, from ffmpeg's copy.
+		first, size, err := textTrack(filepath.Join(work, f.made(n)), path)
+		facts.FirstMs = first
+		return facts, size, err
+	}
 	file, err := os.OpenFile(path, os.O_RDWR, 0)
 	if err != nil {
 		return facts, 0, err

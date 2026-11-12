@@ -30,10 +30,16 @@ func decodeText(raw []byte) []byte {
 		}
 		return []byte(string(utf16.Decode(u)))
 	}
+	return []byte(modern(raw))
+}
+
+// modern reads text that is either in today's encoding (UTF-8) or in the
+// old Western European one (Windows-1252), in which every byte is one
+// character.
+func modern(raw []byte) string {
 	if utf8.Valid(raw) {
-		return raw
+		return string(raw)
 	}
-	// Windows-1252: every byte is one character.
 	var b strings.Builder
 	for _, c := range raw {
 		if c >= 0x80 && c <= 0x9F {
@@ -42,7 +48,7 @@ func decodeText(raw []byte) []byte {
 			b.WriteRune(rune(c))
 		}
 	}
-	return []byte(b.String())
+	return b.String()
 }
 
 var cp1252 = [32]rune{0x20AC, 0xFFFD, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021, 0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0xFFFD, 0x017D, 0xFFFD,

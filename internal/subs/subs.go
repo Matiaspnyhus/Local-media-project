@@ -76,7 +76,8 @@ type form int
 const (
 	formNone form = iota
 	formASS       // a styled track, copied as it is
-	formVTT       // a text track, converted to the form browsers show
+	formTXT       // a text track, copied as it is and written here in the form browsers show
+	formVTT       // a text track of the sort MP4 files have, which ffmpeg converts to that form
 	formSUP       // disc pictures (PGS), copied into the file form made for them
 	formMKS       // DVD and broadcast pictures, copied into a Matroska file
 )
@@ -86,7 +87,9 @@ func formOf(codec string) form {
 	switch codec {
 	case "ass", "ssa":
 		return formASS
-	case "subrip", "srt", "webvtt", "vtt", "mov_text", "text":
+	case "subrip", "srt", "text", "webvtt", "vtt":
+		return formTXT
+	case "mov_text":
 		return formVTT
 	case "hdmv_pgs_subtitle", "pgssub":
 		return formSUP
@@ -104,7 +107,7 @@ func (f form) kind() Kind {
 	switch f {
 	case formASS:
 		return Styled
-	case formVTT:
+	case formTXT, formVTT:
 		return Text
 	case formSUP, formMKS:
 		return Picture
@@ -117,16 +120,15 @@ func (f form) kind() Kind {
 // told which track to read ("0:s:n") and how the rest of the program
 // numbers them.
 //
-// Text tracks are written as WebVTT, not in the film's own text format.
+// Text tracks are kept as WebVTT, not in the film's own text format.
 // WebVTT is the one form browsers show, so the file can be sent as it is;
-// one converter setting covers every text format a film can hold, where
-// copying only works for some of them; and it is what the program has
-// served for these tracks since it first showed subtitles.
+// one form covers every text format a film can hold; and it is what the
+// program has served for these tracks since it first showed subtitles.
 func (f form) file(n int) string {
 	switch f {
 	case formASS:
 		return "s" + strconv.Itoa(n) + ".ass"
-	case formVTT:
+	case formTXT, formVTT:
 		return "t" + strconv.Itoa(n) + ".vtt"
 	case formSUP:
 		return "p" + strconv.Itoa(n) + ".sup"
@@ -134,6 +136,16 @@ func (f form) file(n int) string {
 		return "p" + strconv.Itoa(n) + ".mks"
 	}
 	return ""
+}
+
+// made is the name of what ffmpeg writes for a track. For all but one sort
+// that is the track's file. A text track is copied out as the film holds
+// it, and its file is written from that copy afterwards (see textTrack).
+func (f form) made(n int) string {
+	if f == formTXT {
+		return "t" + strconv.Itoa(n) + ".mks"
+	}
+	return f.file(n)
 }
 
 // fontFile is where attachment k of the film is written. Fonts go in a

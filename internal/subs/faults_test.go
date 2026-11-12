@@ -201,3 +201,60 @@ func TestAFileThatSaysItHoldsMore(t *testing.T) {
 		t.Error("a file that is not there is taken for one that is cut short")
 	}
 }
+
+// Text tracks are not always in today's encoding: a film put together from
+// an old subtitle file carries its text as that file had it. ffmpeg, asked
+// to convert such a track, drops every caption it cannot read as today's
+// encoding and says the track is done; and when it can read too few of
+// them it gives up on the whole film, the other tracks with it. So text
+// tracks are not converted by ffmpeg: they are copied out as they are and
+// turned into WebVTT here, where a line in the old Western European
+// encoding is read as that.
+func TestATextTrackInAnOldEncodingKeepsItsLines(t *testing.T) {
+	tl := tools(t)
+	// Two of five captions are in the old encoding; one of them has two
+	// lines. The last is in today's, with letters the old one cannot hold.
+	film := mixedFilm(t, tl, srtOf("Bl\xe5b\xe6rsyltet\xf8y er godt", "Plain line", "Enda en bl\xe5 linje\nover to linjer", "Plain line", "Blåbær og ♪ i dag"))
+	dir, res, _ := extracted(t, tl, film)
+	if len(res.Tracks) != 3 || !res.Tracks[0].Done || !res.Tracks[1].Done || !res.Tracks[2].Done || res.Tracks[1].File != "t1.vtt" || res.Tracks[1].FirstMs != 1000 {
+		t.Fatalf("tracks: %+v", res.Tracks)
+	}
+	want := "WEBVTT\n" +
+		"\n00:00:01.000 --> 00:00:01.800\nBlåbærsyltetøy er godt\n" +
+		"\n00:00:02.000 --> 00:00:02.800\nPlain line\n" +
+		"\n00:00:03.000 --> 00:00:03.800\nEnda en blå linje\nover to linjer\n" +
+		"\n00:00:04.000 --> 00:00:04.800\nPlain line\n" +
+		"\n00:00:05.000 --> 00:00:05.800\nBlåbær og ♪ i dag\n"
+	if got := string(mustRead(t, filepath.Join(dir, "t1.vtt"))); got != want {
+		t.Errorf("the text track:\n%q\nwant\n%q", got, want)
+	}
+}
+
+// A text track of which not one caption is in today's encoding (Greek, in
+// the encoding Greek PCs used) made ffmpeg give up on the whole film. Now
+// the film's other tracks come out, and so does this one: its ten captions
+// are there, at their times. (Their letters are wrong: only the Western
+// European encoding is known here. That is what the program does with a
+// subtitle file in such an encoding too.)
+func TestATextTrackNobodyCanReadDoesNotLoseTheFilm(t *testing.T) {
+	tl := tools(t)
+	var greek []string
+	for i := 0; i < 10; i++ {
+		greek = append(greek, "\xca\xe1\xeb\xe7\xec\xdd\xf1\xe1 \xea\xfc\xf3\xec\xe5")
+	}
+	dir, res, _ := extracted(t, tl, mixedFilm(t, tl, srtOf(greek...)))
+	if len(res.Tracks) != 3 || !res.Tracks[0].Done || !res.Tracks[1].Done || !res.Tracks[2].Done {
+		t.Fatalf("tracks: %+v", res.Tracks)
+	}
+	vtt := string(mustRead(t, filepath.Join(dir, "t1.vtt")))
+	if got := strings.Count(vtt, "-->"); got != 10 || !strings.Contains(vtt, "\n00:00:10.000 --> 00:00:10.800\n") {
+		t.Errorf("%d of 10 captions came out:\n%s", got, vtt)
+	}
+	// The other two are what they would be in any film.
+	if got := Flatten(mustRead(t, filepath.Join(dir, "s0.ass"))); len(got) != 2 {
+		t.Errorf("the styled track: %+v", got)
+	}
+	if facts, err := ReadPicture(filepath.Join(dir, "p2.sup")); err != nil || facts != (PictureFacts{Width: 1920, Height: 1080, FirstMs: 2000}) {
+		t.Errorf("the disc's track: %+v, %v", facts, err)
+	}
+}

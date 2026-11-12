@@ -428,27 +428,39 @@ var vttEscape = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 // begin before zero begins at zero; one that would be over by then is left
 // out.
 func WebVTT(cues []Cue) []byte {
+	list := make([]vttCaption, 0, len(cues))
+	for _, c := range cues {
+		// "<" would begin an instruction of WebVTT's own.
+		list = append(list, vttCaption{startMs: c.StartMs, endMs: c.EndMs, lines: ownLines(vttEscape.Replace(c.Text))})
+	}
+	file, _ := vttFile(list)
+	return file
+}
+
+// vttCaption is a caption ready to be written: its lines are WebVTT as they
+// stand, and none is empty (an empty line would end the caption).
+type vttCaption struct {
+	startMs, endMs int64
+	lines          []string
+}
+
+// vttFile writes a WebVTT file. It also returns when the first of its
+// captions is shown, or -1 if it has none.
+func vttFile(cues []vttCaption) (file []byte, firstMs int64) {
+	firstMs = -1
 	var b strings.Builder
 	b.WriteString("WEBVTT\n")
 	for _, c := range cues {
-		start := max(c.StartMs, 0)
-		if c.EndMs <= start {
+		start := max(c.startMs, 0)
+		if c.endMs <= start || len(c.lines) == 0 {
 			continue
 		}
-		var lines []string
-		for _, line := range strings.Split(c.Text, "\n") {
-			// An empty line would end the caption, and "<" would begin an
-			// instruction of WebVTT's own.
-			if line = strings.TrimSpace(line); line != "" {
-				lines = append(lines, vttEscape.Replace(line))
-			}
+		if firstMs < 0 || start < firstMs {
+			firstMs = start
 		}
-		if len(lines) == 0 {
-			continue
-		}
-		b.WriteString("\n" + vttTime(start) + " --> " + vttTime(c.EndMs) + "\n" + strings.Join(lines, "\n") + "\n")
+		b.WriteString("\n" + vttTime(start) + " --> " + vttTime(c.endMs) + "\n" + strings.Join(c.lines, "\n") + "\n")
 	}
-	return []byte(b.String())
+	return []byte(b.String()), firstMs
 }
 
 func vttTime(ms int64) string {

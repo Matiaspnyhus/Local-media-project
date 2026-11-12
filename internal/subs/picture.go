@@ -147,6 +147,7 @@ const (
 	idSimpleBlock  = 0xA3
 	idBlockGroup   = 0xA0
 	idBlock        = 0xA1
+	idBlockLength  = 0x9B
 )
 
 const unknownSize = -1
@@ -186,14 +187,14 @@ func readMKS(r io.ReaderAt, length int64, whole bool) (PictureFacts, error) {
 	case size != unknownSize && data+size < length:
 		end = data + size
 	}
-	scale := int64(1000000) // how many billionths of a second one tick is
-	var codec string
-	var private []byte
+	about := mksAbout{scale: 1000000}
 	captions := 0
 	var saidW, saidH int // the size a broadcast caption gave, if one did
 	// enough says the captions need no more looking at: the first has given
 	// its time, and the first few have had their chance to give a size.
-	enough := func() bool { return captions >= 8 || captions > 0 && (saidW > 0 || codec != "" && codec != "S_DVBSUB") }
+	enough := func() bool {
+		return captions >= 8 || captions > 0 && (saidW > 0 || about.codec != "" && about.codec != "S_DVBSUB")
+	}
 	caption := func(clusterTime, at, n int64) {
 		block := make([]byte, min(n, 64<<10))
 		if _, err := r.ReadAt(block, at); err != nil {
@@ -204,7 +205,7 @@ func readMKS(r io.ReaderAt, length int64, whole bool) (PictureFacts, error) {
 			return
 		}
 		if captions == 0 {
-			facts.FirstMs = (clusterTime + rel) * scale / 1000000
+			facts.FirstMs = (clusterTime + rel) * about.scale / 1000000
 		}
 		captions++
 		if w, h, ok := dvbSize(payload); ok && saidW == 0 {
@@ -229,26 +230,7 @@ top:
 			if _, err := r.ReadAt(b, body); err != nil {
 				return facts, errNotWhole
 			}
-			ebmlChildren(b, func(id uint32, v []byte) {
-				switch id {
-				case idTimeScale:
-					if n := int64(ebmlUint(v)); n > 0 && n <= 1000000000 {
-						scale = n
-					}
-				case idTrackEntry:
-					if codec != "" {
-						return // a second track: these files have one
-					}
-					ebmlChildren(v, func(id uint32, v []byte) {
-						switch id {
-						case idCodecID:
-							codec = string(v)
-						case idCodecPrivate:
-							private = v
-						}
-					})
-				}
-			})
+			about.read(b)
 		case idCluster:
 			if enough() {
 				if !whole {
@@ -287,9 +269,9 @@ top:
 		}
 		off = body + size
 	}
-	switch codec {
+	switch about.codec {
 	case "S_VOBSUB":
-		described := readIDX(private)
+		described := readIDX(about.private)
 		facts.Width, facts.Height = described.Width, described.Height
 	case "S_DVBSUB":
 		facts.Width, facts.Height = dvbWidth, dvbHeight
@@ -300,6 +282,37 @@ top:
 		return facts, errors.New("the Matroska file describes no track")
 	}
 	return facts, nil
+}
+
+// mksAbout is what a Matroska file says about itself near its top.
+type mksAbout struct {
+	scale   int64  // how many billionths of a second one tick of its clock is
+	codec   string // the format of its track (the first, if it has several)
+	private []byte // what that format keeps about the track as a whole
+}
+
+// read takes in one of the two elements that say these things.
+func (a *mksAbout) read(element []byte) {
+	ebmlChildren(element, func(id uint32, v []byte) {
+		switch id {
+		case idTimeScale:
+			if n := int64(ebmlUint(v)); n > 0 && n <= 1000000000 {
+				a.scale = n
+			}
+		case idTrackEntry:
+			if a.codec != "" {
+				return // a second track: these files have one
+			}
+			ebmlChildren(v, func(id uint32, v []byte) {
+				switch id {
+				case idCodecID:
+					a.codec = string(v)
+				case idCodecPrivate:
+					a.private = v
+				}
+			})
+		}
+	})
 }
 
 // blockParts takes a caption's block apart: which track it is for (not
@@ -402,17 +415,19 @@ func ebmlWalk(r io.ReaderAt, from, to int64, fn func(id uint32, at, n int64) boo
 	return nil
 }
 
-// ebmlChildren calls fn for each element inside b.
-func ebmlChildren(b []byte, fn func(id uint32, body []byte)) {
+// ebmlChildren calls fn for each element inside b. It says whether b was
+// made of whole elements from its first byte to its last.
+func ebmlChildren(b []byte, fn func(id uint32, body []byte)) bool {
 	r := byteReaderAt(b)
 	for off := int64(0); off < int64(len(b)); {
 		id, size, data, err := ebmlHeader(r, off)
 		if err != nil || size == unknownSize || data+size > int64(len(b)) {
-			return
+			return false
 		}
 		fn(id, b[data:data+size])
 		off = data + size
 	}
+	return true
 }
 
 type byteReaderAt []byte

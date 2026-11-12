@@ -126,6 +126,11 @@ First plain line
 <i>Second</i> plain line
 `
 
+// plainAsWebVTT is what a text track made from plain comes out as.
+const plainAsWebVTT = "WEBVTT\n" +
+	"\n00:00:00.500 --> 00:00:01.500\nFirst plain line\n" +
+	"\n00:00:04.000 --> 00:00:05.000\n<i>Second</i> plain line\n"
+
 // Things a film can say about itself that must never reach a command line
 // or become a file name.
 const (
@@ -380,16 +385,18 @@ const standInFilm = `{"format": {"start_time": "0.000000", "duration": "100.0000
 
 // standIn behaves as ffprobe when it is asked to describe a file, and
 // otherwise as ffmpeg: it writes the four files that go with standInFilm
-// into the folder it was started in, says on its clock that it has read 0,
+// into the folder it was started in (the text track as ffmpeg copies one
+// out: a small Matroska file), says on its clock that it has read 0,
 // 10, 50, 99.9 and 100.5 seconds, and ends. how changes one thing about
 // that:
 //
 //	ok           nothing
 //	hang         after the first two times on the clock it never ends
 //	fail         it complains about the film by its full path and ends badly
-//	cut-sup, cut-ass, cut-vtt, cut-font
+//	cut-sup, cut-ass, cut-txt, cut-font
 //	             that file is cut short (the font: is empty), and it ends well
-//	no-sup       that file is not written, and it ends well
+//	no-sup, no-txt
+//	             that file is not written, and it ends well
 //	short:WORDS  it says WORDS as ffmpeg says what troubles it, stops
 //	             reading at 50 seconds, and ends well
 //	whole:WORDS  it says WORDS, reads to the end, and ends well
@@ -415,7 +422,7 @@ func standIn(how string) {
 	}
 	files := map[string][]byte{
 		"s0.ass":   []byte(strings.ReplaceAll(script, "\n", "\r\n")),
-		"t1.vtt":   []byte("WEBVTT\n\n00:00.500 --> 00:01.500\nFirst plain line\n\n"),
+		"t1.mks":   textMKS("S_TEXT/UTF8", textCaption{500, 1000, "First plain line"}),
 		"p2.sup":   sup,
 		"fonts/f0": fontA,
 	}
@@ -424,12 +431,14 @@ func standIn(how string) {
 		files["p2.sup"] = sup[:len(sup)-7]
 	case "cut-ass":
 		files["s0.ass"] = files["s0.ass"][:len(files["s0.ass"])-9]
-	case "cut-vtt":
-		files["t1.vtt"] = []byte("WEB")
+	case "cut-txt":
+		files["t1.mks"] = files["t1.mks"][:len(files["t1.mks"])-5]
 	case "cut-font":
 		files["fonts/f0"] = nil
 	case "no-sup":
 		delete(files, "p2.sup")
+	case "no-txt":
+		delete(files, "t1.mks")
 	}
 	for name, content := range files {
 		if err := os.WriteFile(filepath.FromSlash(name), content, 0o600); err != nil {
@@ -461,4 +470,48 @@ func standIn(how string) {
 	// to: that is still not "finished".
 	fmt.Println(100500)
 	os.Exit(0)
+}
+
+// A text track as ffmpeg copies it out of a film: a small Matroska file
+// with one track, whose captions each have a time, a length and their
+// words. Written by hand here, so that tests can put into one what ffmpeg
+// would not write on purpose.
+
+type textCaption struct {
+	startMs, lengthMs int64
+	words             string
+}
+
+// element writes one element of a Matroska file: its name, the length of
+// what is in it (the long way, in eight bytes), and that.
+func element(id uint32, content ...[]byte) []byte {
+	var out []byte
+	for shift := 24; shift >= 0; shift -= 8 {
+		if b := byte(id >> shift); b != 0 || len(out) > 0 {
+			out = append(out, b)
+		}
+	}
+	body := bytes.Join(content, nil)
+	out = append(out, 0x01, 0, 0, 0)
+	out = binary.BigEndian.AppendUint32(out, uint32(len(body)))
+	return append(out, body...)
+}
+
+func number(v int64) []byte { return binary.BigEndian.AppendUint64(nil, uint64(v)) }
+
+// textMKS writes the file for a track in the given format ("S_TEXT/UTF8"
+// for the commonest), with one cluster for each caption.
+func textMKS(codec string, captions ...textCaption) []byte {
+	parts := [][]byte{
+		element(idInfo, element(idTimeScale, number(1000000))),
+		element(idTracks, element(idTrackEntry, element(0xD7, []byte{1}), element(0x83, []byte{0x11}), element(idCodecID, []byte(codec)))),
+	}
+	for _, c := range captions {
+		// A block: track 1, no time of its own beyond its cluster's, no
+		// marks, and the words.
+		block := append([]byte{0x81, 0, 0, 0}, c.words...)
+		parts = append(parts, element(idCluster, element(idClusterTime, number(c.startMs)),
+			element(idBlockGroup, element(idBlock, block), element(idBlockLength, number(c.lengthMs)))))
+	}
+	return append(element(idEBML, element(0x4282, []byte("matroska"))), element(idSegment, parts...)...)
 }

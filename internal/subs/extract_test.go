@@ -102,11 +102,10 @@ func TestOnePassWritesEveryTrack(t *testing.T) {
 			t.Errorf("the styled track lacks %q:\n%s", line, ass)
 		}
 	}
-	// The text track is in the form browsers show.
-	vtt, _ := os.ReadFile(filepath.Join(dir, "t1.vtt"))
-	if text := strings.ReplaceAll(string(vtt), "\r", ""); !strings.HasPrefix(text, "WEBVTT\n") ||
-		!strings.Contains(text, "00:00.500 --> 00:01.500\nFirst plain line\n") || !strings.Contains(text, "00:04.000 --> 00:05.000\n<i>Second</i> plain line\n") {
-		t.Errorf("the text track:\n%s", vtt)
+	// The text track is in the form browsers show, with its words as the
+	// film has them.
+	if vtt := string(mustRead(t, filepath.Join(dir, "t1.vtt"))); vtt != plainAsWebVTT {
+		t.Errorf("the text track:\n%q\nwant\n%q", vtt, plainAsWebVTT)
 	}
 	// The disc's pictures are the film's, piece for piece, at the film's
 	// times.
@@ -380,9 +379,8 @@ func TestAFilmWithoutSoundIsFollowedByItsPicture(t *testing.T) {
 		if tr := res.Tracks[i]; tr.File != file || tr.Kind != Text || !tr.Done || tr.FirstMs != 500 {
 			t.Errorf("track %d: %+v", i, tr)
 		}
-		if text := strings.ReplaceAll(string(mustRead(t, filepath.Join(dir, file))), "\r", ""); !strings.HasPrefix(text, "WEBVTT\n") ||
-			!strings.Contains(text, "00:00.500 --> 00:01.500\nFirst plain line\n") || !strings.Contains(text, "00:04.000 --> 00:05.000\n") {
-			t.Errorf("%s:\n%s", file, text)
+		if text := string(mustRead(t, filepath.Join(dir, file))); text != plainAsWebVTT {
+			t.Errorf("%s:\n%q\nwant\n%q", file, text, plainAsWebVTT)
 		}
 	}
 	if why := rising(percents); why != "" || len(percents) < 50 {
@@ -478,10 +476,13 @@ func TestCommandLineIsBuiltOnlyFromTypedValues(t *testing.T) {
 			"\x00-copyts\x00-i\x00", "\x00-nostdin\x00", "\x00-y\x00",
 			"-dump_attachment:t:0\x00fonts/f0\x00", "-dump_attachment:t:3\x00fonts/f3\x00", "-dump_attachment:t:4\x00fonts/f4\x00",
 			"-map\x000:s:0\x00-c\x00copy\x00-f\x00ass\x00s0.ass\x00",
-			"-map\x000:s:1\x00-c\x00webvtt\x00-f\x00webvtt\x00t1.vtt\x00",
+			// A text track is copied out as it is, and its file is written
+			// from that copy afterwards. Only the sort MP4 files have is
+			// converted by ffmpeg.
+			"-map\x000:s:1\x00-c\x00copy\x00-map_metadata\x00-1\x00-map_chapters\x00-1\x00-f\x00matroska\x00t1.mks\x00",
 			"-map\x000:s:2\x00-c\x00copy\x00-f\x00sup\x00p2.sup\x00",
 			"-map\x000:s:3\x00-c\x00copy\x00-map_metadata\x00-1\x00-map_chapters\x00-1\x00-f\x00matroska\x00p3.mks\x00",
-			"\x00p4.mks\x00", "\x00t5.vtt\x00", "\x00s6.ass\x00", "\x00t7.vtt\x00",
+			"\x00p4.mks\x00", "-map\x000:s:5\x00-c\x00webvtt\x00-f\x00webvtt\x00t5.vtt\x00", "\x00s6.ass\x00", "\x00-f\x00matroska\x00t7.mks\x00",
 		} {
 			if !strings.Contains(joined, want) {
 				t.Errorf("missing %q in %q", strings.ReplaceAll(want, "\x00", " "), a)
@@ -489,7 +490,7 @@ func TestCommandLineIsBuiltOnlyFromTypedValues(t *testing.T) {
 		}
 		// What is not a font by its own account is not written, and a sort
 		// of track that cannot be used is not asked for.
-		for _, not := range []string{"fonts/f1\x00", "fonts/f2\x00", "0:s:8\x00", "0:s:9\x00", "0:s:10\x00", "0:s:11\x00", "\x00-t\x00"} {
+		for _, not := range []string{"fonts/f1\x00", "fonts/f2\x00", "0:s:8\x00", "0:s:9\x00", "0:s:10\x00", "0:s:11\x00", "\x00-t\x00", "t1.vtt", "t7.vtt"} {
 			if strings.Contains(joined, not) {
 				t.Errorf("%q should not be in %q", strings.ReplaceAll(not, "\x00", " "), a)
 			}
@@ -676,7 +677,7 @@ func TestAFailedRunLeavesNoResult(t *testing.T) {
 // complete. A file cut short, as a full disk leaves it, makes the whole
 // run count for nothing.
 func TestAFileCutShortIsNotAResult(t *testing.T) {
-	for _, how := range []string{"cut-sup", "cut-ass", "cut-vtt", "no-sup"} {
+	for _, how := range []string{"cut-sup", "cut-ass", "cut-txt", "no-sup", "no-txt"} {
 		t.Run(how, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "subs")
 			var percents []int
@@ -713,7 +714,9 @@ func TestAFullDiskLeavesNoResult(t *testing.T) {
 		t.Skip("this machine has no /dev/full")
 	}
 	path := madeFilm(t, tl, "five")
-	for _, name := range []string{"s0.ass", "t1.vtt", "p2.sup", "p3.mks"} {
+	// (Of a text track, ffmpeg writes a copy and this package the file that
+	// is kept. The disk can be full for either.)
+	for _, name := range []string{"s0.ass", "t1.mks", "t1.vtt", "p2.sup", "p3.mks"} {
 		t.Run(name, func(t *testing.T) {
 			dir := filepath.Join(t.TempDir(), "subs")
 			e := &extraction{tools: tl, film: path, dir: dir, prepared: func(work string) {
