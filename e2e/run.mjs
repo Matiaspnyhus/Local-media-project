@@ -73,6 +73,24 @@ async function waitPlaying(page, beyond) {
   await page.waitForFunction((b) => document.querySelector('video').currentTime > b, beyond, { timeout: 20000 })
 }
 
+// Waits until the film is playing on beyond a given second. Used where the
+// film is handed to the player afresh while it is open (a change of sound,
+// a jump): the nudge that waitPlaying gives once is given until it takes.
+async function playsBeyond(page, beyond, why) {
+  await page.waitForFunction((b) => {
+    const v = document.querySelector('video')
+    if (!v) return false
+    if (v.paused && v.readyState >= 1) {
+      v.muted = true
+      v.play().catch(() => {})
+    }
+    return !v.seeking && v.currentTime > b
+  }, beyond, { timeout: 20000, polling: 200 }).catch(async () => {
+    const t = await page.evaluate(() => document.querySelector('video')?.currentTime)
+    assert.fail(`${why}: after 20 seconds the film is at ${t} s, not playing beyond ${beyond} s`)
+  })
+}
+
 assert.ok(existsSync(bin), `program not found at ${bin}; build it first`)
 const data = mkdtempSync(join(tmpdir(), 'lm-data-'))
 const media = mkdtempSync(join(tmpdir(), 'lm-media-'))
@@ -92,6 +110,17 @@ const made = spawnSync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
 assert.equal(made.status, 0, `ffmpeg is needed for this test (set LOCALMEDIA_FFMPEG and LOCALMEDIA_FFPROBE, or put both on the PATH): ${made.error || made.stderr}`)
 writeFileSync(join(media, 'Dolby.Sound.Test.en.srt'),
   '1\n00:00:00,500 --> 00:00:20,000\nThe subtitle is showing\n\n2\n00:00:20,000 --> 00:00:39,000\nStill in step after a jump\n')
+// A longer film with three sound tracks to switch between and subtitles
+// stored inside it: 90 seconds, more than a player keeps ready at once.
+writeFileSync(join(media, 'three-sounds-subtitles.txt'),
+  '1\n00:00:00,500 --> 00:00:45,000\nSaid in the first half\n\n2\n00:00:45,000 --> 00:01:29,000\nSaid in the second half\n')
+const made3 = spawnSync(ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y',
+  '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=24:duration=90', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=90',
+  '-f', 'srt', '-i', join(media, 'three-sounds-subtitles.txt'), '-map', '0:v', '-map', '1:a', '-map', '1:a', '-map', '1:a', '-map', '2:s',
+  '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '34', '-g', '48', '-pix_fmt', 'yuv420p', '-c:a', 'ac3', '-b:a', '96k', '-c:s', 'srt',
+  '-metadata:s:a', 'language=eng', '-metadata:s:s:0', 'language=eng', '-disposition:a:0', 'default', '-disposition:a:1', '0', '-disposition:a:2', '0',
+  join(media, 'Three.Sounds.Test.mkv')], { encoding: 'utf8' })
+assert.equal(made3.status, 0, `ffmpeg could not make the film with three sound tracks: ${made3.error || made3.stderr}`)
 
 const server = spawn(bin, ['--data', data, '--port', String(port), '--no-browser'], { stdio: ['ignore', 'pipe', 'pipe'] })
 let serverLog = ''
@@ -136,7 +165,7 @@ try {
     await setupPage.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
     await setupPage.keyboard.type(media)
     await setupPage.keyboard.press('Enter')
-    await setupPage.waitForSelector('text=Films (2)')
+    await setupPage.waitForSelector('text=Films (3)')
   })
 
   await step('the PC shows the address and a QR code for other devices', async () => {
@@ -173,7 +202,7 @@ try {
     await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
     await page.keyboard.type('a good password')
     await page.keyboard.press('Enter')
-    await page.waitForSelector('text=Films (2)')
+    await page.waitForSelector('text=Films (3)')
   })
 
   await step('play a file, keyboard only', async () => {
@@ -201,7 +230,7 @@ try {
     const t = await page.evaluate(() => document.querySelector('video').currentTime)
     assert.ok(t >= 11 && t < 19, `resumed at ${t}`)
     await page.goBack()
-    await page.waitForSelector('text=Films (2)')
+    await page.waitForSelector('text=Films (3)')
   })
 
   // How many films the PC holds open for conversion.
@@ -260,6 +289,39 @@ try {
     }
   })
 
+  await step('changing the sound twice in a row keeps the place in the film', async () => {
+    await focusByText(page, 'Three Sounds Test')
+    await page.keyboard.press('Enter')
+    await waitPlaying(page, 1)
+    await page.evaluate(() => (document.querySelector('video').currentTime = 60))
+    await playsBeyond(page, 60.5, 'a jump to one minute')
+    const place = await page.evaluate(() => document.querySelector('video').currentTime)
+    // Not with the keyboard for once: until the PC answers, the list goes
+    // back to the track that is playing, so two key presses cannot be aimed
+    // at the third track. The second pick is made before the first has
+    // taken effect.
+    await page.selectOption('[data-testid=pick-sound]', '1')
+    await page.selectOption('[data-testid=pick-sound]', '2')
+    await playsBeyond(page, place + 0.5, 'after two changes of sound')
+    const v = await page.evaluate(() => {
+      const el = document.querySelector('video')
+      return { at: el.currentTime, sound: document.querySelector('[data-testid=pick-sound]').value, method: el.dataset.method }
+    })
+    assert.ok(v.at < place + 15, `the film was at ${place} s and is now at ${v.at} s`)
+    assert.equal(v.sound, '2', 'the list shows the sound track picked last')
+    // The PC opened the film once for each pick. The one that was not used
+    // must be closed again, leaving the one that is playing.
+    for (let i = 0; (await converters()) !== 1; i++) {
+      assert.ok(i < 50, `${await converters()} films are held open for conversion 5 seconds after changing the sound; one is playing`)
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    console.log(`      (was at ${place.toFixed(2)} s, plays on at ${v.at.toFixed(2)} s by method ${v.method})`)
+    await page.evaluate(() => document.querySelector('video').pause())
+    await focusByText(page, '← Back')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('text=Continue watching')
+  })
+
   await step('a repackaged film resumes where it stopped, with its subtitles', async () => {
     const asked = []
     const note = (r) => /\/hls\//.test(r.url()) && asked.push(r.url().split('/').pop())
@@ -287,7 +349,7 @@ try {
     if (browserName === 'chromium') assert.ok(Math.abs(v.from - 30) < 0.25, `the chunk for 30 s was placed at ${v.from}`)
     assert.notEqual(v.sub, '', 'the subtitle choice was remembered')
     await page.goBack()
-    await page.waitForSelector('text=Films (2)')
+    await page.waitForSelector('text=Films (3)')
   })
 
   await step('a show: open it, finish episode 1, and episode 2 is next up', async () => {
@@ -317,7 +379,7 @@ try {
     await page.waitForSelector('text=2 episodes · 1 watched')
     await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A')
     await page.keyboard.press('Backspace')
-    await page.waitForSelector('text=Films (2)')
+    await page.waitForSelector('text=Films (3)')
   })
 
   await step('the stream link stops working after signing out', async () => {

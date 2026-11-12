@@ -750,25 +750,44 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
   const carryOn = useRef<number | null>(null) // where to pick up after switching sound, in seconds
   const first = useRef(true)
   const chunkPlayer = useRef(false)
+  const asked = useRef(0) // how many times the film has been asked for
 
+  // Each request for the film is numbered and only the newest one's answer
+  // is used. When the sound is changed twice in a row the answers can come
+  // back in either order, and the first would otherwise use up the place to
+  // carry on from. The PC opens the film for every answer, so one that is
+  // not used is closed again.
   const load = useCallback(
     (audio?: number) => {
+      const n = ++asked.current
       api
         .play(id, audio)
         .then((p) => {
+          if (n !== asked.current) {
+            if (p.hls) api.hlsStop(p.hls)
+            return
+          }
           if (carryOn.current !== null) p.positionMs = Math.floor(carryOn.current * 1000)
           carryOn.current = null
           if (first.current) setSubKey(p.subtitles.find((s) => s.selected)?.key || '')
           first.current = false
           setInfo(p)
         })
-        .catch((e: ApiError) => (e.status === 401 ? onSignedOut() : setError(e.message)))
+        .catch((e: ApiError) => {
+          if (n !== asked.current) return
+          if (e.status === 401) onSignedOut()
+          else setError(e.message)
+        })
     },
     [id, onSignedOut],
   )
   useEffect(() => {
     first.current = true
     load()
+    // An answer that arrives after the player has been left is not used.
+    return () => {
+      asked.current++
+    }
   }, [load])
 
   const report = useCallback(
@@ -884,7 +903,11 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
   }
   const pickAudio = (index: number) => {
     const v = videoRef.current
-    carryOn.current = v && v.currentTime > 0 ? v.currentTime : null
+    // Carry on from where the film is. While it is still starting again
+    // after an earlier change its clock reads nothing, and the place to
+    // keep is the one it was about to start from.
+    if (v && v.currentTime > 0) carryOn.current = v.currentTime
+    else if (carryOn.current === null && info) carryOn.current = info.positionMs / 1000
     remember(index, subKey)
     load(index)
   }
