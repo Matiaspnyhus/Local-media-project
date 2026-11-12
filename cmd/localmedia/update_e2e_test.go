@@ -280,7 +280,7 @@ func TestATestBuildDoesNotUpdate(t *testing.T) {
 	if u.enabled || !strings.Contains(u.why, "test build") {
 		t.Fatalf("enabled=%v why=%q", u.enabled, u.why)
 	}
-	if err := u.Install(); err == nil {
+	if err := u.Install("", true); err == nil {
 		t.Fatal("a test build tried to install an update")
 	}
 	if st := u.Status(); st.Supported || st.CanUndo {

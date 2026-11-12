@@ -124,6 +124,11 @@ func (a *app) run() (err error) {
 
 	a.upd = newUpdater(a, d)
 	ffprobe, ffmpeg := probe.Find(), probe.FindFFmpeg()
+	// No helper program may outlive this one (see helpers_windows.go).
+	// Set up before the server, so that it is undone after it: the server
+	// stops the helpers it knows of, and this ends whatever is left.
+	helpers := tieHelpers(ffprobe, ffmpeg)
+	defer helpers.end()
 	srv, err := server.New(server.Config{
 		DB: d, DataDir: o.dataDir, Version: version, Port: o.port, Assets: web.Assets(), LogOut: os.Stdout, FFprobe: ffprobe, FFmpeg: ffmpeg,
 		Update: a.upd.forServer(),
@@ -166,8 +171,23 @@ func (a *app) run() (err error) {
 		go openBrowser(a.localURL())
 	}
 
+	// Every way of being told to stop ends the same way: the server is
+	// closed, which stops the helper programs, and what the program keeps
+	// on disk while it runs is removed.
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	// A terminal that is closed says so with a hang-up, which would
+	// otherwise end the program on the spot, with its helpers left
+	// running. A program started so as to survive its terminal (with
+	// nohup) has hang-ups switched off, and they stay off.
+	if !signal.Ignored(syscall.SIGHUP) {
+		signal.Notify(stop, syscall.SIGHUP)
+	}
+	// Nothing gives these signals back when this function returns, and
+	// that is wanted. After it comes the hand-over to a new version, which
+	// can take a minute, and through that minute the program must not be
+	// ended by a polite request: it is still there to put the earlier
+	// version back if the new one does not start.
 	select {
 	case err := <-errc:
 		if !errors.Is(err, http.ErrServerClosed) {

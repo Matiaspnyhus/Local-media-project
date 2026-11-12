@@ -229,7 +229,9 @@ func TestTheOrderOfVersions(t *testing.T) {
 		{rel: "direct, 720p, copy 2", plan: plan(playback.Yes, playback.Direct), pixels: 1280 * 720, size: 20},
 		{rel: "repackaged", plan: plan(playback.Yes, playback.Remux), pixels: 3840 * 2160, size: 90},
 		{rel: "sound converted", plan: plan(playback.Yes, playback.Audio), pixels: 3840 * 2160, size: 90},
-		{rel: "picture converted", plan: plan(playback.Yes, playback.Convert), pixels: 3840 * 2160, size: 90},
+		// (A way the decision rules of this version do not hand out yet;
+		// the order of copies is ready for it.)
+		{rel: "picture converted", plan: plan(playback.Yes, playback.Method("convert")), pixels: 3840 * 2160, size: 90},
 		{rel: "unknown", plan: plan(playback.Unknown, playback.Direct), pixels: 3840 * 2160, size: 90},
 		{rel: "not at all", plan: plan(playback.No, playback.None), pixels: 3840 * 2160, size: 90},
 	}
