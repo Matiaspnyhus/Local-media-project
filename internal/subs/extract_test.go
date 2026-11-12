@@ -74,6 +74,14 @@ func TestOnePassWritesEveryTrack(t *testing.T) {
 	if len(res.Fonts) != 0 {
 		t.Errorf("fonts in a film that has none: %+v", res.Fonts)
 	}
+	if tr, ok := res.Track(2); !ok || tr.File != "p2.sup" {
+		t.Errorf("asked for track 2: %+v, %v", tr, ok)
+	}
+	for _, n := range []int{-1, 5} {
+		if tr, ok := res.Track(n); ok {
+			t.Errorf("asked for track %d of five: %+v", n, tr)
+		}
+	}
 	if why := rising(percents); why != "" {
 		t.Error(why)
 	}
@@ -831,6 +839,23 @@ func TestReadingWhatAFilmHolds(t *testing.T) {
 	}
 	if _, err := parseInspection([]byte("not what ffprobe writes")); err == nil {
 		t.Error("nonsense was read as a film")
+	}
+	// What the reading is followed by: the first sound track if it is of a
+	// sort that comes in few enough pieces, else the picture, else whatever
+	// there is.
+	for streams, want := range map[string]clock{
+		`{"codec_type": "video", "codec_name": "hevc"}, {"codec_type": "audio", "codec_name": "eac3"}`:                                                 clockSound,
+		`{"codec_type": "video", "codec_name": "hevc"}, {"codec_type": "audio", "codec_name": "truehd"}, {"codec_type": "audio", "codec_name": "ac3"}`: clockPicture,
+		`{"codec_type": "audio", "codec_name": "ac3"}, {"codec_type": "audio", "codec_name": "truehd"}, {"codec_type": "video", "codec_name": "hevc"}`: clockSound,
+		`{"codec_type": "video", "codec_name": "h264"}, {"codec_type": "audio", "codec_name": "pcm_s16le"}`:                                            clockPicture,
+		`{"codec_type": "audio", "codec_name": "truehd"}`:                                                                                              clockSound,
+		`{"codec_type": "audio", "codec_name": "truehd"}, {"codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}}`:          clockSound,
+		`{"codec_type": "video", "codec_name": "h264"}`:                                                                                                clockPicture,
+		`{"codec_type": "subtitle", "codec_name": "ass"}`:                                                                                              clockNone,
+	} {
+		if f, err := parseInspection([]byte(`{"format": {}, "streams": [` + streams + `]}`)); err != nil || f.clock != want {
+			t.Errorf("a file with %s is followed by %v (%v), want %v", streams, f.clock, err, want)
+		}
 	}
 	for codec, want := range map[string]Kind{"ass": Styled, "ssa": Styled, "subrip": Text, "mov_text": Text, "webvtt": Text, "text": Text,
 		"hdmv_pgs_subtitle": Picture, "dvd_subtitle": Picture, "dvb_subtitle": Picture, "dvb_teletext": Other, "eia_608": Other, "": Other, "h264": Other} {

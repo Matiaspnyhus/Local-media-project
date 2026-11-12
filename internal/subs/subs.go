@@ -277,8 +277,22 @@ func looksLikeFont(head []byte) bool {
 }
 
 // clock is the track whose times say how far through the film ffmpeg has
-// read. The sound is preferred: it runs evenly from the start of a film to
-// its end and is a small part of the file.
+// read: its first sound track, or its picture.
+//
+// The sound is preferred. In an MP4 file ffmpeg passes over the tracks it
+// is not asked for where it can, and the sound is a small part of the file
+// where the picture is nearly all of it: of an MP4 at 30 Mbit/s it read a
+// quarter when following the sound and all of it when following the
+// picture. (At 4 Mbit/s it read all of it either way, as it does of an MKV
+// file or a TV recording.)
+//
+// But the sound has to be of a sort that comes in a hundred pieces a
+// second or fewer, as most do. ffmpeg spends a little time on every piece
+// it passes on, and the lossless sound of Blu-ray discs (TrueHD) comes in
+// 1,200 a second: twenty minutes of film took ten to thirty seconds to
+// follow by such sound and a third of a second by the picture. With sound
+// like that, or of a sort not listed here, the picture is used if there is
+// one.
 type clock int
 
 const (
@@ -286,6 +300,11 @@ const (
 	clockSound
 	clockPicture
 )
+
+// steadySound lists the sound codecs, as ffprobe names them, that come in
+// a hundred pieces a second or fewer.
+var steadySound = map[string]bool{"ac3": true, "eac3": true, "aac": true, "mp3": true, "mp2": true, "opus": true,
+	"vorbis": true, "flac": true, "dts": true, "alac": true}
 
 // inventory is what is known about a file before it is read through.
 type inventory struct {
@@ -334,10 +353,13 @@ func parseInspection(out []byte) (inventory, error) {
 		return inventory{}, fmt.Errorf("the film could not be inspected: %w", err)
 	}
 	f := inventory{durationMs: seconds(raw.Format.Duration), startMs: seconds(raw.Format.StartTime)}
-	sound, picture := false, false
+	sound, picture, steady := false, false, false
 	for _, s := range raw.Streams {
 		switch s.CodecType {
 		case "audio":
+			if !sound {
+				steady = steadySound[s.CodecName] // the first sound track is the one followed
+			}
 			sound = true
 		case "video":
 			// A cover picture is kept as a "video" of one frame; it has no
@@ -364,7 +386,7 @@ func parseInspection(out []byte) (inventory, error) {
 		}
 	}
 	switch {
-	case sound:
+	case sound && (steady || !picture):
 		f.clock = clockSound
 	case picture:
 		f.clock = clockPicture
