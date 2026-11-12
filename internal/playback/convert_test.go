@@ -3,8 +3,8 @@ package playback
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"math/rand"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -147,11 +147,48 @@ var pcs = []struct {
 	{"a PC without the Dolby Vision filter", Limits{Convert: true, ToneMap: true}, false, -1},
 	{"a fast PC", fast, false, -1},
 	{"a PC too slow for anything", measured(able, every(0.5), every(0.5), every(0.5), every(0.5)), false, -1},
-	{"a device with lessons: a slow connection, a small picture, no HDR", func() Limits {
+	{"a device with lessons: a slow connection, a small picture, no HDR, trouble with 10-bit HEVC from 1080p up", func() Limits {
 		l := able
-		l.MaxRate, l.MaxHeight, l.NoHDR = 4_000_000, 720, true
+		l.MaxRate, l.MaxHeight, l.NoHDR = 5_000_000, 720, true
+		l.Trouble = []PictureKind{{Codec: "hevc", BitDepth: 10, Size: Size1080}}
 		return l
 	}(), false, -1},
+	{"a PC that has not been measured and is converting two films already", func() Limits { l := able; l.Busy = 2; return l }(), false, -1},
+}
+
+// rungFor works out, the slow way, which rung the rules pick for a film
+// whose picture is lines tall (0 = not read) and 16:9 wide; 0 when no rung
+// keeps up. row is the film's row of the speed table, need its bar and
+// start the rung an unmeasured PC begins at.
+//
+// A rung keeps up when neither it nor any lighter rung was measured below
+// the bar, and it was either measured itself or lies at or below the
+// starting rung, which moves one down for each film being converted
+// already. The wishes (lighter, smaller, fewer bits) choose among the
+// rungs that keep up and never rule out the last one.
+func rungFor(row [NumRungs]float64, need float64, start, busy, lower, maxHeight, maxRate, lines int) int {
+	keeps := func(n int) bool {
+		for lighter := n; lighter <= NumRungs; lighter++ {
+			if s := row[lighter-1]; s > 0 && s/float64(busy+1) < need {
+				return false
+			}
+		}
+		return row[n-1] > 0 || n >= start+busy || n == NumRungs
+	}
+	if !keeps(NumRungs) {
+		return 0
+	}
+	for n := 1; n < NumRungs; n++ {
+		r := Ladder()[n-1]
+		height := r.Height
+		if lines > 0 && lines < height {
+			height = lines
+		}
+		if keeps(n) && n >= lower && (maxRate == 0 || r.MaxRate <= maxRate) && (maxHeight == 0 || height <= maxHeight) {
+			return n
+		}
+	}
+	return NumRungs
 }
 
 // rank orders answers by what the viewer gets: the film's own picture,
@@ -228,10 +265,21 @@ func broken(m Media, dev *Caps, w Want, l Limits, p, m3 Plan) string {
 
 	// must: nothing but a converted picture will do. may: the design of
 	// the subtitles is worth converting for, but not worth losing the film
-	// over. advice: a lesson would rather have the picture converted.
-	must := !plays || tooLarge || wrongColours || mode == SubsBurn && kind == PictureSubs || w.Lower > 0
+	// over. advice: a lesson or the viewer's wish for a lighter picture
+	// would rather have the picture converted.
+	must := !plays || tooLarge || wrongColours || mode == SubsBurn && kind == PictureSubs
 	may := mode == SubsBurn && kind == StyledSubs
-	advice := l.MaxRate > 0 && (m.BitRate == 0 || m.BitRate > l.MaxRate) || l.NoHDR && hdr
+	// No film in the table says how many bits it spends, so each is taken
+	// to spend what the ladder allows a picture of its size: 2.5 Mbit/s at
+	// 480p, 10 at 1080p, and 4K more than any cap.
+	taken, known := map[int]int{480: 2_500_000, 1080: 10_000_000}[v.Height]
+	heavy := !known || taken > l.MaxRate
+	troubled := false
+	for _, k := range l.Trouble {
+		lines := map[Size]int{Size480: 0, Size720: 481, Size1080: 721, Size4K: 1089}[k.Size]
+		troubled = troubled || k.Codec == v.Codec && (k.BitDepth > 8) == (v.BitDepth > 8) && v.Height >= lines
+	}
+	advice := l.MaxRate > 0 && heavy || l.NoHDR && hdr || w.Lower > 0 || troubled
 
 	// Whether this PC and this device can do a conversion at all.
 	var a *Track
@@ -247,9 +295,22 @@ func broken(m Media, dev *Caps, w Want, l Limits, p, m3 Plan) string {
 	case hdr:
 		can = can && l.ToneMap
 	}
-	// Whether a rung is certain to be found: nothing measured means nothing
-	// is known to be too slow.
-	certain := can && l.Speed == nil && w.Lower <= NumRungs
+	// The film's row of the speed table, its bar, and where an unmeasured
+	// PC starts.
+	class, need, start := ClassHD, 1.5, 1
+	switch {
+	case large && hdr:
+		class, need, start = Class4KHDR, 1.2, 3
+	case large:
+		class, start = Class4K, 3
+	case hdr:
+		class, start = ClassHDR, 3
+	}
+	wantRung := rungFor(l.Speed[class], need, start, l.Busy, w.Lower, l.MaxHeight, l.MaxRate, v.Height)
+	// Whether a rung is certain to be found: speed is the only thing that
+	// can stand in the way, and only when the lightest rung of all was
+	// measured too slow. No wish and no lesson can.
+	certain := can && wantRung != 0
 	tooSlow := p.Playable == No && len(p.Reasons) > 0 && strings.HasPrefix(p.Reasons[len(p.Reasons)-1], "This PC cannot convert this film fast enough to watch")
 
 	if p.Reasons == nil || p.Lost == nil {
@@ -263,6 +324,12 @@ func broken(m Media, dev *Caps, w Want, l Limits, p, m3 Plan) string {
 	}
 	if p.TooSlow != tooSlow || tooSlow != (p.Explain() == "This PC cannot convert this film fast enough to watch.") {
 		return "the answer is unsure whether this PC is too slow"
+	}
+	// A refusal blames this PC exactly when its last reason does, and then
+	// its one-sentence summary does not blame the browser.
+	blamesPC := p.Playable == No && len(p.Reasons) > 0 && strings.HasPrefix(p.Reasons[len(p.Reasons)-1], "This PC")
+	if p.PCCannot != blamesPC || blamesPC && strings.Contains(p.Explain(), "This browser") {
+		return fmt.Sprintf("the answer is unsure whether it is this PC that cannot: pcCannot=%v, explained as %q", p.PCCannot, p.Explain())
 	}
 	for _, said := range [3][]string{{p.Explain()}, p.Reasons, p.Lost} {
 		for _, s := range said {
@@ -292,7 +359,7 @@ func broken(m Media, dev *Caps, w Want, l Limits, p, m3 Plan) string {
 	case tooSlow && (certain || !can):
 		return "called too slow where speed cannot be the reason"
 	case plays && !must && (advice || may) && certain && p.Method != Convert:
-		return "a lesson's advice or the subtitles' design was dropped although this PC could have converted"
+		return "advice (a lesson, or a wish for a lighter picture) or the subtitles' design was dropped although this PC could have converted"
 	}
 
 	// Subtitles: burn implies convert, draw only with Draw and PageFullscreen.
@@ -319,18 +386,9 @@ func broken(m Media, dev *Caps, w Want, l Limits, p, m3 Plan) string {
 			return "no such rung"
 		}
 		r := Ladder()[n-1]
-		class, need := ClassHD, 1.5
-		switch {
-		case large && hdr:
-			class, need = Class4KHDR, 1.2
-		case large:
-			class = Class4K
-		case hdr:
-			class = ClassHDR
-		}
 		height := min(v.Height, r.Height) // every picture in the table is 16:9
 		switch {
-		case n < w.Lower:
+		case n < w.Lower && n < NumRungs:
 			return "a better picture than was asked for"
 		case l.Speed[class][n-1] > 0 && l.Speed[class][n-1]/float64(l.Busy+1) < need:
 			return "a rung this PC was measured too slow for"
@@ -338,6 +396,8 @@ func broken(m Media, dev *Caps, w Want, l Limits, p, m3 Plan) string {
 			return "more bits a second than the connection is trusted with"
 		case n < NumRungs && l.MaxHeight > 0 && height > l.MaxHeight:
 			return "a larger picture than the device is trusted with"
+		case n != wantRung:
+			return fmt.Sprintf("rung %d, where the rules give rung %d", n, wantRung)
 		case p.Video != (Video{Rung: n, Height: height, Encoder: "x264", HDRToSDR: hdr, Class: class}):
 			return fmt.Sprintf("the converted picture is described as %+v", p.Video)
 		case p.Picture.Codec != "h264" || p.Picture.BitDepth != 8:
@@ -487,13 +547,16 @@ func walkDevice(t *testing.T, dname string, base *Caps) (combinations, n int, an
 }
 
 // The planner never picks a setting this PC was measured too slow for,
-// whatever the measurements are: this draws speed tables at random and
-// checks every pick against the bar (1.5 times the film's own speed, 1.2
-// for 4K HDR, shared with what the PC is converting already). It also
-// checks that the pick is the best one allowed, that "too slow" is only
-// said when every allowed rung was measured too slow, with the best
-// figure quoted, and that neither a lighter wish nor a busier PC ever
-// gives a better picture. The seed is fixed, so a failure can be repeated.
+// whatever the measurements are: this draws speed tables at random, with
+// gaps and with lighter rungs slower than heavier ones, and checks every
+// pick against the bar (1.5 times the film's own speed, 1.2 for 4K HDR,
+// shared with what the PC is converting already). A rung is also not
+// picked when a lighter one was measured too slow, since it cannot be
+// faster than that one. It also checks that the pick is the best one
+// allowed (rungFor), that "too slow" is said only when the lightest rung
+// of all was measured too slow, with its figure quoted, and that neither
+// a lighter wish nor a busier PC ever gives a better picture. The seed is
+// fixed, so a failure can be repeated.
 func TestNoRungBelowItsBar(t *testing.T) {
 	rnd := rand.New(rand.NewSource(20261112))
 	sources := []struct{ w, h int }{{0, 0}, {854, 480}, {1280, 720}, {1920, 1080}, {3840, 2160}}
@@ -542,7 +605,14 @@ func TestNoRungBelowItsBar(t *testing.T) {
 		for l.Busy = 0; l.Busy <= busy; l.Busy++ {
 			before := 0
 			for lower := 0; lower <= NumRungs+1; lower++ {
-				p := DecideFor(m, dev, Want{Audio: -1, Subtitle: -1, Lower: lower}, l)
+				// A lighter rung is asked for by the viewer in one draw
+				// and by a step after trouble in the next. For a film
+				// that is converted anyway the two come to the same.
+				wish := Want{Audio: -1, Subtitle: -1, Lower: lower}
+				if l.Lower = 0; i%2 == 1 {
+					wish.Lower, l.Lower = 0, lower
+				}
+				p := DecideFor(m, dev, wish, l)
 				where := func() string {
 					return fmt.Sprintf("draw %d: %dx%d %s, speeds %v, at most %d lines and %d bits, %d others, lighter=%d -> rung %d %v",
 						i, src.w, src.h, col.name, l.Speed[class], l.MaxHeight, l.MaxRate, l.Busy, lower, p.Video.Rung, p.Reasons)
@@ -557,34 +627,19 @@ func TestNoRungBelowItsBar(t *testing.T) {
 				if l.Busy > 0 {
 					calm := l
 					calm.Busy--
-					if q := DecideFor(m, dev, Want{Audio: -1, Subtitle: -1, Lower: lower}, calm); rank(p) < rank(q) {
+					if q := DecideFor(m, dev, wish, calm); rank(p) < rank(q) {
 						t.Fatalf("%s: a busier PC gave a better picture", where())
 					}
 				}
-				// Which rungs were allowed, and how each stands.
-				best, bestFigure := 0, 0.0
-				for n := 1; n <= NumRungs; n++ {
-					r := Ladder()[n-1]
-					height := r.Height
-					if src.h > 0 && src.h < height {
-						height = src.h
-					}
-					if n < lower || n < NumRungs && (l.MaxRate > 0 && r.MaxRate > l.MaxRate || l.MaxHeight > 0 && height > l.MaxHeight) {
-						continue
-					}
-					speed := l.Speed[class][n-1] / float64(l.Busy+1)
-					if speed == 0 && n >= start || speed >= need {
-						if best == 0 {
-							best = n
-						}
-						continue
-					}
-					bestFigure = math.Max(bestFigure, speed)
-				}
+				best := rungFor(l.Speed[class], need, start, l.Busy, lower, l.MaxHeight, l.MaxRate, src.h)
 				if p.Method == Convert {
 					picked[p.Video.Rung]++
-					if s := l.Speed[class][p.Video.Rung-1]; s > 0 && s/float64(l.Busy+1) < need {
-						t.Fatalf("%s: picked a rung measured at %.2f, below its bar of %.1f", where(), s/float64(l.Busy+1), need)
+					// No rung measured below its bar, and none that a
+					// lighter rung's figure speaks against.
+					for n := p.Video.Rung; n <= NumRungs; n++ {
+						if s := l.Speed[class][n-1]; s > 0 && s/float64(l.Busy+1) < need {
+							t.Fatalf("%s: picked although rung %d was measured at %.2f, below the bar of %.1f", where(), n, s/float64(l.Busy+1), need)
+						}
 					}
 					if p.Video.Rung != best {
 						t.Fatalf("%s: want rung %d, the best one allowed", where(), best)
@@ -595,22 +650,30 @@ func TestNoRungBelowItsBar(t *testing.T) {
 				if best != 0 {
 					t.Fatalf("%s: refused although rung %d would do", where(), best)
 				}
+				// Too slow is said only when the lightest rung of all was
+				// measured too slow; then no wish and no cap matters.
+				lightest := l.Speed[class][NumRungs-1] / float64(l.Busy+1)
+				if !p.TooSlow || !(lightest > 0 && lightest < need) {
+					t.Fatalf("%s: refused, tooSlow=%v, with the lightest rung at %.2f", where(), p.TooSlow, lightest)
+				}
 				last := p.Reasons[len(p.Reasons)-1]
-				if !strings.HasPrefix(last, "This PC cannot convert this film fast enough to watch") {
+				if !strings.HasPrefix(last, "This PC cannot convert this film fast enough to watch: at best it manages ") {
 					t.Fatalf("%s: the refusal does not say the PC is too slow", where())
 				}
-				if lower <= NumRungs {
-					// The figure quoted is the best one measured, cut off
-					// to one decimal: never more than was measured, and
-					// so never the bar itself.
-					var quoted, needed float64
-					if _, err := fmt.Sscanf(strings.TrimPrefix(last, "This PC cannot convert this film fast enough to watch: "),
-						"at best it manages %f seconds of film a second, and it takes %f to keep up", &quoted, &needed); err != nil {
-						t.Fatalf("%s: the refusal quotes no figure: %v", where(), err)
-					}
-					if quoted > bestFigure || quoted < bestFigure-0.1001 || quoted >= need || needed != need {
-						t.Fatalf("%s: the refusal quotes %.1f against %.1f; measured %.4f against %.1f", where(), quoted, needed, bestFigure, need)
-					}
+				// The figure quoted is the lightest rung's, cut off to one
+				// decimal: never more than was measured, and so never the
+				// bar itself.
+				var quoted, needed float64
+				_, err1 := fmt.Sscanf(last[strings.Index(last, "at best it manages "):], "at best it manages %f seconds of film a second", &quoted)
+				at := strings.Index(last, "the app asks for ")
+				if err1 != nil || at < 0 {
+					t.Fatalf("%s: the refusal quotes no figure", where())
+				}
+				if _, err := fmt.Sscanf(last[at:], "the app asks for %f so that", &needed); err != nil {
+					t.Fatalf("%s: the refusal does not say what it takes: %v", where(), err)
+				}
+				if quoted > lightest || quoted < lightest-0.1001 || quoted >= need || needed != need {
+					t.Fatalf("%s: the refusal quotes %.1f against %.1f; measured %.4f against %.1f", where(), quoted, needed, lightest, need)
 				}
 				if (l.Busy > 0) != strings.Contains(last, "converting for") {
 					t.Fatalf("%s: the refusal is wrong about what else the PC is doing", where())
@@ -903,18 +966,22 @@ func TestDolbyVisionProfile5(t *testing.T) {
 		t.Errorf("on a device that shows it: %+v; want the original", p)
 	}
 	p := DecideFor(m, newDevices["chrome+hevc"], want, withFilter)
-	if p.Method != Convert || !p.Video.HDRToSDR || !has(p.Reasons, "Dolby Vision (profile 5), which this device cannot show in the right colours") {
+	if p.Method != Convert || !p.Video.HDRToSDR || !has(p.Reasons, "Dolby Vision of a kind (profile 5) that this device cannot show in the right colours") {
 		t.Errorf("on a device that plays HEVC but not Dolby Vision: %+v", p)
 	}
+	// It is the PC that cannot, and the answer says so, in its reasons and
+	// in its one-sentence summary.
+	pcCannot := "This device cannot play this file as it is, and this PC cannot convert it for the device."
 	for name, l := range map[string]Limits{"no Dolby Vision filter": without, "no tone mapping at all": {Convert: true}} {
 		p = DecideFor(m, newDevices["chrome+hevc"], want, l)
-		if p.Playable != No || !has(p.Reasons, "Dolby Vision (profile 5)") || !has(p.Reasons, "This PC's converter cannot turn Dolby Vision of this kind into normal colour") {
-			t.Errorf("%s: %+v; want a plain no", name, p)
+		if p.Playable != No || !has(p.Reasons, "(profile 5)") || !has(p.Reasons, "This PC's converter cannot turn Dolby Vision of this kind into normal colour") ||
+			!p.PCCannot || p.Explain() != pcCannot {
+			t.Errorf("%s: %+v, explained as %q; want a plain no", name, p, p.Explain())
 		}
 	}
 	p = DecideFor(m, newDevices["chrome+hevc"], want, Limits{})
-	if p.Playable != No || !has(p.Reasons, "Dolby Vision (profile 5)") || !has(p.Reasons, "This PC cannot convert pictures.") {
-		t.Errorf("a PC that cannot convert: %+v; want a plain no", p)
+	if p.Playable != No || !has(p.Reasons, "(profile 5)") || !has(p.Reasons, "This PC cannot convert pictures.") || !p.PCCannot || p.Explain() != pcCannot {
+		t.Errorf("a PC that cannot convert: %+v, explained as %q; want a plain no", p, p.Explain())
 	}
 	// A device without HEVC needs the filter just the same.
 	if p = DecideFor(m, newDevices["chrome"], want, without); p.Playable != No || !has(p.Reasons, "Dolby Vision") {
@@ -938,8 +1005,9 @@ func TestDolbyVisionProfile5(t *testing.T) {
 		t.Errorf("profile 8 on a device that plays HEVC: %+v; want the picture left alone", p)
 	}
 	// And ordinary HDR is converted by the ordinary filter, or not at all.
-	if p = DecideFor(m, newDevices["chrome"], want, Limits{Convert: true}); p.Playable != No || !has(p.Reasons, "cannot turn HDR into normal colour") {
-		t.Errorf("HDR on a PC without tone mapping: %+v", p)
+	if p = DecideFor(m, newDevices["chrome"], want, Limits{Convert: true}); p.Playable != No || !has(p.Reasons, "cannot turn HDR into normal colour") ||
+		!p.PCCannot || p.Explain() != pcCannot {
+		t.Errorf("HDR on a PC without tone mapping: %+v, explained as %q", p, p.Explain())
 	}
 }
 
@@ -951,24 +1019,41 @@ func TestLessonsAreAdvice(t *testing.T) {
 	dev := newDevices["chrome"]
 	m := film("mp4", "h264", 8, "aac", sizes[1], colours[0], "")
 	slowLink := able
-	slowLink.MaxRate = 4_000_000
+	slowLink.MaxRate = 5_000_000 // what one stall teaches (see StepDown)
 
+	// One stall costs a 1080p picture one size, not two: the first 720p
+	// rung spends no more than the cap.
 	p := DecideFor(m, dev, want, slowLink)
-	if p.Method != Convert || p.Video.Rung != 5 || !has(p.Reasons, "reaching this device too slowly") {
-		t.Errorf("a slow connection: %+v; want the lightest picture", p)
+	if p.Method != Convert || p.Video.Rung != 3 || !has(p.Reasons, "reaching this device too slowly") || !sameStrings(p.Lost, []string{"1080p picture shown as 720p."}) {
+		t.Errorf("a slow connection: %+v; want the first 720p rung", p)
 	}
-	// A file known to be lighter than the cap is left alone.
-	m.BitRate = 2_500_000
-	if p = DecideFor(m, dev, want, slowLink); p.Method != Direct {
-		t.Errorf("a slow connection and a light file: %+v; want the original", p)
+	// A file known to be no heavier than the cap is left alone.
+	for _, rate := range []int{2_500_000, 5_000_000} {
+		m.BitRate = rate
+		if p = DecideFor(m, dev, want, slowLink); p.Method != Direct {
+			t.Errorf("a slow connection and a file of %d bits a second: %+v; want the original", rate, p)
+		}
 	}
 	m.BitRate = 9_000_000
 	if p = DecideFor(m, dev, want, slowLink); p.Method != Convert {
 		t.Errorf("a slow connection and a heavy file: %+v", p)
 	}
+	// A file that does not say what it spends is judged by the size of its
+	// picture: a small one was light all along and is left alone, a 1080p
+	// one is not.
+	for _, c := range []struct {
+		size pictureSize
+		want Method
+	}{{pictureSize{"360p", 640, 360}, Direct}, {sizes[0], Direct}, {pictureSize{"720p", 1280, 720}, Direct}, {sizes[1], Convert}, {sizes[2], Convert},
+		{pictureSize{"a size that was not read", 0, 0}, Convert}} {
+		unknown := film("mp4", "h264", 8, "aac", c.size, colours[0], "")
+		if p = DecideFor(unknown, says(dev, "h264", false), want, slowLink); p.Method != c.want {
+			t.Errorf("a slow connection and a %s file that does not say what it spends: %s, want %s", c.size.name, p.Method, c.want)
+		}
+	}
 	// A PC that cannot convert, or not fast enough, sends the original.
 	tooSlow := measured(slowLink, every(1), every(1), every(1), every(1))
-	for name, l := range map[string]Limits{"cannot convert": {MaxRate: 4_000_000}, "too slow": tooSlow} {
+	for name, l := range map[string]Limits{"cannot convert": {MaxRate: 5_000_000}, "too slow": tooSlow} {
 		if p = DecideFor(m, dev, want, l); p.Method != Direct || len(p.Reasons) != 0 {
 			t.Errorf("a slow connection and a PC that %s: %+v; want the original", name, p)
 		}
@@ -1069,14 +1154,16 @@ func TestTooSlowIsSaidPlainly(t *testing.T) {
 	m := film("avi", "mpeg4", 8, "mp3", sizes[1], colours[0], "")
 	slow := measured(able, [NumRungs]float64{0.4, 0.5, 0.8, 1.0, 1.49}, every(0), every(0), every(0))
 	p := DecideFor(m, newDevices["chrome"], Want{Audio: -1, Subtitle: -1}, slow)
+	// 1.4 seconds of film a second sounds fast enough, so the sentence says
+	// what the figure is held against, and why.
 	want := []string{"Its picture is MPEG-4 (DivX/Xvid), which this browser cannot play.", "It is packaged as AVI, which this browser cannot open.",
-		"This PC cannot convert this film fast enough to watch: at best it manages 1.4 seconds of film a second, and it takes 1.5 to keep up."}
+		"This PC cannot convert this film fast enough to watch: at best it manages 1.4 seconds of film a second, and the app asks for 1.5 so that the film does not stop when you jump or the PC has other work."}
 	if p.Playable != No || p.Method != None || !sameStrings(p.Reasons, want) {
 		t.Errorf("got %s %q, want %q", p.Method, p.Reasons, want)
 	}
 	// The plan says so in a way the page can act on (it offers another
 	// player), and in its one-sentence summary.
-	if !p.TooSlow || p.Explain() != "This PC cannot convert this film fast enough to watch." {
+	if !p.TooSlow || !p.PCCannot || p.Explain() != "This PC cannot convert this film fast enough to watch." {
 		t.Errorf("too slow: tooSlow=%v, explained as %q", p.TooSlow, p.Explain())
 	}
 	// Other refusals are not about speed.
@@ -1086,6 +1173,10 @@ func TestTooSlowIsSaidPlainly(t *testing.T) {
 		"a film that plays":                                    DecideFor(m, newDevices["chrome"], Want{Audio: -1, Subtitle: -1}, able),
 		"a lesson this PC is too slow for":                     DecideFor(film("mp4", "h264", 8, "aac", sizes[1], colours[0], ""), newDevices["chrome"], Want{Audio: -1, Subtitle: -1}, func() Limits { l := slow; l.MaxRate = 4_000_000; return l }()),
 		"a design this PC is too slow to put into the picture": DecideFor(film("mp4", "h264", 8, "aac", sizes[1], colours[0], StyledSubs), surfaces[3].on(newDevices["safari"]), Want{Audio: -1, Subtitle: 0}, slow),
+		// Too slow, and the device could not be sent the converted sound
+		// either: speed is not the one thing in the way, so the film is
+		// not called fine but for this PC.
+		"a device without AAC, on a PC that is too slow as well": DecideFor(m, caps(true, "mp4", "h264", "mp3"), Want{Audio: -1, Subtitle: -1}, slow),
 	} {
 		if q.TooSlow || strings.Contains(q.Explain(), "fast enough") {
 			t.Errorf("%s: tooSlow=%v, explained as %q", name, q.TooSlow, q.Explain())
@@ -1093,7 +1184,7 @@ func TestTooSlowIsSaidPlainly(t *testing.T) {
 	}
 	slow.Busy = 2
 	p = DecideFor(m, newDevices["chrome"], Want{Audio: -1, Subtitle: -1}, slow)
-	if last := p.Reasons[len(p.Reasons)-1]; last != "This PC cannot convert this film fast enough to watch: at best it manages 0.4 seconds of film a second, and it takes 1.5 to keep up while it is converting for 2 other screens as well." {
+	if last := p.Reasons[len(p.Reasons)-1]; last != "This PC cannot convert this film fast enough to watch: at best it manages 0.4 seconds of film a second while it is converting for 2 other screens as well, and the app asks for 1.5 so that the film does not stop when you jump or the PC has other work." {
 		t.Errorf("busy: %q", last)
 	}
 	// One hundredth faster and it plays, at the lightest rung.
@@ -1102,16 +1193,207 @@ func TestTooSlowIsSaidPlainly(t *testing.T) {
 	if p = DecideFor(m, newDevices["chrome"], Want{Audio: -1, Subtitle: -1}, slow); p.Video.Rung != 5 {
 		t.Errorf("exactly on the bar: %+v", p)
 	}
-	// A lighter picture than the lightest there is: no, with the lightest
-	// rung's figure where that was measured too slow.
-	p = DecideFor(m, newDevices["chrome"], Want{Audio: -1, Subtitle: -1, Lower: NumRungs + 1}, able)
-	if last := p.Reasons[len(p.Reasons)-1]; p.Playable != No || last != "This PC cannot convert this film fast enough to watch." {
-		t.Errorf("lighter than the lightest, nothing measured: %s %q", p.Method, p.Reasons)
+	// A wish for a lighter picture never makes a PC "too slow". Asking for
+	// lighter than the lightest gives the lightest, on a fast PC and on
+	// one that has not been measured.
+	for name, l := range map[string]Limits{"not measured": able, "fast": measured(able, every(12), every(12), every(12), every(12))} {
+		p = DecideFor(m, newDevices["chrome"], Want{Audio: -1, Subtitle: -1, Lower: NumRungs + 1}, l)
+		if p.Method != Convert || p.Video.Rung != NumRungs || p.TooSlow {
+			t.Errorf("lighter than the lightest on a PC that is %s: %s rung %d %q", name, p.Method, p.Video.Rung, p.Reasons)
+		}
 	}
+	// Where the lightest rung itself was measured too slow, that is said,
+	// with its figure, whatever was wished for.
 	slow.Speed = Speeds{ClassHD: {0.4, 0.5, 0.8, 1.0, 0.7}}
-	p = DecideFor(m, newDevices["chrome"], Want{Audio: -1, Subtitle: -1, Lower: NumRungs + 1}, slow)
-	if last := p.Reasons[len(p.Reasons)-1]; !strings.Contains(last, "at best it manages 0.7 seconds") {
-		t.Errorf("lighter than the lightest, measured: %q", last)
+	for lower := 0; lower <= NumRungs+1; lower++ {
+		p = DecideFor(m, newDevices["chrome"], Want{Audio: -1, Subtitle: -1, Lower: lower}, slow)
+		if last := p.Reasons[len(p.Reasons)-1]; !p.TooSlow || !strings.Contains(last, "at best it manages 0.7 seconds") {
+			t.Errorf("the lightest rung measured at 0.7, lighter=%d: %q", lower, last)
+		}
+	}
+}
+
+// A rung that was never measured is not trusted blindly. It cannot be
+// faster than a lighter rung, so a lighter rung measured too slow speaks
+// against it; and while the PC is converting for others, an unmeasured PC
+// starts further down.
+func TestUnmeasuredRungs(t *testing.T) {
+	m := film("avi", "mpeg4", 8, "mp3", sizes[1], colours[0], "")
+	uhd := film("avi", "mpeg4", 8, "mp3", sizes[2], colours[1], "")
+	want := Want{Audio: -1, Subtitle: -1}
+	for _, c := range []struct {
+		name string
+		m    Media
+		row  [NumRungs]float64
+		busy int
+		rung int // 0 = too slow
+	}{
+		{"nothing measured", m, [NumRungs]float64{}, 0, 1},
+		{"only the lightest rung, and it is too slow: nothing heavier can keep up", m, [NumRungs]float64{0, 0, 0, 0, 0.8}, 0, 0},
+		{"rungs 2 to 4 too slow, rung 5 fast enough: rung 1 is not faster than rung 2", m, [NumRungs]float64{0, 1.0, 1.2, 1.4, 2.0}, 0, 5},
+		{"rung 3 too slow: rungs 1 and 2 are out, rung 4 is tried", m, [NumRungs]float64{0, 0, 0.9, 0, 0}, 0, 4},
+		{"rung 1 too slow, as a real play showed: the next rung is tried", m, [NumRungs]float64{0.8, 0, 0, 0, 0}, 0, 2},
+		{"a measured rung with a slower lighter one is not believed either", m, [NumRungs]float64{3, 3, 3, 3, 0.8}, 0, 0},
+		{"a lighter rung measured fast enough speaks for no heavier one", m, [NumRungs]float64{0, 0, 0, 0, 9}, 0, 1},
+		// While the PC converts for others, an unmeasured PC starts one
+		// rung further down for each of them, and never refuses on a guess.
+		{"nothing measured, one film being converted", m, [NumRungs]float64{}, 1, 2},
+		{"nothing measured, two", m, [NumRungs]float64{}, 2, 3},
+		{"nothing measured, three", m, [NumRungs]float64{}, 3, 4},
+		{"nothing measured, nine", m, [NumRungs]float64{}, 9, 5},
+		{"4K HDR, nothing measured", uhd, [NumRungs]float64{}, 0, 3},
+		{"4K HDR, nothing measured, one film being converted", uhd, [NumRungs]float64{}, 1, 4},
+		{"4K HDR, nothing measured, three", uhd, [NumRungs]float64{}, 3, 5},
+		// A measured rung is judged by its figure, shared, as before.
+		{"measured, one film being converted", m, [NumRungs]float64{3.0, 4, 5, 6, 9}, 1, 1},
+		{"measured a little slower, one film being converted", m, [NumRungs]float64{2.9, 4, 5, 6, 9}, 1, 2},
+	} {
+		l := able
+		l.Busy = c.busy
+		l.Speed = Speeds{ClassHD: c.row, Class4KHDR: c.row}
+		p := DecideFor(c.m, newDevices["chrome"], want, l)
+		if c.rung == 0 && !p.TooSlow || c.rung != 0 && (p.Method != Convert || p.Video.Rung != c.rung) {
+			t.Errorf("%s (speeds %v): %s rung %d, tooSlow=%v; want rung %d (0 = too slow)", c.name, c.row, p.Method, p.Video.Rung, p.TooSlow, c.rung)
+		}
+	}
+}
+
+// A wish for a lighter picture is a wish (Want.Lower). It never refuses a
+// film: a film that is converted anyway is made lighter where this PC can,
+// and a film that would play as it is gets converted where this PC can and
+// is otherwise sent as it would have been.
+func TestALighterPictureIsAWish(t *testing.T) {
+	plain := Want{Audio: -1, Subtitle: -1}
+	old := film("avi", "mpeg4", 8, "mp3", sizes[1], colours[0], "") // must be converted
+	mp4 := film("mp4", "h264", 8, "aac", sizes[1], colours[0], "")  // plays as it is
+	mp4.BitRate = 8_000_000
+	dev := newDevices["chrome"]
+	lastRungOnly := measured(able, [NumRungs]float64{0.7, 0.9, 1.1, 1.3, 1.6}, every(0), every(0), every(0))
+	tooSlow := measured(able, every(0.9), every(0.9), every(0.9), every(0.9))
+
+	for _, c := range []struct {
+		name   string
+		m      Media
+		lower  int
+		l      Limits
+		method Method
+		rung   int
+	}{
+		{"a film that is converted anyway, two rungs lighter", old, 3, able, Convert, 3},
+		{"the same, on a PC that keeps up only with the last rung", old, 3, lastRungOnly, Convert, 5},
+		{"lighter than the lightest", old, 6, lastRungOnly, Convert, 5},
+		{"far lighter than the lightest", old, 99, able, Convert, 5},
+		{"a film that plays as it is", mp4, 3, able, Convert, 3},
+		{"a film that plays as it is, lighter than the lightest", mp4, 6, middling, Convert, 5},
+		// Where this PC cannot make what was wished for, the film plays as
+		// it would have without the wish.
+		{"a film that plays as it is, on a PC that cannot convert", mp4, 3, Limits{}, Direct, 0},
+		{"a film that plays as it is, on a PC too slow to convert", mp4, 3, tooSlow, Direct, 0},
+		{"a film that plays as it is, on a device that takes no chunks", mp4, 3, able, Direct, 0},
+	} {
+		d := dev
+		if strings.Contains(c.name, "takes no chunks") {
+			d = newDevices["old-tv"]
+		}
+		w := plain
+		w.Lower = c.lower
+		p := DecideFor(c.m, d, w, c.l)
+		if p.Method != c.method || p.Video.Rung != c.rung || p.TooSlow {
+			t.Errorf("%s (lighter=%d): %s rung %d %q; want %s rung %d", c.name, c.lower, p.Method, p.Video.Rung, p.Reasons, c.method, c.rung)
+		}
+		// With the wish dropped because it cannot be met, the answer is
+		// the very one given without it.
+		if c.method == Direct {
+			if without := DecideFor(c.m, d, plain, c.l); !reflect.DeepEqual(p, without) {
+				t.Errorf("%s: %+v; want what is answered without the wish, %+v", c.name, p, without)
+			}
+		}
+	}
+
+	// The reason says "you asked" only where the wish is why the film is
+	// converted at all. A film converted for another reason is given that
+	// reason, also when a step after trouble asked for the lighter rung.
+	p := DecideFor(mp4, dev, Want{Audio: -1, Subtitle: -1, Lower: 3}, able)
+	if !sameStrings(p.Reasons, []string{"You asked for a lighter picture."}) || !sameStrings(p.Lost, []string{"1080p picture shown as 720p."}) {
+		t.Errorf("a film that plays, made lighter: reasons %q, lost %q", p.Reasons, p.Lost)
+	}
+	p = DecideFor(old, dev, Want{Audio: -1, Subtitle: -1, Lower: 3}, able)
+	if has(p.Reasons, "lighter picture") || p.Video.Rung != 3 {
+		t.Errorf("a film that is converted anyway, made lighter: rung %d, reasons %q", p.Video.Rung, p.Reasons)
+	}
+	slowLink := able
+	slowLink.MaxRate = 5_000_000
+	p = DecideFor(mp4, dev, Want{Audio: -1, Subtitle: -1, Lower: 4}, slowLink)
+	if has(p.Reasons, "You asked") || !has(p.Reasons, "reaching this device too slowly") || p.Video.Rung != 4 {
+		t.Errorf("a film converted for a slow connection, made lighter: rung %d, reasons %q", p.Video.Rung, p.Reasons)
+	}
+}
+
+// Lighter names the rung to ask for when the viewer presses "lighter
+// picture": one that really is lighter than what they are watching.
+func TestWhichRungIsLighter(t *testing.T) {
+	plain := Want{Audio: -1, Subtitle: -1}
+	dev := says(newDevices["chrome"], "h264", false)
+	for _, c := range []struct {
+		name string
+		size pictureSize
+		rate int
+		want int
+	}{
+		{"1080p at 8 Mbit/s: the 1080p rungs may spend more, so 720p", sizes[1], 8_000_000, 3},
+		{"1080p at 30 Mbit/s: the first rung is lighter", sizes[1], 30_000_000, 1},
+		{"1080p at 11 Mbit/s", sizes[1], 11_000_000, 1},
+		{"1080p that does not say what it spends", sizes[1], 0, 3},
+		{"4K", sizes[2], 20_000_000, 1},
+		{"720p at 6 Mbit/s", pictureSize{"720p", 1280, 720}, 6_000_000, 3},
+		{"720p at 3 Mbit/s", pictureSize{"720p", 1280, 720}, 3_000_000, 5},
+		{"480p at 3 Mbit/s", sizes[0], 3_000_000, 5},
+		{"480p at 1 Mbit/s: nothing lighter is made", sizes[0], 1_000_000, 0},
+		{"a size and bit rate that were not read", pictureSize{"unknown", 0, 0}, 0, 1},
+	} {
+		m := film("mp4", "h264", 8, "aac", c.size, colours[0], "")
+		m.BitRate = c.rate
+		p := DecideFor(m, dev, plain, able)
+		if p.Method != Direct {
+			t.Fatalf("%s: %s %q", c.name, p.Method, p.Reasons)
+		}
+		got := Lighter(m, p)
+		if got != c.want {
+			t.Errorf("%s: rung %d, want %d", c.name, got, c.want)
+		}
+		// Asking for it gives a conversion at that rung, whose picture is
+		// smaller or may spend fewer bits than the film does.
+		if got > 0 {
+			w := plain
+			w.Lower = got
+			q := DecideFor(m, dev, w, fast)
+			r := Ladder()[got-1]
+			if q.Method != Convert || q.Video.Rung != got || !(r.Height < c.size.height || c.size.height == 0 || c.rate > r.MaxRate || c.rate == 0) {
+				t.Errorf("%s, asked for: %s rung %d", c.name, q.Method, q.Video.Rung)
+			}
+		}
+	}
+	// From a converted picture it is the next rung, and after the last
+	// there is none.
+	old := film("avi", "mpeg4", 8, "mp3", sizes[1], colours[0], "")
+	for rung := 1; rung <= NumRungs; rung++ {
+		w := plain
+		w.Lower = rung
+		want := rung + 1
+		if rung == NumRungs {
+			want = 0
+		}
+		if got := Lighter(old, DecideFor(old, dev, w, able)); got != want {
+			t.Errorf("from rung %d: %d, want %d", rung, got, want)
+		}
+	}
+	// Nothing is lighter than a film that does not play, or one that was
+	// never inspected.
+	if got := Lighter(old, DecideFor(old, dev, plain, Limits{})); got != 0 {
+		t.Errorf("a film that is refused: %d", got)
+	}
+	if got := Lighter(Media{}, DecideFor(Media{}, dev, plain, able)); got != 0 {
+		t.Errorf("a film that was never inspected: %d", got)
 	}
 }
 
@@ -1211,7 +1493,7 @@ func TestPlanJSON(t *testing.T) {
 		sort.Strings(names)
 		return strings.Join(names, " ")
 	}
-	if want := "audioCopy audioTrack deviceUnknown hasAudio lost method picture playable reasons subtitleKind subtitles tooSlow video"; keys(got) != want {
+	if want := "audioCopy audioTrack deviceUnknown hasAudio lost method pcCannot picture playable reasons subtitleKind subtitles tooSlow video"; keys(got) != want {
 		t.Errorf("a plan has the fields %q, want %q", keys(got), want)
 	}
 	if want := "class encoder hdrToSdr height rung"; keys(got["video"].(map[string]any)) != want {

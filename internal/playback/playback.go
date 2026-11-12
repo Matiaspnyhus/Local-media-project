@@ -15,8 +15,8 @@
 //	none     it cannot be played on this device from this PC, and the
 //	         reasons say why
 //
-// When something goes wrong while a film plays, StepDown says what to
-// change and what to remember (see stepdown.go).
+// When something goes wrong while a film plays, Replan says what to change,
+// what to remember and what to tell the viewer (see stepdown.go).
 package playback
 
 import "strings"
@@ -144,6 +144,12 @@ type Plan struct {
 	// convert the film as fast as it plays. The film itself is fine, so
 	// the page can offer to open it in another player.
 	TooSlow bool `json:"tooSlow"`
+	// PCCannot says the answer is no because of this PC, not the device:
+	// the file would have to be repackaged or converted for the device,
+	// and this PC cannot do that. It cannot convert pictures, or its
+	// converter lacks what this film needs, or it is too slow (TooSlow is
+	// then set as well).
+	PCCannot bool `json:"pcCannot"`
 	// Video says what the picture is converted to. It is empty unless the
 	// method is convert.
 	Video Video `json:"video"`
@@ -183,9 +189,11 @@ func Decide(m Media, c *Caps, audioTrack int) Plan {
 // what earlier trouble has taught (see Want and Limits).
 //
 // The original is sent whenever it would play, and repackaged when that is
-// all it takes. The picture is converted only when nothing less will do:
-// the device cannot show the film's own picture, the subtitles have to be
-// put into it, or a lighter picture was asked for.
+// all it takes. The picture is converted when nothing less will do: the
+// device cannot show the film's own picture, or the subtitles have to be
+// put into it. Where this PC can, it is also converted when a lesson or the
+// viewer's wish for a lighter picture advises it (see advised); where it
+// cannot, advice is dropped and the film plays as it would have.
 func DecideFor(m Media, c *Caps, w Want, l Limits) Plan {
 	sub := wanted(m, w)
 	if !m.Probed {
@@ -246,13 +254,10 @@ func decide(m Media, c *Caps, w Want, l Limits, sub *Subtitle, mode SubtitleMode
 		picture = append(picture, "Its picture is "+sizeWord(v.Width, v.Height)+", which this device does not say it plays smoothly.")
 	}
 	if v.DoVi == 5 && !lacks && !c.Video["dovi5"] {
-		picture = append(picture, "Its picture is Dolby Vision (profile 5), which this device cannot show in the right colours.")
+		picture = append(picture, "Its picture is Dolby Vision of a kind (profile 5) that this device cannot show in the right colours.")
 	}
 	if mode == SubsBurn {
 		picture = append(picture, burnReason(sub, c))
-	}
-	if w.Lower > 0 {
-		picture = append(picture, "A lighter picture was asked for.")
 	}
 
 	// Second, what keeps the original file from simply being sent although
@@ -336,21 +341,29 @@ func decide(m Media, c *Caps, w Want, l Limits, sub *Subtitle, mode SubtitleMode
 	}
 
 	// The picture has to be converted. Can this PC do that?
-	if !l.Convert {
-		if lacks {
-			// M3's answer and M3's words, kept while Decide stands in for
-			// a PC without picture conversion.
-			return refuse(p, []string{"Its picture is " + VideoName(v) + ", which this browser cannot play. Converting the picture arrives in a later version."})
-		}
-		return refuse(p, why("This PC cannot convert pictures."))
+	switch {
+	case l.Convert:
+		return converted(p, why(), m, a, c, w, l)
+	case lacks:
+		// M3's answer and M3's words, kept while Decide stands in for
+		// a PC without picture conversion.
+		return refuse(p, []string{"Its picture is " + VideoName(v) + ", which this browser cannot play. Converting the picture arrives in a later version."})
 	}
-	return converted(p, why(), m, a, c, w, l)
+	return cannot(p, why("This PC cannot convert pictures."))
 }
 
 // refuse is the answer "this cannot be played here", with the reasons.
 func refuse(p Plan, reasons []string) Plan {
 	return Plan{Playable: No, Method: None, HasAudio: p.HasAudio, AudioTrack: p.AudioTrack, Reasons: reasons,
 		Subtitles: SubsNone, Lost: []string{}}
+}
+
+// cannot is refuse where it is this PC, not the device, that stands in the
+// way: the plan says so, and so does its one-sentence summary.
+func cannot(p Plan, reasons []string) Plan {
+	no := refuse(p, reasons)
+	no.PCCannot = true
+	return no
 }
 
 // videoKey is the name a picture format goes by in Caps.Video and
@@ -499,6 +512,9 @@ func (p Plan) Explain() string {
 	}
 	if p.TooSlow {
 		return "This PC cannot convert this film fast enough to watch."
+	}
+	if p.PCCannot {
+		return "This device cannot play this file as it is, and this PC cannot convert it for the device."
 	}
 	return "This browser cannot play this file yet."
 }
