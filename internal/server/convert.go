@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,17 +21,21 @@ import (
 
 // conversion is what the server keeps in memory for converting pictures.
 type conversion struct {
-	// What the converter on this PC was built to do, asked once.
-	mu      sync.Mutex
-	asked   bool
-	can     hls.Abilities
-	retryAt time.Time // after a failed ask: not before this
+	// What the converter on this PC was built to do. ffmpeg is asked in the
+	// background (see askConverter); nothing holds mu while it runs.
+	mu        sync.Mutex
+	asked     bool          // can is ffmpeg's own answer
+	can       hls.Abilities // nothing, until ffmpeg has answered
+	asking    chan struct{} // closed when the ask under way ends; nil when none is
+	waitUntil time.Time     // until when a request may wait for that ask
+	retryAt   time.Time     // after a failed ask: not before this
 
-	// Facts about films' pictures, kept while the program runs, and the
-	// looks at films that are under way.
+	// Facts about films' pictures, kept while the program runs, the looks
+	// at films that are under way, and the looks that failed a while ago.
 	factMu    sync.Mutex
 	facts     map[string]keptFacts  // by file
 	looks     map[string]*factsLook // by file and stamp
+	lookFails map[string]lookFailure
 	factSlots chan struct{}
 }
 
@@ -47,6 +52,13 @@ type factsLook struct {
 	err   error
 }
 
+// lookFailure remembers that a look failed for a file as it was then.
+type lookFailure struct {
+	stamp string
+	at    time.Time
+	err   error
+}
+
 const (
 	// maxFactLooks is how many films are looked at at once. A look is two
 	// short reads, so this is hardly ever reached.
@@ -54,64 +66,118 @@ const (
 	// factLookLimit is how long one look may take. It takes a moment,
 	// except on a disk that has to wake up first.
 	factLookLimit = 45 * time.Second
+	// lookRetryAfter is how long a failed look at a file is remembered. A
+	// file ffprobe could not make sense of will not have changed its mind
+	// by the next press of Play. It is shorter than for a failed search
+	// for cuts (cutRetryAfter), because here the film does not play
+	// meanwhile.
+	lookRetryAfter = 5 * time.Minute
 	// maxKeptFacts bounds the memory the kept facts take.
 	maxKeptFacts = 5000
+	// abilityAskLimit is how long ffmpeg is given to say what it can do,
+	// and abilityRetry how long after a failed ask it is asked again.
+	abilityAskLimit = 30 * time.Second
+	abilityRetry    = time.Minute
 )
 
+// abilityWait is how long after the program has started a list or a Play
+// waits for ffmpeg's first answer about what it can do, and lookWait how
+// long a Play waits for the look at a film's picture. (Variables so that
+// tests need not wait as long.)
+var (
+	abilityWait = 2 * time.Second
+	lookWait    = 20 * time.Second
+)
+
+// errLookSlow says a look at a film's picture did not finish in the time a
+// Play waits for it. The look carries on.
+var errLookSlow = errors.New("the look at the film's picture is taking long")
+
 func newConversion() *conversion {
-	return &conversion{facts: map[string]keptFacts{}, looks: map[string]*factsLook{}, factSlots: make(chan struct{}, maxFactLooks)}
+	return &conversion{facts: map[string]keptFacts{}, looks: map[string]*factsLook{}, lookFails: map[string]lookFailure{},
+		factSlots: make(chan struct{}, maxFactLooks)}
 }
 
-// abilities says what this PC's converter can do. The converter is asked
-// once, when the program starts (see askConverterSoon), and the answer
-// kept; a call that arrives while it is being asked waits for it. Should
-// asking fail, nothing can be converted for now, and it is asked again a
-// minute later: a PC that is busy starting up must not lose conversion
-// until the program is next started.
-func (s *Server) abilities() hls.Abilities {
+// abilities says what this PC's converter can do, and whether that is
+// known: until ffmpeg has answered, the answer is "nothing, as far as is
+// known".
+//
+// ffmpeg is asked when the program starts (see askConverterSoon), in the
+// background. No request ever runs it or waits behind a lock for it: the
+// program is large, and on a PC that is busy starting up it can take its
+// time, or hang. A request that arrives in the first moments waits a
+// little for that first answer (abilityWait, counted from when ffmpeg was
+// asked, not from when the request came) and after that is answered from
+// what is known. Should asking fail, nothing can be converted for now, and
+// the first request a minute later has it asked again, without waiting for
+// it: a PC that was busy starting up must not lose conversion until the
+// program is next started.
+func (s *Server) abilities() (can hls.Abilities, known bool) {
 	if s.ffmpeg == "" {
-		return hls.Abilities{}
+		return hls.Abilities{}, true
 	}
 	c := s.helpers.convert
+	c.mu.Lock()
+	if !c.asked && c.asking == nil && !time.Now().Before(c.retryAt) {
+		s.askConverter(0)
+	}
+	asking, wait := c.asking, time.Until(c.waitUntil)
+	can, known = c.can, c.asked
+	c.mu.Unlock()
+	if known || asking == nil || wait <= 0 {
+		return can, known
+	}
+	limit := time.NewTimer(wait)
+	defer limit.Stop()
+	select {
+	case <-asking:
+	case <-limit.C:
+	case <-s.ctx.Done():
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.asked && !time.Now().Before(c.retryAt) {
-		s.askConverter(s.ffmpeg)
-	}
-	return c.can
+	return c.can, c.asked
 }
 
-// askConverter asks ffmpeg what it can do (it is started twice, for a
-// moment each) and keeps the answer. The caller holds c.mu.
-func (s *Server) askConverter(ffmpeg string) {
+// askConverter has ffmpeg asked what it can do (it is started twice, for a
+// moment each) and the answer kept. It returns at once; requests may wait
+// for the answer for as long as wait says. The caller holds c.mu.
+func (s *Server) askConverter(wait time.Duration) {
 	c := s.helpers.convert
-	ctx, cancel := context.WithTimeout(s.ctx, 30*time.Second)
-	defer cancel()
-	can, err := hls.ReadAbilities(ctx, ffmpeg)
-	if err != nil {
-		if s.ctx.Err() == nil {
-			s.log.Printf("the converter could not be asked what it can do, so pictures are not converted for now: %s", s.pathless(err.Error()))
-		}
-		c.retryAt = time.Now().Add(time.Minute)
-		return
+	if s.ctx.Err() != nil {
+		return // the program is closing
 	}
-	c.asked, c.can = true, can
-}
-
-// askConverterSoon asks the converter what it can do, in the background, so
-// that neither the program's start nor the first list or Play waits for
-// ffmpeg to be loaded from the disk. The answer is held shut from this
-// moment until it is there, so whoever needs it first gets this one.
-func (s *Server) askConverterSoon() {
-	c := s.helpers.convert
+	done := make(chan struct{})
+	c.asking, c.waitUntil = done, time.Now().Add(wait)
 	ffmpeg := s.ffmpeg
-	c.mu.Lock()
 	s.background.Add(1)
 	go func() {
 		defer s.background.Done()
-		defer c.mu.Unlock()
-		s.askConverter(ffmpeg)
+		ctx, cancel := context.WithTimeout(s.ctx, abilityAskLimit)
+		can, err := hls.ReadAbilities(ctx, ffmpeg)
+		cancel()
+		c.mu.Lock()
+		if err != nil {
+			if s.ctx.Err() == nil {
+				s.log.Printf("the converter could not be asked what it can do, so pictures are not converted for now: %s", s.pathless(err.Error()))
+			}
+			c.retryAt = time.Now().Add(abilityRetry)
+		} else {
+			c.asked, c.can = true, can
+		}
+		c.asking = nil
+		c.mu.Unlock()
+		close(done)
 	}()
+}
+
+// askConverterSoon asks the converter what it can do when the program
+// starts, so that the answer is usually there before anyone needs it.
+func (s *Server) askConverterSoon() {
+	c := s.helpers.convert
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s.askConverter(abilityWait)
 }
 
 // limits says what this PC can do for one play: whether it can repackage
@@ -128,16 +194,81 @@ func (s *Server) limits(u *User) playback.Limits {
 	if s.hls == nil {
 		return playback.Limits{NoConverter: true}
 	}
-	l := playback.Limits{Convert: s.abilities().CanConvert()}
+	can, _ := s.abilities()
+	l := playback.Limits{Convert: can.CanConvert()}
 	if u != nil {
 		l.Busy = s.hls.Converting(u.SessionID)
 	}
 	return l
 }
 
+// decide is the decision how a film is played (playback.DecideFor) as this
+// server gives it. The rules are playback's. Two answers are put right
+// here, where it is known what stands behind the limits:
+//
+//   - A device's word that it does not play 4K smoothly is advice, as a
+//     lesson is: where this PC can make a smaller picture, it does. Where
+//     it cannot (no converter, an HDR film, too slow), the film is planned
+//     as if the device had not said so, and plays as it did before
+//     pictures could be converted. Stuttering beats not playing.
+//   - A PC whose converter cannot convert pictures, or has not said yet
+//     whether it can, gets the rules' answer for a PC without picture
+//     conversion, which is worded for the version before there was any
+//     ("arrives in a later version") and blames the browser. The reasons
+//     are taken from what the film would need, and the PC is named.
+func (s *Server) decide(m playback.Media, c *playback.Caps, w playback.Want, l playback.Limits) playback.Plan {
+	p := playback.DecideFor(m, c, w, l)
+	if p.Playable != playback.No || c == nil {
+		return p
+	}
+	if p.PCCannot {
+		anySize := *c
+		anySize.Tall = maps.Clone(c.Video)
+		if q := playback.DecideFor(m, &anySize, w, l); q.Playable != playback.No {
+			return q
+		}
+		return p
+	}
+	if l.Convert || l.NoConverter {
+		return p
+	}
+	// What would be decided on a PC that converts anything?
+	able := l
+	able.Convert, able.ToneMap, able.DoViTone = true, true, true
+	q := playback.DecideFor(m, c, w, able)
+	switch {
+	case q.Playable == playback.No && !q.PCCannot:
+		return q // the device could not play it then either, and this says why
+	case q.Playable != playback.No && q.Method != playback.Convert:
+		return p
+	}
+	reason := "The converter on this PC cannot convert pictures, so the film cannot be converted for this device."
+	if _, known := s.abilities(); !known {
+		cv := s.helpers.convert
+		cv.mu.Lock()
+		waiting := cv.asking != nil
+		cv.mu.Unlock()
+		reason = "The converter on this PC could not be asked what it can do, so pictures cannot be converted at the moment. It will be asked again within a minute or two."
+		if waiting {
+			reason = "The converter on this PC has not said yet what it can do, so pictures cannot be converted at the moment. Try again in a minute."
+		}
+	}
+	no := unplayable(q, reason)
+	no.PCCannot = true
+	return no
+}
+
 // pictureFacts returns the facts about a film's picture that converting it
 // starts from (see hls.PictureFacts), looking at the file the first time
-// and keeping the answer for as long as the file stays the same.
+// and keeping the answer for as long as the file stays the same. size and
+// mtime are the file's own, read when Play was pressed: a file that was
+// replaced since the library last scanned it is looked at afresh.
+//
+// A look that failed is remembered for a while, as a failed search for
+// cuts is: pressing Play again must not start the same doomed look, with
+// every other film waiting behind it. A look that is slow (a disk waking
+// up) is waited for only so long; errLookSlow then says that it is still
+// going on, and the next Play finds what it found.
 func (s *Server) pictureFacts(ctx context.Context, fileID, path string, size, mtime int64) (hls.PictureFacts, error) {
 	if s.ffprobe == "" {
 		return hls.PictureFacts{}, errors.New("the file inspector is not installed")
@@ -148,6 +279,10 @@ func (s *Server) pictureFacts(ctx context.Context, fileID, path string, size, mt
 	if k, ok := c.facts[fileID]; ok && k.stamp == stamp {
 		c.factMu.Unlock()
 		return k.facts, nil
+	}
+	if f, ok := c.lookFails[fileID]; ok && f.stamp == stamp && time.Since(f.at) < lookRetryAfter {
+		c.factMu.Unlock()
+		return hls.PictureFacts{}, f.err // it failed a moment ago; it would fail again
 	}
 	key := fileID + " " + stamp
 	look := c.looks[key]
@@ -164,11 +299,15 @@ func (s *Server) pictureFacts(ctx context.Context, fileID, path string, size, mt
 	c.factMu.Unlock()
 	// The look belongs to no one request: a viewer who gives up leaves it
 	// running for the next.
+	limit := time.NewTimer(lookWait)
+	defer limit.Stop()
 	select {
 	case <-look.done:
 		return look.facts, look.err
 	case <-ctx.Done():
 		return hls.PictureFacts{}, ctx.Err()
+	case <-limit.C:
+		return hls.PictureFacts{}, errLookSlow
 	}
 }
 
@@ -176,25 +315,66 @@ func (s *Server) pictureFacts(ctx context.Context, fileID, path string, size, mt
 func (s *Server) lookAtPicture(look *factsLook, key, fileID, stamp, path string) {
 	defer s.background.Done()
 	c := s.helpers.convert
+	cutShort := false // by the clock or by the program closing, which says nothing about the file
 	select {
 	case c.factSlots <- struct{}{}:
 		ctx, cancel := context.WithTimeout(s.ctx, factLookLimit)
 		look.facts, look.err = hls.ProbePicture(ctx, s.ffprobe, path)
+		cutShort = ctx.Err() != nil
 		cancel()
 		<-c.factSlots
 	case <-s.ctx.Done():
-		look.err = s.ctx.Err()
+		look.err, cutShort = s.ctx.Err(), true
 	}
 	c.factMu.Lock()
 	delete(c.looks, key)
-	if look.err == nil {
+	switch {
+	case look.err == nil:
 		if len(c.facts) >= maxKeptFacts {
 			c.facts = map[string]keptFacts{} // each is found again when next needed
 		}
 		c.facts[fileID] = keptFacts{stamp: stamp, facts: look.facts}
+		delete(c.lookFails, fileID)
+	case !cutShort:
+		// Old entries go when a new one comes.
+		for id, f := range c.lookFails {
+			if time.Since(f.at) >= lookRetryAfter {
+				delete(c.lookFails, id)
+			}
+		}
+		c.lookFails[fileID] = lookFailure{stamp: stamp, at: time.Now(), err: look.err}
 	}
 	c.factMu.Unlock()
 	close(look.done)
+}
+
+// sizeFor is how large a film's picture is made at a setting whose frame is
+// lines high. The arithmetic is hls.PictureFacts.Size's. Two kinds of
+// picture are held against a different frame here, the one the decision
+// goes by when it says what is lost (playback's fit and sizeOf):
+//
+//   - A picture that stands taller than it is wide, as a phone held upright
+//     films it, is fitted to the frame stood on end. 1080 by 1920 is as
+//     much picture as 1920 by 1080 and stays whole at the 1080p settings;
+//     fitted by its height alone it came out 608 by 1080.
+//   - A picture a few lines over 1080 (1088, as some files store 1080p) is
+//     left as it is at the 1080p settings, where shaving off its eight
+//     lines made 1906 by 1080 of it.
+func sizeFor(f hls.PictureFacts, lines int) (w, h int) {
+	// The picture as it is shown, at its own size: turned upright, and with
+	// square pixels.
+	ownW, ownH := f.Size(1 << 20)
+	lyingW, lyingH := max(ownW, ownH), min(ownW, ownH)
+	if lines == 1080 && lyingH <= 1088 && lyingW <= 1920 {
+		return ownW, ownH
+	}
+	if ownH > ownW {
+		// Stood on end the frame is lines wide and 16:9 of that high. Size
+		// goes by the height: the most this picture may have is what
+		// leaves it inside both.
+		return f.Size(min(lines*ownH/ownW, lines*16/9))
+	}
+	return f.Size(lines)
 }
 
 // convertSpec works out how one film's picture is converted for one play:
@@ -218,7 +398,7 @@ func convertSpec(f hls.PictureFacts, v playback.Video) (hls.Grid, *hls.Convert, 
 	if !g.Valid() {
 		return hls.Grid{}, nil, errors.New("the film does not say enough about its picture's timing to be cut into chunks")
 	}
-	c.W, c.H = f.Size(rung.Height)
+	c.W, c.H = sizeFor(f, rung.Height)
 	if c.W < 2 || c.H < 2 {
 		return hls.Grid{}, nil, fmt.Errorf("the film gives its picture's size as %d by %d", f.Width, f.Height)
 	}

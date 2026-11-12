@@ -459,15 +459,15 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	// The viewer picked the sound for this play only if the request names
 	// it; otherwise it comes from their settings or an earlier pick.
 	want := playback.Want{Audio: choice.Audio, AudioAuto: in.Audio == nil, Subtitle: -1, Lower: in.Lower}
-	plan := playback.DecideFor(ft.media, caps, want, limits)
+	plan := s.decide(ft.media, caps, want, limits)
 	if plan.Playable == playback.No {
 		// The preferred sound track may be what stands in the way (it takes
 		// repackaging to switch). The file's own main track is better than
 		// nothing.
 		main := want
 		main.Audio, main.AudioAuto = -1, false
-		if alt := playback.DecideFor(ft.media, caps, main, limits); alt.Playable != playback.No {
-			plan = alt
+		if alt := s.decide(ft.media, caps, main, limits); alt.Playable != playback.No {
+			plan, want = alt, main
 		}
 	}
 
@@ -479,21 +479,48 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	path := filepath.Join(libPath, filepath.FromSlash(rel))
 	var grid hls.Grid
 	var convert *hls.Convert
-	if plan.Method == playback.Convert {
-		// Converting starts from a few facts about the picture (where its
-		// clock stands, how fast its frames come, what shape they are),
-		// found by a short look at the file the first time.
-		facts, err := s.pictureFacts(r.Context(), fileID, path, size, mtime)
-		if err == nil {
-			grid, convert, err = convertSpec(facts, plan.Video)
-		}
+	if plan.Method == playback.Remux || plan.Method == playback.Audio || plan.Method == playback.Convert {
+		// Before any helper program is pointed at the file: it must be a
+		// real file inside its library, and be there. (A drive that was
+		// unplugged takes its films with it.)
+		f, now, err := openMedia(libPath, rel)
 		if err != nil {
-			if r.Context().Err() != nil {
-				return // the viewer has gone
+			writeErr(w, http.StatusNotFound, "That file is not available right now.")
+			return
+		}
+		f.Close()
+		if plan.Method == playback.Convert {
+			// Converting starts from a few facts about the picture (where
+			// its clock stands, how fast its frames come, what shape they
+			// are), found by a short look at the file the first time. They
+			// are kept for the file as it is at this moment, by its own
+			// size and date, not the ones the library last noted.
+			facts, err := s.pictureFacts(r.Context(), fileID, path, now.Size(), now.ModTime().UnixNano())
+			if err == nil {
+				// The decision went by the frame rate the library noted. The
+				// converter goes by the one the look found, which is the
+				// truer. Where they differ the decision is made again, so
+				// that what the answer says is lost is what is left out.
+				if rate := float64(facts.RateNum) / float64(max(facts.RateDen, 1)); rate != ft.media.Video[0].FrameRate {
+					ft.media.Video[0].FrameRate = rate
+					if again := s.decide(ft.media, caps, want, limits); again.Method == playback.Convert {
+						plan = again
+					}
+				}
+				grid, convert, err = convertSpec(facts, plan.Video)
 			}
-			s.log.Printf("%s cannot be converted: %s", filepath.Base(path), s.pathless(strings.ReplaceAll(err.Error(), path, filepath.Base(path))))
-			plan = unplayable(plan, "This PC could not work out how to convert this film's picture.")
-			plan.PCCannot = true
+			if err != nil {
+				if r.Context().Err() != nil {
+					return // the viewer has gone
+				}
+				s.log.Printf("%s cannot be converted: %s", filepath.Base(path), s.pathless(strings.ReplaceAll(err.Error(), path, filepath.Base(path))))
+				reason := "This PC could not work out how to convert this film's picture."
+				if errors.Is(err, errLookSlow) {
+					reason = "This PC could not read the film in time to convert its picture. The disk it is on may have been asleep: try again in a moment."
+				}
+				plan = unplayable(plan, reason)
+				plan.PCCannot = true
+			}
 		}
 	}
 
@@ -507,12 +534,6 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		"explain":    plan.Explain(),
 	}
 	if plan.Method == playback.Remux || plan.Method == playback.Audio || plan.Method == playback.Convert {
-		f, _, err := openMedia(libPath, rel) // confirms the file is a real file inside its library
-		if err != nil {
-			writeErr(w, http.StatusNotFound, "That file is not available right now.")
-			return
-		}
-		f.Close()
 		if convert == nil {
 			grid = s.grid(r.Context(), fileID, path, size, mtime, durationMs)
 		}

@@ -175,6 +175,14 @@ func applyOverrides(c *playback.Caps, userAgent string) {
 	if c.Tall == nil {
 		c.Tall = maps.Clone(c.Video)
 	}
+	// That page did not ask about Dolby Vision profile 5 either (a page
+	// that asks sends the answer, yes or no), and such a film was sent to
+	// any device that plays its HEVC. It is not refused now on the
+	// strength of a question nobody put: the device answers for itself
+	// once its page has been loaded again.
+	if _, asked := c.Video["dovi5"]; !asked && c.Video != nil {
+		c.Video["dovi5"] = true
+	}
 }
 
 // version is one copy of a film or an episode. Most have one; a film kept
@@ -293,7 +301,16 @@ func (s *Server) judge(u *User, copies []*version) error {
 	// converting for someone else at this moment.
 	caps, limits := s.playCaps(u), s.limits(nil)
 	for _, v := range copies {
-		v.plan = playback.DecideFor(*media[v.fileID], caps, playback.Want{Audio: -1, Subtitle: -1}, limits)
+		m := media[v.fileID]
+		v.plan = s.decide(*m, caps, playback.Want{Audio: -1, Subtitle: -1}, limits)
+		if v.plan.Method == playback.Convert && m.Video[0].Height > 0 {
+			// A copy whose picture is converted is ranked by the picture the
+			// device is shown, not the one in the file: of a 1080p copy
+			// converted at its full size and a 4K copy shown at 720p, the
+			// first is the better picture, and far less work to read.
+			own, lines := m.Video[0], v.plan.Video.Height
+			v.pixels = own.Width * lines / own.Height * lines
+		}
 	}
 	return nil
 }
