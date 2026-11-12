@@ -424,8 +424,8 @@ try {
   await step('a page the browser puts aside and brings back goes on playing', async () => {
     // When the viewer goes to another page in the same tab, a browser may
     // keep this one exactly as it is and bring it back on Back. It says so
-    // with these two events. (The test browsers have that habit switched
-    // off, so the events are sent by hand.)
+    // with these two events. (A browser run by a test does not reliably do
+    // this, so the events are sent by hand.)
     await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })))
     await page.waitForTimeout(500) // time for a request to stop converting, had one been sent, to arrive
     assert.equal(await converters(), 1, 'the film is still open on the PC for the page that may come back')
