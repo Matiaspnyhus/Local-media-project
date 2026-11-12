@@ -749,6 +749,58 @@ func TestNothingIsLeftRunningOrOnDisk(t *testing.T) {
 	}
 }
 
+// The chunks are files in a folder, and something other than this program
+// may empty that folder: starting the program a second time did. When the
+// run that made them has already finished, nothing will write them again
+// by itself; a request for one must start the converter again, and not
+// wait half a minute for a file that will never come back.
+func TestChunksThatVanishFromTheDiskAreMadeAgain(t *testing.T) {
+	ffmpeg, ffprobe := tools(t)
+	src := source(t, ffmpeg, "plain")
+	m := manager(t, ffmpeg)
+	ctx := context.Background()
+	token := m.Open(Spec{Path: src, Grid: grid(t, ffprobe, src, 40000), VideoCodec: "h264", AudioTrack: 0, AudioCopy: true})
+	fetch(t, m, token, 0, 6)
+	m.mu.Lock()
+	s := m.sessions[token]
+	m.mu.Unlock()
+	finished := func() bool {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return s.run != nil && !s.run.alive() && s.run.ended
+	}
+	if !settled(finished) {
+		t.Fatal("the converter did not finish a 40-second film")
+	}
+	header, _ := m.Init(ctx, token)
+	for i, ask := range []func() ([]byte, error){
+		func() ([]byte, error) { return m.Segment(ctx, token, 3) },
+		func() ([]byte, error) { return m.Init(ctx, token) },
+	} {
+		if !settled(finished) {
+			t.Fatal("the converter did not finish again")
+		}
+		// The folder is inside this test's own temporary folder.
+		if err := os.RemoveAll(s.dir); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		b, err := ask()
+		if err != nil || len(b) == 0 || time.Since(start) > 10*time.Second {
+			t.Fatalf("request %d after the chunks vanished: %d bytes, %v, after %v", i, len(b), err, time.Since(start))
+		}
+		if i == 1 && !bytes.Equal(b, header) {
+			t.Errorf("the header made again differs from the first (%d and %d bytes)", len(b), len(header))
+		}
+	}
+	m.mu.Lock()
+	starts := s.starts
+	m.mu.Unlock()
+	if starts != 3 {
+		t.Errorf("ffmpeg was started %d times, want 3 (the film, and once for each time its chunks vanished)", starts)
+	}
+}
+
 func TestTheConverterWaitsWhenFarAheadAndForgetsWhatWasWatched(t *testing.T) {
 	ffmpeg, ffprobe := tools(t)
 	src := source(t, ffmpeg, "plain")

@@ -357,6 +357,7 @@ func (m *Manager) reach() int {
 func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	launched := false
+	var unreadable *run // the run whose file for this request could not be read
 	for {
 		m.mu.Lock()
 		s := m.sessions[token]
@@ -386,18 +387,35 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 		}
 		r := s.run
 		alive := r != nil && r.alive()
+		lost := false
 		if r != nil && (n < 0 && r.header || n >= r.low && n < r.next) {
-			p := r.file(n)
-			m.mu.Unlock()
-			// Read outside the lock. If a restart removed the file in the
-			// meantime, go round again.
-			if b, err := os.ReadFile(p); err == nil {
-				return b, nil
+			if r != unreadable {
+				p := r.file(n)
+				m.mu.Unlock()
+				// Read outside the lock. If the file is not there, go round
+				// again: a restart may have removed it in the meantime, and
+				// then there is a new run to look at.
+				if b, err := os.ReadFile(p); err == nil {
+					return b, nil
+				}
+				unreadable = r
+				continue
 			}
-			m.mu.Lock()
+			// The same run still says it has the file, and the disk says
+			// otherwise. Something outside this program removed it (a second
+			// copy of the program clearing the folder as it starts, a
+			// cleaning tool), and waiting will not bring it back.
+			lost = true
 		}
 		startAt := -1
 		switch {
+		case lost:
+			// Make it again from here; the run's other files are likely
+			// gone as well.
+			startAt = n
+			if n < 0 {
+				startAt = r.first
+			}
 		case n < 0:
 			// The header was asked for and nothing is running: start at the
 			// top, or where the stopped run began.
@@ -421,7 +439,10 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 				// This request already started ffmpeg once. Either it failed,
 				// or another request has since moved it.
 				var err error = ErrSuperseded
-				if r != nil && !alive && r.first == startAt {
+				switch {
+				case lost:
+					err = errors.New("the converter's files are removed from the disk as fast as it makes them")
+				case r != nil && !alive && r.first == startAt:
 					err = fmt.Errorf("the converter stopped: %s", r.stderr.String())
 				}
 				m.mu.Unlock()
