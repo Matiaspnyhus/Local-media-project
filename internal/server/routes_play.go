@@ -526,7 +526,15 @@ func hlsError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, hls.ErrNoSession), errors.Is(err, hls.ErrPastEnd):
 		writeErr(w, http.StatusNotFound, "Not found.")
-	case errors.Is(err, hls.ErrSuperseded), errors.Is(err, context.Canceled):
+	case errors.Is(err, hls.ErrSuperseded):
+		// A newer request moved the converter while this one waited. Most
+		// often this request's player has moved on too and is not even
+		// listening. If it does still want the chunk, it must ask again:
+		// the app's player (hls.js) does that after an answer in the 500s
+		// and gives up for good after one in the 400s.
+		w.Header().Set("Retry-After", "1")
+		writeErr(w, http.StatusServiceUnavailable, "The film was moved to another place while this part was being prepared. Ask for it again.")
+	case errors.Is(err, context.Canceled):
 		writeErr(w, http.StatusConflict, "The player moved elsewhere in the film.")
 	default:
 		writeErr(w, http.StatusInternalServerError, "This part could not be prepared.")

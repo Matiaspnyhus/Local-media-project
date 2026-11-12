@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -24,6 +26,29 @@ func script(t *testing.T, body string) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// When a newer request moves the converter while an older one waits, the
+// older one is told so. Usually its player has moved on and is not
+// listening. But if it still wants the chunk it must be told in a way that
+// makes it ask again: the app's player (hls.js) tries again after an
+// answer in the 500s and gives up for good after one in the 400s.
+func TestAChunkRequestThatWasOvertakenIsAskedToTryAgain(t *testing.T) {
+	for _, err := range []error{hls.ErrSuperseded, fmt.Errorf("chunk 60: %w", hls.ErrSuperseded)} {
+		w := httptest.NewRecorder()
+		hlsError(w, err)
+		if w.Code != http.StatusServiceUnavailable || w.Header().Get("Retry-After") == "" {
+			t.Errorf("%v: answered %d with Retry-After %q; want 503 and a short wait", err, w.Code, w.Header().Get("Retry-After"))
+		}
+	}
+	// The other answers stay as they were.
+	for err, want := range map[error]int{hls.ErrNoSession: 404, hls.ErrPastEnd: 404, fmt.Errorf("the converter stopped"): 500} {
+		w := httptest.NewRecorder()
+		hlsError(w, err)
+		if w.Code != want {
+			t.Errorf("%v: answered %d, want %d", err, w.Code, want)
+		}
+	}
 }
 
 // longest is the longest chunk of a grid, in milliseconds.
