@@ -574,20 +574,22 @@ function UpdateCard() {
     return () => window.clearInterval(t)
   }, [held, heldOn])
   // While the program restarts into another version, ask now and then
-  // whether it is back, and reload the page when it is.
+  // whether it is back, and reload the page when it is. It may also turn
+  // out not to restart: the update failed and was undone; or the install
+  // stopped short, because someone began to watch after the button was
+  // pressed (it then waits for a quiet moment) or because the new version
+  // could not be fetched. The card then shows how things stand.
   useEffect(() => {
     if (!waiting) return
     const t = window.setInterval(() => {
       api
         .update()
         .then((now) => {
-          if (now.current !== waiting || now.lastResult === 'failed') {
-            if (now.current !== waiting) window.location.reload()
-            else {
-              setWaiting('')
-              setSt(now)
-              setMsg('')
-            }
+          if (now.current !== waiting) window.location.reload()
+          else if (now.lastResult === 'failed' || (!now.installing && (now.waiting || !!now.problem))) {
+            setWaiting('')
+            setSt(now)
+            setMsg('')
           }
         })
         .catch(() => undefined)

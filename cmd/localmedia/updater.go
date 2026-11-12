@@ -54,12 +54,27 @@ type updater struct {
 	enabled    bool
 	why        string // why updates are off, in plain words
 
-	mu          sync.Mutex
-	available   *update.Release
-	checking    bool
-	installing  bool
-	byOwner     bool // the install under way was asked for by the owner, so it waits for nobody
-	waiting     bool // an install that started by itself was put off because someone was watching
+	// again wakes the updater's own loop when an install the owner asked
+	// for has been put off, so that it looks again within the minute.
+	again chan struct{}
+
+	mu         sync.Mutex
+	available  *update.Release
+	checking   bool
+	installing bool
+	// What the owner has said. byOwner: the owner pressed "Install it now".
+	// It holds until the version is in or has failed, also across tries
+	// that were put off, and whether or not versions may install by
+	// themselves. whoever: the owner was told who is watching and said to
+	// install all the same, so the install waits for nobody. besides: the
+	// sign-in the owner pressed the button on. A film on that very device
+	// is the owner's own to interrupt, for the try the press began.
+	byOwner bool
+	whoever bool
+	besides string
+	// waiting: an install was put off because someone was watching. It
+	// goes in by itself at the first look that finds nobody.
+	waiting     bool
 	lastChecked int64
 	problem     string
 }
@@ -72,7 +87,7 @@ func packageName() string {
 }
 
 func newUpdater(a *app, d *sql.DB) *updater {
-	u := &updater{app: a, db: d}
+	u := &updater{app: a, db: d, again: make(chan struct{}, 1)}
 	exe, err := executable()
 	if err == nil {
 		exe, err = filepath.EvalSymlinks(exe)
@@ -142,12 +157,44 @@ func (u *updater) Check(ctx context.Context) server.UpdateStatus {
 	return u.Status()
 }
 
-// Install implements server.Updater: the owner asked for the update, so it
-// goes in now, whoever is watching.
-func (u *updater) Install() error { return u.install(true) }
+// Install implements server.Updater: the owner asked for the update. The
+// server has already told the owner who was watching at that moment (apart
+// from the device the owner asked on, the sign-in from), and whoever says
+// whether the owner then said to install all the same.
+//
+// Without that word the install still looks at the moment of the restart:
+// someone who began to watch after the owner pressed has not been mentioned
+// to the owner. It is then put off like one that started by itself, the
+// settings page says who is watching, and the owner can say "anyway".
+func (u *updater) Install(from string, whoever bool) error {
+	err := u.install(&word{from: from, whoever: whoever})
+	if errors.Is(err, errSomeoneWatching) {
+		select {
+		case u.again <- struct{}{}:
+		default: // the loop has been told already
+		}
+	}
+	return err
+}
 
-// What an install that started by itself answers when it has stopped short
-// of restarting the program.
+// word is what the owner said when asking for an install.
+type word struct {
+	from    string // the sign-in the owner asked on
+	whoever bool   // install whoever is watching
+}
+
+// hear notes the owner's word. The caller holds the lock.
+func (u *updater) hear(w *word) {
+	// "Whoever is watching", once said, stands for the install it was said
+	// about, also when the button is pressed again without it.
+	u.byOwner, u.besides, u.whoever = true, w.from, u.whoever || w.whoever
+}
+
+// forget drops the owner's word. The caller holds the lock.
+func (u *updater) forget() { u.byOwner, u.besides, u.whoever = false, "", false }
+
+// What an install answers when it has stopped short of restarting the
+// program without anything having gone wrong.
 var (
 	errSomeoneWatching = errors.New("someone is watching, so the update waits")
 	errSwitchedOff     = errors.New("installing by itself has been switched off")
@@ -157,27 +204,31 @@ var (
 // database while the program keeps running; only then does it stop the
 // program to swap the files.
 //
-// An install the owner did not ask for (byOwner false) never stops the
-// program under someone who is watching. Who is watching is asked three
-// times: before anything is downloaded, again before the database is
-// backed up, and a last time at the moment of the restart, which is the
-// one that counts: a download can take minutes, and a film can be started
-// in any of them. When someone is, nothing is thrown away. The unpacked
-// version stays where it is, the updater's loop looks again every minute,
-// and the first look that finds nobody watching restarts. (The owner may
-// also have switched installing by itself off in those minutes; then the
-// version stays unpacked, for when the owner asks for it.)
-func (u *updater) install(byOwner bool) error {
+// An install never stops the program under someone who is watching, unless
+// the owner has been told who that is and said to install all the same
+// (whoever). Who is watching is asked three times: before anything is
+// downloaded, again before the database is backed up, and a last time at
+// the moment of the restart, which is the one that counts: a download can
+// take minutes, and a film can be started in any of them. When someone is,
+// nothing is thrown away. The unpacked version stays where it is, the
+// updater's loop looks again every minute, and the first look that finds
+// nobody watching restarts. (For an install that started by itself the
+// owner may also have switched installing by itself off in those minutes;
+// then the version stays unpacked, for when the owner asks for it.)
+//
+// owner is the owner's word if this try comes from the owner's own press,
+// and nil when the updater's loop tries by itself.
+func (u *updater) install(owner *word) error {
 	if !u.enabled {
 		return errors.New(u.why)
 	}
 	u.mu.Lock()
 	rel := u.available
 	if u.installing {
-		if byOwner {
-			// One that started by itself is on its way. The owner has now
-			// said to go ahead, so it no longer waits for anybody.
-			u.byOwner = true
+		if owner != nil {
+			// One is on its way already. What the owner has now said goes
+			// for that one.
+			u.hear(owner)
 			u.mu.Unlock()
 			return nil
 		}
@@ -188,12 +239,17 @@ func (u *updater) install(byOwner bool) error {
 		u.mu.Unlock()
 		return errors.New("there is no newer version to install")
 	}
-	u.installing, u.byOwner = true, byOwner
+	u.installing = true
+	if owner != nil {
+		u.hear(owner)
+	}
 	u.mu.Unlock()
 	fail := func(err error) error {
 		u.mu.Lock()
-		// It is no longer a quiet moment that the version waits for.
+		// It is no longer a quiet moment that the version waits for. What
+		// the owner asked for has ended, with a problem the owner is shown.
 		u.installing, u.waiting, u.problem = false, false, err.Error()
+		u.forget()
 		u.mu.Unlock()
 		return err
 	}
@@ -206,14 +262,19 @@ func (u *updater) install(byOwner bool) error {
 		u.mu.Lock()
 		defer u.mu.Unlock()
 		switch {
-		case u.byOwner:
+		case u.whoever:
 			return nil
-		case !u.app.srv.AutoUpdate():
+		case !u.byOwner && !u.app.srv.AutoUpdate():
 			u.installing, u.waiting = false, false
 			return errSwitchedOff
-		case len(u.app.srv.Watching()) > 0:
-			u.installing, u.waiting = false, true
-			return errSomeoneWatching
+		}
+		for _, w := range u.app.srv.Watching() {
+			if w.SignIn != u.besides {
+				// From here on it waits for a moment when nobody at all is
+				// watching, which is what the settings page says of it.
+				u.installing, u.waiting, u.besides = false, true, ""
+				return errSomeoneWatching
+			}
 		}
 		return nil
 	}
@@ -393,6 +454,7 @@ func (u *updater) started() {
 			case <-u.app.quit:
 				return
 			case <-time.After(wait):
+			case <-u.again:
 			}
 			wait = u.round(&asked)
 		}
@@ -414,15 +476,22 @@ func (u *updater) round(asked *time.Time) time.Duration {
 	st := u.Status()
 	last := update.ReadState(u.app.opts.dataDir)
 	// Install by itself only when the owner allows it and this exact
-	// version has not already failed. (Whether anyone is watching is for
-	// install to find out, at the moment it matters.)
-	if st.Available == "" || !u.app.srv.AutoUpdate() || (last.Result == "failed" && last.To == st.Available) {
+	// version has not already failed; or when the owner has asked for it
+	// and it was put off. (Whether anyone is watching is for install to
+	// find out, at the moment it matters.)
+	u.mu.Lock()
+	if st.Available == "" {
+		u.forget() // there is nothing left that the owner asked for
+	}
+	byOwner := u.byOwner
+	u.mu.Unlock()
+	if st.Available == "" || (!byOwner && (!u.app.srv.AutoUpdate() || (last.Result == "failed" && last.To == st.Available))) {
 		u.mu.Lock()
 		u.waiting = false
 		u.mu.Unlock()
 		return next
 	}
-	if err := u.install(false); errors.Is(err, errSomeoneWatching) {
+	if err := u.install(nil); errors.Is(err, errSomeoneWatching) {
 		return min(retryEvery, next)
 	}
 	return next

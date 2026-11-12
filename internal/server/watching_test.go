@@ -434,19 +434,28 @@ func TestAPausedRepackagedFilmIsStillBeingWatched(t *testing.T) {
 // fakeUpdater stands in for the part of the program that installs updates.
 type fakeUpdater struct {
 	status    UpdateStatus
-	installed chan struct{}
+	installed chan asked
+}
+
+// asked is what the server passed on with the owner's request.
+type asked struct {
+	from    string
+	whoever bool
 }
 
 func (f *fakeUpdater) Status() UpdateStatus               { return f.status }
 func (f *fakeUpdater) Check(context.Context) UpdateStatus { return f.status }
 func (f *fakeUpdater) Undo() error                        { return nil }
-func (f *fakeUpdater) Install() error                     { f.installed <- struct{}{}; return nil }
-func (f *fakeUpdater) wasAsked(within time.Duration) bool {
+func (f *fakeUpdater) Install(from string, whoever bool) error {
+	f.installed <- asked{from, whoever}
+	return nil
+}
+func (f *fakeUpdater) wasAsked(within time.Duration) (asked, bool) {
 	select {
-	case <-f.installed:
-		return true
+	case a := <-f.installed:
+		return a, true
 	case <-time.After(within):
-		return false
+		return asked{}, false
 	}
 }
 
@@ -460,7 +469,7 @@ func TestInstallingNowNamesWhoIsWatching(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer d.Close()
-	upd := &fakeUpdater{status: UpdateStatus{Supported: true, Current: "v1.0.0", Available: "v1.1.0", Waiting: true}, installed: make(chan struct{}, 4)}
+	upd := &fakeUpdater{status: UpdateStatus{Supported: true, Current: "v1.0.0", Available: "v1.1.0", Waiting: true}, installed: make(chan asked, 4)}
 	s, err := New(Config{DB: d, DataDir: data, Version: "v1.0.0", Port: 8177, Assets: fstest.MapFS{}, Update: upd})
 	if err != nil {
 		t.Fatal(err)
@@ -473,8 +482,15 @@ func TestInstallingNowNamesWhoIsWatching(t *testing.T) {
 	// The owner has been watching on this very device: nobody else is, so
 	// there is nobody to name.
 	e.do("PUT", "/api/items/"+film+"/progress", local, owner, map[string]int64{"positionMs": 1000, "durationMs": 100000})
-	if w := e.do("POST", "/api/update/install", local, owner, nil); w.Code != 202 || !upd.wasAsked(30*time.Second) {
+	w := e.do("POST", "/api/update/install", local, owner, nil)
+	plain, ok := upd.wasAsked(30 * time.Second)
+	if w.Code != 202 || !ok {
 		t.Fatalf("with only the owner's own device watching, install answered %d %s", w.Code, w.Body)
+	}
+	// The updater is told which sign-in asked, and that the owner has not
+	// said "anyway": someone may begin to watch before it restarts.
+	if now := s.Watching(); len(now) != 1 || plain.from != now[0].SignIn || plain.whoever {
+		t.Errorf("the updater was told %+v; want the owner's own sign-in (watching: %+v) and no \"anyway\"", plain, now)
 	}
 
 	// Now a phone and a TV are watching.
@@ -488,13 +504,13 @@ func TestInstallingNowNamesWhoIsWatching(t *testing.T) {
 	if !st.Waiting || len(st.Watching) != 2 {
 		t.Errorf("the settings page is told waiting=%v watching=%q; want the wait and both the owner's device and the phone", st.Waiting, st.Watching)
 	}
-	w := e.do("POST", "/api/update/install", local, owner, nil)
+	w = e.do("POST", "/api/update/install", local, owner, nil)
 	var refusal struct{ Error string }
 	decode(t, w, &refusal)
 	if w.Code != 409 || refusal.Error != "owner on an iPhone is watching right now. Installing restarts Local Media, which can stop what they are watching." {
 		t.Fatalf("install with a phone watching answered %d %q", w.Code, refusal.Error)
 	}
-	if upd.wasAsked(200 * time.Millisecond) {
+	if _, ok := upd.wasAsked(200 * time.Millisecond); ok {
 		t.Fatal("the update was installed without the owner being told who is watching")
 	}
 	e.do("POST", "/api/items/"+film+"/play", remote, big, nil)
@@ -505,7 +521,12 @@ func TestInstallingNowNamesWhoIsWatching(t *testing.T) {
 	}
 
 	// Told, the owner may go ahead.
-	if w := e.do("POST", "/api/update/install?anyway=1", local, owner, nil); w.Code != 202 || !upd.wasAsked(30*time.Second) {
+	w = e.do("POST", "/api/update/install?anyway=1", local, owner, nil)
+	told, ok := upd.wasAsked(30 * time.Second)
+	if w.Code != 202 || !ok {
 		t.Fatalf("install anyway answered %d %s", w.Code, w.Body)
+	}
+	if told.from != plain.from || !told.whoever {
+		t.Errorf("the updater was told %+v; want the same sign-in and the owner's \"anyway\"", told)
 	}
 }

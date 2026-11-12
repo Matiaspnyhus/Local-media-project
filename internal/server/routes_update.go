@@ -36,10 +36,13 @@ type UpdateStatus struct {
 type Updater interface {
 	Status() UpdateStatus
 	Check(ctx context.Context) UpdateStatus
-	// Install installs the newer version now, whoever is watching: it is
-	// the owner's own decision. (An update that installs by itself waits
-	// for a moment when Watching reports nobody.)
-	Install() error
+	// Install installs the newer version because the owner asked for it.
+	// from is the sign-in the owner asked on. whoever says that the owner
+	// was told who is watching and said to install all the same; without
+	// it, the install is put off if someone else has begun to watch by the
+	// time it would restart the program. (An update that installs by itself
+	// waits for a moment when Watching reports nobody.)
+	Install(from string, whoever bool) error
 	Undo() error
 }
 
@@ -83,8 +86,9 @@ func (s *Server) handleUpdateInstall(w http.ResponseWriter, r *http.Request) {
 	// whose film it can stop. Asked plainly, the answer names who is
 	// watching (apart from the device the owner is pressing the button
 	// on); asked again with "anyway", it goes ahead.
-	if r.URL.Query().Get("anyway") == "" {
-		if who := s.watchingBesides(currentUser(r).SessionID); len(who) > 0 {
+	from, anyway := currentUser(r).SessionID, r.URL.Query().Get("anyway") != ""
+	if !anyway {
+		if who := s.watchingBesides(from); len(who) > 0 {
 			verb := "is"
 			if len(who) > 1 {
 				verb = "are"
@@ -96,7 +100,7 @@ func (s *Server) handleUpdateInstall(w http.ResponseWriter, r *http.Request) {
 	s.log.Printf("the owner asked to install an update")
 	// Answer first: installing ends with this program stopping.
 	go func() {
-		if err := s.update.Install(); err != nil {
+		if err := s.update.Install(from, anyway); err != nil {
 			s.log.Printf("update not installed: %v", err)
 		}
 	}()

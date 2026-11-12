@@ -182,14 +182,21 @@ func startQuiet(t *testing.T, before func(install string, pkg []byte)) *quiet {
 	return q
 }
 
-// watchAFilm signs a device in and has it do what a player does: open the
-// film, fetch a piece of it and save how far it has got.
+// watchAFilm signs a device in and has it watch the film.
 func (q *quiet) watchAFilm(userAgent string) *site {
 	q.t.Helper()
 	d := q.device(userAgent)
 	if code := d.call("POST", "/api/login", map[string]string{"name": "owner", "password": "a good password"}, nil); code != 200 {
 		q.t.Fatalf("sign-in: %d", code)
 	}
+	q.watch(d)
+	return d
+}
+
+// watch has a signed-in device do what a player does: open the film, fetch
+// a piece of it and save how far it has got.
+func (q *quiet) watch(d *site) {
+	q.t.Helper()
 	var films struct{ Items []struct{ ID string } }
 	d.call("GET", "/api/movies", nil, &films)
 	if len(films.Items) != 1 {
@@ -209,7 +216,57 @@ func (q *quiet) watchAFilm(userAgent string) *site {
 	if code := d.call("PUT", "/api/items/"+films.Items[0].ID+"/progress", map[string]int64{"positionMs": 5000, "durationMs": 600000}, nil); code != 200 {
 		q.t.Fatalf("progress: %d", code)
 	}
-	return d
+}
+
+// ownerAsks presses "Install it now" for the owner at a moment when the
+// server has no question to put first, and waits until the updater has
+// heard: the answer to the press comes back before it is acted on.
+func (q *quiet) ownerAsks() {
+	q.t.Helper()
+	var refusal struct{ Error string }
+	if code := q.owner.call("POST", "/api/update/install", nil, &refusal); code != 202 {
+		q.t.Fatalf("the owner's install was answered %d %q; want it taken without a question", code, refusal.Error)
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		q.app.upd.mu.Lock()
+		byOwner := q.app.upd.byOwner
+		q.app.upd.mu.Unlock()
+		if byOwner {
+			return
+		}
+		if time.Now().After(deadline) {
+			q.t.Fatal("the owner's request never reached the updater")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// holdTheBackup makes the program stop when it comes to back up the
+// database, which is the last thing it does before the last look at who is
+// watching. The first channel is closed when it has got there; opening the
+// gate lets it go on. Call it before the program is started: what it
+// changes is put back only once the program has stopped.
+func holdTheBackup(t *testing.T) (<-chan struct{}, *gate) {
+	backingUp, goOn := make(chan struct{}), newGate()
+	var first sync.Once
+	real := backUp
+	backUp = func(d *sql.DB, dataDir string, schema int) (string, error) {
+		first.Do(func() { close(backingUp) })
+		<-goOn.c
+		return real(d, dataDir, schema)
+	}
+	t.Cleanup(func() { goOn.open(); backUp = real })
+	return backingUp, goOn
+}
+
+func (q *quiet) untilBackingUp(backingUp <-chan struct{}) {
+	q.t.Helper()
+	select {
+	case <-backingUp:
+	case <-time.After(60 * time.Second):
+		q.t.Fatalf("the program never got as far as backing up the database: %+v", q.status())
+	}
 }
 
 type waitStatus struct {
@@ -343,24 +400,10 @@ func TestAnUpdateWaitsWhileSomeoneIsWatching(t *testing.T) {
 // arrive and still be seen. The update must wait for that viewer too, and
 // the backup made for a restart that did not happen must not be left lying.
 func TestAFilmStartedDuringTheBackupStillPutsTheUpdateOff(t *testing.T) {
-	backingUp, goOn := make(chan struct{}), newGate()
-	var first sync.Once
-	real := backUp
-	backUp = func(d *sql.DB, dataDir string, schema int) (string, error) {
-		first.Do(func() { close(backingUp) })
-		<-goOn.c
-		return real(d, dataDir, schema)
-	}
-	// Put back last of all, when the program has stopped.
-	t.Cleanup(func() { goOn.open(); backUp = real })
+	backingUp, goOn := holdTheBackup(t)
 	q := startQuiet(t, nil)
-	t.Cleanup(goOn.open) // first of all, so that the program can stop
 	q.letDownloadFinish()
-	select {
-	case <-backingUp:
-	case <-time.After(60 * time.Second):
-		t.Fatalf("the program never got as far as backing up the database: %+v", q.status())
-	}
+	q.untilBackingUp(backingUp)
 	// Nobody was watching before the download or after it. Now someone is.
 	viewer := q.watchAFilm("Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1")
 	goOn.open()
@@ -445,6 +488,107 @@ func TestTheOwnerAskingDuringTheDownloadIsNotMadeToWait(t *testing.T) {
 	if n := q.downloads.Load(); n != 1 {
 		t.Errorf("the new version was downloaded %d times; want once", n)
 	}
+}
+
+// The owner who presses "Install it now" is told who is watching at that
+// moment. Someone who starts a film after that, while the version is still
+// being fetched, has not been mentioned to the owner, and the fetching can
+// take minutes. The fault: the install went ahead under that viewer, and
+// nobody was asked or told. Now it stops short of the restart, the settings
+// page says who is watching, and the owner decides as before.
+func TestAViewerWhoStartsAfterTheOwnerPressedIsNotCutOff(t *testing.T) {
+	q := startQuiet(t, nil)
+	<-q.asked
+	q.ownerAsks() // nobody is watching, so there was nothing to ask
+	q.watchAFilm("Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1")
+	q.letDownloadFinish()
+
+	st := q.untilWaiting()
+	if len(st.Watching) != 1 || st.Watching[0] != "owner on an iPhone" {
+		t.Errorf("the settings page is told %+v; want that the owner on an iPhone is watching", st)
+	}
+	for i := 0; i < 10; i++ {
+		time.Sleep(3 * retryEvery)
+		q.stillRunning("while the film that began after the owner pressed is being watched")
+	}
+	if _, ok := update.Ready(q.install, "v1.1.0"); !ok {
+		t.Error("the downloaded version was not kept")
+	}
+	// Pressing again brings the question, and "anyway" still installs.
+	var refusal struct{ Error string }
+	if code := q.owner.call("POST", "/api/update/install", nil, &refusal); code != 409 || !strings.HasPrefix(refusal.Error, "owner on an iPhone is watching right now.") {
+		t.Fatalf("install while an iPhone is watching answered %d %q; want 409 and who is watching", code, refusal.Error)
+	}
+	q.stillRunning("after the owner was told who is watching")
+	if code := q.owner.call("POST", "/api/update/install?anyway=1", nil, nil); code != 202 {
+		t.Fatalf("install anyway: %d", code)
+	}
+	q.untilRestart("after the owner said to install anyway")
+	if n := q.downloads.Load(); n != 1 {
+		t.Errorf("the new version was downloaded %d times; want once", n)
+	}
+}
+
+// What the owner asked for is not forgotten when it has to wait: it goes
+// in as soon as nobody is watching, as the settings page says. That holds
+// also when versions are not allowed to install by themselves (the owner
+// asked for this one), and when nothing else would have made the program
+// look again for hours.
+func TestWhatTheOwnerAskedForGoesInWhenTheViewerLeaves(t *testing.T) {
+	backingUp, goOn := holdTheBackup(t)
+	q := startQuiet(t, nil)
+	<-q.asked
+	if code := q.owner.call("PUT", "/api/settings/auto-update", map[string]bool{"on": false}, nil); code != 200 {
+		t.Fatalf("switching it off: %d", code)
+	}
+	q.letDownloadFinish()
+	// The version is fetched and kept, and the program leaves it at that:
+	// its next look by itself is half a day away.
+	deadline := time.Now().Add(60 * time.Second)
+	for {
+		q.app.upd.mu.Lock()
+		installing := q.app.upd.installing
+		q.app.upd.mu.Unlock()
+		if _, ok := update.Ready(q.install, "v1.1.0"); ok && !installing {
+			break
+		}
+		q.stillRunning("while the version was being unpacked")
+		if time.Now().After(deadline) {
+			t.Fatalf("the downloaded version was never made ready: %+v", q.status())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// The owner asks, with nobody watching. Before the install has got to
+	// the restart, someone starts a film.
+	q.ownerAsks()
+	q.untilBackingUp(backingUp)
+	viewer := q.watchAFilm("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/130.0.0.0 Mobile Safari/537.36")
+	goOn.open()
+	if st := q.untilWaiting(); len(st.Watching) != 1 || st.Watching[0] != "owner on an Android phone" {
+		t.Errorf("the settings page is told %+v; want that the owner on an Android phone is watching", st)
+	}
+	for i := 0; i < 5; i++ {
+		time.Sleep(3 * retryEvery)
+		q.stillRunning("while the film that began after the owner pressed is being watched")
+	}
+	if code := viewer.call("POST", "/api/logout", nil, nil); code != 200 {
+		t.Fatalf("sign-out: %d", code)
+	}
+	q.untilRestart("after the viewer left")
+	if n := q.downloads.Load(); n != 1 {
+		t.Errorf("the new version was downloaded %d times; want once", n)
+	}
+}
+
+// The film the owner is watching on the very device they press the button
+// on is theirs to interrupt: it is not a reason to put their install off.
+func TestTheOwnersOwnFilmDoesNotHoldUpWhatTheyAskedFor(t *testing.T) {
+	q := startQuiet(t, nil)
+	<-q.asked
+	q.watch(q.owner)
+	q.ownerAsks()
+	q.letDownloadFinish()
+	q.untilRestart("with only the owner's own device watching")
 }
 
 // A PC that is only switched on to watch films may never have a quiet
