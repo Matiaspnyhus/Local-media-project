@@ -40,10 +40,26 @@ type Grid struct {
 }
 
 // maxChunkMs is the longest a chunk may be. A chunk is made, sent and held
-// by the player in one piece, so one of several minutes is never ready in
-// time and is too big to handle. A list with such a chunk in it is a sign
-// that the key frames were not found, not a list to play from.
-const maxChunkMs = 10 * SegmentSeconds * 1000
+// by the player in one piece, and a request waits half a minute for it. In
+// that time ffmpeg gets through about five minutes of film (the first
+// minute at once, the rest eight times as fast as it plays), so a chunk
+// longer than four minutes is never ready in time, and a list with one in
+// it is not a list to play from. A chunk somewhat shorter than that can be
+// late as well, because it is known to be whole only when ffmpeg has sent
+// the piece that follows it; it is there for a player that asks again.
+const maxChunkMs = 4 * 60 * 1000
+
+// doubtMs is how long a chunk in a list found by jumping may be before the
+// list is doubted. Nearly every film has a key frame every few seconds, so
+// a chunk of over a minute usually means that key frames were not found.
+// But not always: where little moves (a recording of a screen, of slides)
+// they can truly be that far apart. So such a list is neither used as it is
+// nor thrown away: the film is read through, which settles it. See FindCuts.
+const doubtMs = 60 * 1000
+
+// maxLeadMs is the most a film may keep from before its start (see
+// Grid.LeadMs). More than that is some other oddity of the file.
+const maxLeadMs = 60 * 1000
 
 // Uniform is the grid used when the key frames could not be found: a cut
 // every few seconds. Chunks then begin at the first key frame after each
@@ -65,15 +81,28 @@ func uniform(startMs, durationMs int64) Grid {
 // can be used: its cuts are in order and inside the film, and no chunk is
 // longer than a chunk can be.
 func (g Grid) Valid() bool {
-	if len(g.Cuts) == 0 || g.Cuts[0] != g.StartMs || g.EndMs <= g.StartMs || g.LeadMs < 0 || g.LeadMs > maxChunkMs {
+	if len(g.Cuts) == 0 || g.Cuts[0] != g.StartMs || g.EndMs <= g.StartMs || g.LeadMs < 0 || g.LeadMs > maxLeadMs {
 		return false
 	}
 	for i := 1; i < len(g.Cuts); i++ {
-		if g.Cuts[i] <= g.Cuts[i-1] || g.Cuts[i] >= g.EndMs || g.Cuts[i]-g.Cuts[i-1] > maxChunkMs {
+		if g.Cuts[i] <= g.Cuts[i-1] || g.Cuts[i] >= g.EndMs {
 			return false
 		}
 	}
-	return g.EndMs-g.Cuts[len(g.Cuts)-1] <= maxChunkMs
+	return g.longest() <= maxChunkMs
+}
+
+// longest is the length of the longest chunk, in milliseconds.
+func (g Grid) longest() int64 {
+	var most int64
+	for k, at := range g.Cuts {
+		end := g.EndMs
+		if k+1 < len(g.Cuts) {
+			end = g.Cuts[k+1]
+		}
+		most = max(most, end-at)
+	}
+	return most
 }
 
 // index is the chunk a fragment starting at ms belongs to.
@@ -130,7 +159,11 @@ var ErrKeyFramesTooFar = errors.New("the film's key frames are too far apart to 
 //     of TV recordings and disc streams, has no list to jump by). Then
 //     ffprobe reads the film through once and reports every key frame. That
 //     is as slow as the disk: a second for a small file, a minute or more
-//     for a long recording on a hard disk.
+//     for a long recording on a hard disk. The same is done when jumping
+//     leaves a chunk of over a minute, to see whether key frames were
+//     missed. If none were, the film is cut at the key frames it has: a
+//     long chunk takes longer to make, but it is the only kind such a film
+//     can be cut into.
 //
 // The result is worth keeping. When no good cuts can be found the error
 // says why, and the grid returned with it is the one to fall back on: a cut
@@ -183,14 +216,16 @@ func FindCuts(ctx context.Context, ffprobe, path string, durationMs int64) (Grid
 		// Skip repeats (two places that share a key frame) and cuts that would
 		// make a chunk too short to be worth a request.
 		g.addCuts(keys, 2000)
-		// Good enough if no chunk is too long to use, and if either every
-		// jump landed on a key frame (then the long stretches there are
-		// have no key frame in them) or there are no long stretches.
-		if g.Valid() && (missed == 0 || denseEnough(g.Cuts, g.StartMs, g.EndMs)) {
+		// Good enough if no chunk is long enough to be doubted, and if
+		// either every jump landed on a key frame (then the long stretches
+		// there are have no key frame in them) or there are no long
+		// stretches.
+		if g.Valid() && g.longest() <= doubtMs && (missed == 0 || denseEnough(g.Cuts, g.StartMs, g.EndMs)) {
 			return g, nil
 		}
 		// Otherwise jumps in this file do not land on key frames, or its
-		// own list of them is thin. Reading it through tells.
+		// own list of them is thin, or its key frames really are that far
+		// apart. Reading it through tells which.
 	}
 	keys, _, err := keyFrames(ctx, ffprobe, path, "")
 	if err != nil {
@@ -234,8 +269,7 @@ func clockStart(ctx context.Context, ffprobe, path string) (startMs, leadMs int6
 		}
 	}
 	if started && !math.IsNaN(first) {
-		// A lead longer than a chunk may be is some other oddity: leave it.
-		if lead := startMs - int64(math.Round(first)); lead > 0 && lead <= maxChunkMs {
+		if lead := startMs - int64(math.Round(first)); lead > 0 && lead <= maxLeadMs {
 			leadMs = lead
 		}
 	}
