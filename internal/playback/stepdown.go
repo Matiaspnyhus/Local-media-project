@@ -214,12 +214,16 @@ func network(rate int) Step {
 // What the viewer wants comes back as it went in. It is passed through so
 // that the three travel together.
 //
-// Everything Apply does takes something away, never adds, and nothing it
-// does can refuse a film that would play without the lesson: a lesson
-// about a device or a connection is advice (see advised), and a cap on a
-// converted picture never rules out the last rung. What it does not
-// promise is a change. Where this PC cannot convert, or the film is light
-// already, the plan made afterwards is the very same one.
+// Everything Apply does takes something away, never adds. A lesson about
+// a device or a connection still cannot refuse a film that would play
+// without it: such a lesson is advice (see advised), and a cap on a
+// converted picture never rules out the last rung. Only a speed this PC
+// was seen at can: a film that must be converted, on a PC now known to be
+// too slow for it even at the lightest rung, is answered "too slow".
+//
+// What Apply does not promise is a change. Where this PC cannot convert,
+// or the film is light already, the plan made afterwards is the very same
+// one.
 func (s Step) Apply(c *Caps, w Want, l Limits) (*Caps, Want, Limits) {
 	switch s.Lesson {
 	case LessonDevice:
