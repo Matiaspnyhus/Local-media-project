@@ -359,6 +359,41 @@ func TestTheMainSoundTrackIsNotTheFirst(t *testing.T) {
 	}
 }
 
+// "You chose a sound track..." is said only to someone who chose one. When
+// the app picked the track itself, from the viewer's language settings or
+// from what they picked earlier in the show, the reason says that. Nothing
+// else about the answer differs.
+func TestWhoChoseTheSoundTrack(t *testing.T) {
+	m := Media{Probed: true, Container: "mp4", Video: []Track{{Codec: "h264", BitDepth: 8}},
+		Audio: []Track{{Codec: "aac", Default: true, Language: "eng"}, {Codec: "aac", Language: "jpn"}}}
+	byHand := DecideFor(m, devices["chrome"], Want{Audio: 1, Subtitle: -1}, Limits{})
+	byApp := DecideFor(m, devices["chrome"], Want{Audio: 1, AudioAuto: true, Subtitle: -1}, Limits{})
+	if want := []string{"You chose a sound track other than the one a browser plays by itself."}; byHand.Method != Remux || !sameStrings(byHand.Reasons, want) {
+		t.Errorf("a track chosen by hand: %s %q", byHand.Method, byHand.Reasons)
+	}
+	if want := []string{"The sound track picked for you, from your language settings or from what you chose before, is not the one a browser plays by itself."}; !sameStrings(byApp.Reasons, want) {
+		t.Errorf("a track chosen by the app: %q", byApp.Reasons)
+	}
+	byApp.Reasons = byHand.Reasons
+	if !reflect.DeepEqual(byApp, byHand) {
+		t.Errorf("who chose the track changed more than the words: %+v, %+v", byApp, byHand)
+	}
+	// Where the file itself is why (its main track is not its first),
+	// nobody chose anything and the sentence about the file stands.
+	m.Audio[0].Default, m.Audio[1].Default = false, true
+	for _, auto := range []bool{false, true} {
+		p := DecideFor(m, devices["chrome"], Want{Audio: -1, AudioAuto: auto, Subtitle: -1}, Limits{})
+		if !has(p.Reasons, "The sound track this file marks as its main one is not its first") || has(p.Reasons, "chose") || has(p.Reasons, "picked for you") {
+			t.Errorf("a main track that is not the first (picked by the app: %v): %q", auto, p.Reasons)
+		}
+	}
+	// And where the track is the one a browser plays anyway, nothing is said.
+	m.Audio[0].Default, m.Audio[1].Default = true, false
+	if p := DecideFor(m, devices["chrome"], Want{Audio: 0, AudioAuto: true, Subtitle: -1}, Limits{}); p.Method != Direct || len(p.Reasons) != 0 {
+		t.Errorf("the first track, picked by the app: %s %q", p.Method, p.Reasons)
+	}
+}
+
 // A PC without a converter cannot repackage anything. The answer then
 // names the PC, not the browser, which may well play repackaged video.
 // (Before, the server hid the missing converter by telling the planner

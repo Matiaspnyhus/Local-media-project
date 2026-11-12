@@ -296,6 +296,9 @@ func decide(m Media, c *Caps, w Want, l Limits, sub *Subtitle, mode SubtitleMode
 	switch {
 	case inDoubt && natural != 0:
 		other = append(other, "The sound track this file marks as its main one is not its first, and browsers differ in which of the two they play by themselves.")
+	case inDoubt && w.AudioAuto:
+		// The viewer chose nothing in this play: say whose choice it was.
+		other = append(other, "The sound track picked for you, from your language settings or from what you chose before, is not the one a browser plays by itself.")
 	case inDoubt:
 		other = append(other, "You chose a sound track other than the one a browser plays by itself.")
 	}

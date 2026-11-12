@@ -20,6 +20,12 @@ type Want struct {
 	// Audio is the sound track, counted from 0; -1 for the file's own main
 	// track (see BrowserAudio).
 	Audio int `json:"audio"`
+	// AudioAuto says the app picked Audio itself, from the viewer's
+	// language settings or from what they chose earlier in the show, and
+	// the viewer did not pick it for this play. It changes no decision,
+	// only the words of one reason, which must not say "you chose" to
+	// someone who did not.
+	AudioAuto bool `json:"audioAuto"`
 	// Subtitle counts into Media.Subtitles; -1 for none.
 	Subtitle int `json:"subtitle"`
 	// Styled says what to do with styled subtitles where the page cannot
