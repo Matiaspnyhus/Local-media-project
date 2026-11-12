@@ -55,10 +55,16 @@ type helperTie struct {
 	names map[string]bool // the helper programs' file names, in lower case
 	self  uint32
 	born  int64 // when this program started, as Windows counts time
-	tied  map[uint32]bool
-	stop  chan struct{}
-	done  sync.WaitGroup
-	once  sync.Once
+	// tied remembers which helpers are in the group already: by process
+	// number, with the moment that process began. The number alone would
+	// not do. Windows gives a number that has come free to the next
+	// process it starts, so between two looks one helper can end and
+	// another be given its number; it would be taken for the one that was
+	// tied, and never be tied itself.
+	tied map[uint32]int64
+	stop chan struct{}
+	done sync.WaitGroup
+	once sync.Once
 }
 
 // tieHelpers starts tying helpers that run one of the given programs to
@@ -66,7 +72,7 @@ type helperTie struct {
 // there is nothing to tie or Windows will not make the group; the helpers
 // are then stopped only by the ways the program can catch, as before.
 func tieHelpers(programs ...string) *helperTie {
-	h := &helperTie{names: map[string]bool{}, self: windows.GetCurrentProcessId(), tied: map[uint32]bool{}, stop: make(chan struct{})}
+	h := &helperTie{names: map[string]bool{}, self: windows.GetCurrentProcessId(), tied: map[uint32]int64{}, stop: make(chan struct{})}
 	for _, p := range programs {
 		if p != "" {
 			h.names[strings.ToLower(filepath.Base(p))] = true
@@ -121,30 +127,27 @@ func (h *helperTie) look() {
 	defer windows.CloseHandle(snapshot)
 	var entry windows.ProcessEntry32
 	entry.Size = uint32(unsafe.Sizeof(entry))
-	running := map[uint32]bool{}
+	// Made afresh at every look, so that helpers that have ended are
+	// forgotten.
+	tied := map[uint32]int64{}
 	for err = windows.Process32First(snapshot, &entry); err == nil; err = windows.Process32Next(snapshot, &entry) {
 		if entry.ParentProcessID != h.self || !h.names[strings.ToLower(windows.UTF16ToString(entry.ExeFile[:]))] {
 			continue
 		}
-		running[entry.ProcessID] = true
-		if !h.tied[entry.ProcessID] && h.tie(entry.ProcessID) {
-			h.tied[entry.ProcessID] = true
+		if began, in := h.tie(entry.ProcessID); in {
+			tied[entry.ProcessID] = began
 		}
 	}
-	// A number is given to a new process once its old one has ended, so
-	// the ones that are gone are forgotten.
-	for pid := range h.tied {
-		if !running[pid] {
-			delete(h.tied, pid)
-		}
-	}
+	h.tied = tied
 }
 
-// tie puts one process in the group.
-func (h *helperTie) tie(pid uint32) bool {
+// tie puts one process in the group, unless that very process is in it
+// already. It reports when the process began and whether it is in the
+// group now.
+func (h *helperTie) tie(pid uint32) (began int64, in bool) {
 	p, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
 	if err != nil {
-		return false // it has ended already
+		return 0, false // it has ended already
 	}
 	defer windows.CloseHandle(p)
 	// Windows remembers who started a process only as a number, and
@@ -152,9 +155,13 @@ func (h *helperTie) tie(pid uint32) bool {
 	// did cannot have been started by it, whatever the number says.
 	var created, exited, kernel, user windows.Filetime
 	if err := windows.GetProcessTimes(p, &created, &exited, &kernel, &user); err != nil || created.Nanoseconds() < h.born {
-		return false
+		return 0, false
 	}
-	return windows.AssignProcessToJobObject(h.job, p) == nil
+	began = created.Nanoseconds()
+	if at, known := h.tied[pid]; known && at == began {
+		return began, true
+	}
+	return began, windows.AssignProcessToJobObject(h.job, p) == nil
 }
 
 // end stops every helper that is still running and stops looking for
