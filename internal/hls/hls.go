@@ -79,6 +79,7 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
+	turns    uint64 // counts uses of sessions, see session.turn
 	// live holds every run whose ffmpeg has been started and is not yet
 	// gone, whatever became of its session, so that closing the manager
 	// can be sure to leave nothing running.
@@ -108,6 +109,10 @@ type session struct {
 	gen     int // each ffmpeg run writes into its own folder
 	run     *run
 	lastReq time.Time
+	// turn says in what order sessions were last used: a higher number is
+	// more recent. The clock cannot say: on Windows it moves in steps of
+	// several milliseconds, and sessions used within one step would tie.
+	turn    uint64
 	lastSeg int
 	starts  int
 	halting chan struct{} // not nil while a stop is in progress; closed when it is done
@@ -222,6 +227,13 @@ func (m *Manager) end(token string, s *session) {
 	os.RemoveAll(s.dir)
 }
 
+// touch notes that a session was used just now. The caller holds the lock.
+func (m *Manager) touch(s *session) {
+	s.lastReq = time.Now()
+	m.turns++
+	s.turn = m.turns
+}
+
 // Open registers a session and returns its token: a random value that is
 // the only way to reach the session's chunks.
 func (m *Manager) Open(spec Spec) string {
@@ -247,7 +259,7 @@ func (m *Manager) Open(spec Spec) string {
 		for t, s := range m.sessions {
 			if s.spec.Owner == spec.Owner {
 				n++
-				if oldest == "" || s.lastReq.Before(m.sessions[oldest].lastReq) {
+				if oldest == "" || s.turn < m.sessions[oldest].turn {
 					oldest = t
 				}
 			}
@@ -261,7 +273,9 @@ func (m *Manager) Open(spec Spec) string {
 		// Too late: the token is as good as any other unknown one.
 		return token
 	}
-	m.sessions[token] = &session{spec: spec, dir: filepath.Join(m.root, token), lastReq: time.Now()}
+	s := &session{spec: spec, dir: filepath.Join(m.root, token)}
+	m.touch(s)
+	m.sessions[token] = s
 	return token
 }
 
@@ -338,7 +352,7 @@ func (m *Manager) Playlist(token string) ([]byte, error) {
 	m.mu.Lock()
 	s := m.sessions[token]
 	if s != nil {
-		s.lastReq = time.Now()
+		m.touch(s)
 	}
 	m.mu.Unlock()
 	if s == nil {
@@ -395,7 +409,7 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 			m.mu.Unlock()
 			return nil, ErrNoSession
 		}
-		s.lastReq = time.Now()
+		m.touch(s)
 		if n >= len(s.spec.Grid.Cuts) {
 			m.mu.Unlock()
 			return nil, ErrPastEnd
