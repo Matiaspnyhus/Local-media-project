@@ -29,6 +29,14 @@ type Grid struct {
 	// key frames), "probe" (ffprobe visited the film every few seconds),
 	// "read" (ffprobe read the film through) or "uniform".
 	From string `json:"from,omitempty"`
+	// LeadMs is how long before StartMs the file's first frame lies. It is
+	// 0 for nearly every file. A clip cut out of a longer film without
+	// re-encoding keeps the frames from the key frame before the cut,
+	// marked as not to be shown, because the first frames that are shown
+	// cannot be decoded without them. They are sent on for the same
+	// reason: the first chunk carries them and is this much longer, and
+	// every time the player is told is this much later than the film's own.
+	LeadMs int64 `json:"lead,omitempty"`
 }
 
 // maxChunkMs is the longest a chunk may be. A chunk is made, sent and held
@@ -57,7 +65,7 @@ func uniform(startMs, durationMs int64) Grid {
 // can be used: its cuts are in order and inside the film, and no chunk is
 // longer than a chunk can be.
 func (g Grid) Valid() bool {
-	if len(g.Cuts) == 0 || g.Cuts[0] != g.StartMs || g.EndMs <= g.StartMs {
+	if len(g.Cuts) == 0 || g.Cuts[0] != g.StartMs || g.EndMs <= g.StartMs || g.LeadMs < 0 || g.LeadMs > maxChunkMs {
 		return false
 	}
 	for i := 1; i < len(g.Cuts); i++ {
@@ -75,11 +83,20 @@ func (g Grid) index(ms float64) int {
 	return max(k, 0)
 }
 
+// shift is how much later than the film's own every time in the chunks is,
+// in milliseconds: enough that none falls below zero.
+func (g Grid) shift() int64 {
+	return clockShiftMs + g.LeadMs
+}
+
 // seconds is how long chunk k lasts.
 func (g Grid) seconds(k int) float64 {
 	end := g.EndMs
 	if k+1 < len(g.Cuts) {
 		end = g.Cuts[k+1]
+	}
+	if k == 0 {
+		end += g.LeadMs // the frames before the start are in the first chunk
 	}
 	return max(float64(end-g.Cuts[k])/1000, 0.1)
 }
@@ -126,8 +143,13 @@ func FindCuts(ctx context.Context, ffprobe, path string, durationMs int64) (Grid
 	if durationMs <= 0 {
 		return Grid{}, fmt.Errorf("the film's length is not known")
 	}
-	start, format := clockStart(ctx, ffprobe, path)
-	g := Grid{StartMs: start, EndMs: start + durationMs, Cuts: []int64{start}, From: "probe"}
+	start, lead, format := clockStart(ctx, ffprobe, path)
+	g := Grid{StartMs: start, EndMs: start + durationMs, Cuts: []int64{start}, From: "probe", LeadMs: lead}
+	even := func() Grid {
+		u := uniform(start, durationMs)
+		u.LeadMs = lead
+		return u
+	}
 	if isMatroska(path) {
 		if keys, err := matroskaKeyFrames(path); err == nil && denseEnough(keys, g.StartMs, g.EndMs) {
 			g.From = "index"
@@ -156,7 +178,7 @@ func FindCuts(ctx context.Context, ffprobe, path string, durationMs int64) (Grid
 		}
 		keys, err := keyFrames(ctx, ffprobe, path, iv.String())
 		if err != nil {
-			return uniform(start, durationMs), fmt.Errorf("ffprobe could not find the key frames: %w", err)
+			return even(), fmt.Errorf("ffprobe could not find the key frames: %w", err)
 		}
 		// Skip repeats (two places that share a key frame) and cuts that would
 		// make a chunk too short to be worth a request.
@@ -169,29 +191,35 @@ func FindCuts(ctx context.Context, ffprobe, path string, durationMs int64) (Grid
 	}
 	keys, err := keyFrames(ctx, ffprobe, path, "")
 	if err != nil {
-		return uniform(start, durationMs), fmt.Errorf("ffprobe could not read the film through for its key frames: %w", err)
+		return even(), fmt.Errorf("ffprobe could not read the film through for its key frames: %w", err)
 	}
-	g = Grid{StartMs: start, EndMs: start + durationMs, Cuts: []int64{start}, From: "read"}
+	g = Grid{StartMs: start, EndMs: start + durationMs, Cuts: []int64{start}, From: "read", LeadMs: lead}
 	g.addCuts(keys, SegmentSeconds*1000)
 	if !g.Valid() {
-		return uniform(start, durationMs), fmt.Errorf("%w (%d found in %d seconds)", ErrKeyFramesTooFar, len(keys), durationMs/1000)
+		return even(), fmt.Errorf("%w (%d found in %d seconds)", ErrKeyFramesTooFar, len(keys), durationMs/1000)
 	}
 	return g, nil
 }
 
 // clockStart asks where the picture's own clock starts, in milliseconds
-// (usually 0, but hours in for some TV recordings), and how ffprobe names
-// the kind of file.
-func clockStart(ctx context.Context, ffprobe, path string) (startMs int64, format string) {
-	cmd := exec.CommandContext(ctx, ffprobe, "-v", "error", "-select_streams", "v:0",
-		"-show_entries", "stream=start_time:format=format_name", "-of", "default=noprint_wrappers=1", path)
+// (usually 0, but hours in for some TV recordings), how long before that
+// the file's first frame lies (see Grid.LeadMs), and how ffprobe names the
+// kind of file.
+func clockStart(ctx context.Context, ffprobe, path string) (startMs, leadMs int64, format string) {
+	// The start as the file states it, and the first frame stored in it.
+	cmd := exec.CommandContext(ctx, ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+		"-show_entries", "packet=pts_time:stream=start_time:format=format_name", "-of", "default=noprint_wrappers=1", path)
 	hideWindow(cmd)
 	out, _ := cmd.Output()
-	started := false
+	started, first := false, math.NaN()
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
 		name, value, _ := strings.Cut(strings.TrimSpace(sc.Text()), "=")
 		switch name {
+		case "pts_time":
+			if v, err := strconv.ParseFloat(value, 64); err == nil && math.IsNaN(first) {
+				first = v * 1000
+			}
 		case "start_time":
 			// For MPEG-TS the line is printed twice (once for the programme
 			// the picture belongs to); the first is as good as the second.
@@ -202,7 +230,13 @@ func clockStart(ctx context.Context, ffprobe, path string) (startMs int64, forma
 			format = value
 		}
 	}
-	return startMs, format
+	if started && !math.IsNaN(first) {
+		// A lead longer than a chunk may be is some other oddity: leave it.
+		if lead := startMs - int64(math.Round(first)); lead > 0 && lead <= maxChunkMs {
+			leadMs = lead
+		}
+	}
+	return startMs, leadMs, format
 }
 
 // keyFrames asks ffprobe when the picture's key frames are shown, in

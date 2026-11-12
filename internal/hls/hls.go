@@ -40,8 +40,10 @@ const SegmentSeconds = 6
 
 // clockShiftMs is added to every time ffmpeg writes. Sound often starts a
 // few hundredths of a second "before zero", which the chunk format cannot
-// express; shifting everything by one second keeps all times positive.
-// Players only look at the differences, so nobody sees it.
+// express; shifting everything by one second keeps those times positive.
+// Players only look at the differences, so nobody sees it. A film that
+// keeps frames from before its start is shifted by their length as well
+// (see Grid.LeadMs and Grid.shift).
 const clockShiftMs = 1000
 
 // maxPerOwner is how many films one sign-in may hold open at once.
@@ -339,7 +341,13 @@ func (m *Manager) Playlist(token string) ([]byte, error) {
 		longest = max(longest, g.seconds(k))
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4\"\n", int(longest+0.999))
+	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n", int(longest+0.999))
+	if g.LeadMs > 0 {
+		// The film proper begins after the frames it keeps from before its
+		// start: a player is asked to begin there and not to show them.
+		fmt.Fprintf(&b, "#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES\n", float64(g.LeadMs)/1000)
+	}
+	b.WriteString("#EXT-X-MAP:URI=\"init.mp4\"\n")
 	for k := range g.Cuts {
 		fmt.Fprintf(&b, "#EXTINF:%.3f,\nseg-%d.m4s\n", g.seconds(k), k)
 	}
@@ -564,7 +572,7 @@ func args(spec Spec, startSeg int, readRate, burst int) []string {
 	// fragment at every key frame, and send it all to this program.
 	return append(a,
 		"-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1",
-		"-copyts", "-avoid_negative_ts", "disabled", "-output_ts_offset", fmt.Sprintf("%d.%03d", clockShiftMs/1000, clockShiftMs%1000),
+		"-copyts", "-avoid_negative_ts", "disabled", "-output_ts_offset", fmt.Sprintf("%d.%03d", spec.Grid.shift()/1000, spec.Grid.shift()%1000),
 		"-max_muxing_queue_size", "2048",
 		"-f", "mp4", "-movflags", "+frag_keyframe+delay_moov+default_base_moof+frag_discont", "pipe:1")
 }
@@ -716,7 +724,7 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 			}
 			seg := max(cur, r.first)
 			if ms, ok := fragmentStart(body, video); ok {
-				seg = grid.index(ms - clockShiftMs)
+				seg = grid.index(ms - float64(grid.shift()))
 			}
 			if cur < 0 && seg < r.first {
 				skip = true // the lead-in before the chunk that was asked for

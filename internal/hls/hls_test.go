@@ -38,6 +38,10 @@ import (
 //	long:   two minutes, a key frame every second: twenty chunks to jump
 //	        about in.
 //	hush:   60 seconds of picture whose sound stops after 50.
+//	sparse: 60 seconds as MP4 with a key frame every 12 seconds.
+//	trimmed: the last 43 seconds of sparse, cut out without re-encoding. The
+//	        cut is 5 seconds after a key frame; those 5 seconds are still in
+//	        the file, marked as not to be shown.
 
 func tools(t *testing.T) (ffmpeg, ffprobe string) {
 	t.Helper()
@@ -67,8 +71,11 @@ func source(t *testing.T, ffmpeg, name string) string {
 		filmDir = dir
 	}
 	p := filepath.Join(filmDir, name+".mkv")
-	if name == "recording" || name == "capture" {
+	switch name {
+	case "recording", "capture":
 		p = filepath.Join(filmDir, name+".ts")
+	case "sparse", "trimmed":
+		p = filepath.Join(filmDir, name+".mp4")
 	}
 	picture := func(seconds string) []string {
 		return []string{"-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=" + seconds, "-f", "lavfi", "-i", "sine=frequency=440:duration=" + seconds}
@@ -116,6 +123,12 @@ func source(t *testing.T, ffmpeg, name string) string {
 		recipes = [][]string{append(picture("90"),
 			"-c:v", "libx264", "-preset", "ultrafast", "-g", "9999", "-sc_threshold", "0",
 			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
+	case "sparse":
+		recipes = [][]string{append(picture("60"),
+			"-c:v", "libx264", "-preset", "ultrafast", "-g", "288", "-keyint_min", "288", "-sc_threshold", "0",
+			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
+	case "trimmed":
+		recipes = [][]string{{"-ss", "17", "-i", source(t, ffmpeg, "sparse"), "-c", "copy", p}}
 	}
 	var out []byte
 	var err error
@@ -505,6 +518,9 @@ func TestEveryChunkBeginsWhereTheListSays(t *testing.T) {
 		t.Run(film, func(t *testing.T) {
 			t.Parallel() // the films are checked side by side to save time
 			g := grid(t, ffprobe, src, 60000)
+			if g.LeadMs != 0 {
+				t.Errorf("a film with nothing before its start was found to keep %d ms there", g.LeadMs)
+			}
 			codec := inspect(t, ffprobe, src)["video"].Codec
 			for _, copySound := range []bool{true, false} {
 				everyChunk(t, ffmpeg, ffprobe, Spec{Path: src, Grid: g, VideoCodec: codec, AudioTrack: 0, AudioCopy: copySound}, film != "rough")
@@ -661,6 +677,115 @@ func TestAFragmentIsFiledByWhenItsKeyFrameIsShown(t *testing.T) {
 	}
 }
 
+// stamps returns the time every fragment of every track in a chunk is
+// stamped with, as the numbers stored.
+func stamps(chunk []byte) (all []int64) {
+	children(chunk, func(typ string, moof []byte) {
+		if typ != "moof" {
+			return
+		}
+		children(moof, func(typ string, traf []byte) {
+			children(traf, func(typ string, b []byte) {
+				if typ == "tfdt" && len(b) >= 12 && b[0] == 1 {
+					all = append(all, int64(binary.BigEndian.Uint64(b[4:12])))
+				} else if typ == "tfdt" && len(b) >= 8 {
+					all = append(all, int64(binary.BigEndian.Uint32(b[4:8])))
+				}
+			})
+		})
+	})
+	return all
+}
+
+// A clip cut out of a longer film without re-encoding still holds the
+// frames from the key frame before the cut, marked as not to be shown: the
+// first frames that are shown cannot be decoded without them. Their times
+// lie before the clip's start, which is to say below zero. The chunks
+// cannot hold a time below zero, and players that met one stood still for
+// the length of the first chunk. So every time is moved along by as much
+// as those frames take, and the list says that the first chunk is that
+// much longer.
+func TestAClipTrimmedWithoutReencodingHasNoTimeBelowZero(t *testing.T) {
+	ffmpeg, ffprobe := tools(t)
+	src := source(t, ffmpeg, "trimmed")
+	g := grid(t, ffprobe, src, 43000)
+	if g.LeadMs == 0 {
+		t.Skip("this ffmpeg cuts a clip out without keeping frames from before the cut")
+	}
+	if g.LeadMs != 5000 || g.StartMs != 0 || len(g.Cuts) != 4 || g.Cuts[1] != 7000 {
+		t.Fatalf("the clip keeps %d ms from before its start and is cut at %v, want 5000 and [0 7000 19000 31000]", g.LeadMs, g.Cuts)
+	}
+	// A grid survives being stored and read back with this in it.
+	stored, _ := json.Marshal(g)
+	var back Grid
+	if json.Unmarshal(stored, &back); !back.Valid() || back.LeadMs != 5000 {
+		t.Errorf("stored and read back: %+v", back)
+	}
+	ctx := context.Background()
+	join := func(parts ...[]byte) string {
+		p := filepath.Join(t.TempDir(), "joined.mp4")
+		os.WriteFile(p, bytes.Join(parts, nil), 0o600)
+		return p
+	}
+	for _, copySound := range []bool{true, false} {
+		spec := Spec{Path: src, Grid: g, VideoCodec: "h264", AudioTrack: 0, AudioCopy: copySound, AudioCodec: "ac3"}
+		m := manager(t, ffmpeg)
+		straight := m.Open(spec)
+		list, _ := m.Playlist(straight)
+		// The first chunk: the 5 seconds from before the start and the 7
+		// after it. A player is asked to begin after those 5.
+		if !strings.Contains(string(list), "#EXTINF:12.000,\nseg-0.m4s") || !strings.Contains(string(list), "#EXT-X-START:TIME-OFFSET=5.000,PRECISE=YES\n") {
+			t.Errorf("the list should give the first chunk 12 seconds and ask players to begin 5 seconds in:\n%s", list)
+		}
+		header, err := m.Init(ctx, straight)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var whole [][]byte
+		begins := float64(g.Cuts[0])/1000 + shift // where the list says the chunk begins
+		for k := range g.Cuts {
+			through, err := m.Segment(ctx, straight, k)
+			if err != nil {
+				t.Fatalf("copy sound %v: chunk %d: %v", copySound, k, err)
+			}
+			whole = append(whole, through)
+			// A fresh session, as a player would: the header, then this chunk.
+			jumped := m.Open(spec)
+			h2, _ := m.Init(ctx, jumped)
+			direct, err := m.Segment(ctx, jumped, k)
+			if err != nil {
+				t.Fatalf("copy sound %v: jumping to chunk %d: %v", copySound, k, err)
+			}
+			m.Stop(jumped)
+			a, b := inspect(t, ffprobe, join(header, through)), inspect(t, ffprobe, join(h2, direct))
+			for name, c := range map[string]struct {
+				chunk []byte
+				x     map[string]streamInfo
+			}{"played through": {through, a}, "jumped to": {direct, b}} {
+				for _, stamp := range stamps(c.chunk) {
+					if stamp < 0 {
+						t.Errorf("copy sound %v: chunk %d %s is stamped with a time below zero (%d)", copySound, k, name, stamp)
+					}
+				}
+				if st := f(c.x["video"].StartTime); math.Abs(st-begins) > 0.002 {
+					t.Errorf("copy sound %v: chunk %d %s begins at %.3f s, the list says %.3f", copySound, k, name, st, begins)
+				}
+			}
+			if a["video"].Packets != b["video"].Packets || copySound && a["audio"].Packets != b["audio"].Packets {
+				t.Errorf("copy sound %v: chunk %d differs: played through %s/%s frames, jumped to %s/%s", copySound, k,
+					a["video"].Packets, a["audio"].Packets, b["video"].Packets, b["audio"].Packets)
+			}
+			begins += g.seconds(k)
+		}
+		all := join(append([][]byte{header}, whole...)...)
+		if got, want := inspect(t, ffprobe, all), inspect(t, ffprobe, src); got["video"].Packets != want["video"].Packets {
+			t.Errorf("copy sound %v: played through: %s frames of %s", copySound, got["video"].Packets, want["video"].Packets)
+		}
+		decodes(t, ffmpeg, all)
+		m.Close()
+	}
+}
+
 // In many films the sound stops a little before the picture does. ffmpeg
 // sends nothing until it has the first piece of every track, and started
 // in the silent end it never gets one for the sound. A viewer who jumps
@@ -684,6 +809,7 @@ func TestJumpingToWhereTheSoundHasEnded(t *testing.T) {
 		spec := Spec{Path: src, Grid: g, VideoCodec: "h264", AudioTrack: 0, AudioCopy: copySound, AudioCodec: "ac3"}
 		m := manager(t, ffmpeg)
 		m.Log = func(string, ...any) {} // the run that finds no sound says so
+		m.Ahead = 1                     // the converter stays by the viewer, so that every jump here is a restart
 		token := m.Open(spec)
 		starts := func() int {
 			m.mu.Lock()
@@ -1072,6 +1198,15 @@ func TestCommandLineIsBuiltOnlyFromTypedValues(t *testing.T) {
 	}
 	if b := args(Spec{Path: "x", Grid: g, VideoCodec: "h264", AudioTrack: -1}, 0, 8, 60); strings.Contains(strings.Join(b, " "), "-ss") || strings.Contains(strings.Join(b, " "), "0:a") {
 		t.Errorf("from the start with no sound: %v", b)
+	}
+	// Every time is moved one second along, and by the length of what a
+	// film keeps from before its start.
+	kept := g
+	kept.LeadMs = 5000
+	for want, grid := range map[string]Grid{"1.000": g, "6.000": kept} {
+		if a := strings.Join(args(Spec{Path: "x", Grid: grid, AudioTrack: -1}, 0, 8, 60), "\x00"); !strings.Contains(a, "-output_ts_offset\x00"+want+"\x00") {
+			t.Errorf("times should be moved along by %s seconds: %q", want, a)
+		}
 	}
 	// AAC that is passed through is rewrapped. Nothing else is: ffmpeg
 	// refuses the rewrapping for any other codec, and converted sound is
