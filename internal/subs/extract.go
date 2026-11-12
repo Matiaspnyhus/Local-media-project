@@ -67,6 +67,12 @@ var (
 // said once everything is in place. It is called from the goroutine that
 // called Extract.
 //
+// A track whose own data is damaged does not cost the film its other
+// tracks: it is left out and marked (Track.Damaged), and the rest is a
+// result like any other. Finding it takes several readings of the film
+// (see salvage); while those go on, progress is silent until a reading
+// gets further than the one before.
+//
 // When ctx ends, ffmpeg is stopped and nothing is kept. In every case
 // where an error is returned the folder has no index, and Load says
 // ErrNotExtracted: a run counts only when ffmpeg read the film to its end
@@ -83,6 +89,9 @@ type extraction struct {
 	tools     Tools
 	film, dir string
 	progress  func(int)
+	// reported is the last percentage that was passed on, so that the next
+	// is always higher, also when the film has to be read more than once.
+	reported int
 	// prepared, when set, is called with the working folder when it is
 	// ready and ffmpeg has not been started. Only tests set it: it lets
 	// them put something in ffmpeg's way.
@@ -95,6 +104,18 @@ type job struct {
 	forms []form // one for each subtitle track, in order; formNone for a track that is left
 	fonts []int  // which attachments are written out
 	clock clock
+	// through has the film read to its end even when no track is taken
+	// from it, to find out whether it can be.
+	through bool
+}
+
+// only is the same job for some of the tracks.
+func (j job) only(tracks []int) job {
+	few := job{forms: make([]form, len(j.forms)), fonts: j.fonts, clock: j.clock}
+	for _, n := range tracks {
+		few.forms[n] = j.forms[n]
+	}
+	return few
 }
 
 // plan decides what is taken from a film.
@@ -185,7 +206,7 @@ func (j job) args(film string) []string {
 		return a
 	}
 	a = append(a, "-c", "copy")
-	if j.outputs() == 0 {
+	if j.outputs() == 0 && !j.through {
 		// Only fonts are wanted, and those are already written by the time
 		// reading begins: none of the film needs to be read.
 		a = append(a, "-t", "0")
@@ -197,6 +218,7 @@ func (e *extraction) run(ctx context.Context) (Result, error) {
 	if e.tools.FFmpeg == "" {
 		return Result{}, errors.New("ffmpeg is not available")
 	}
+	e.reported = -1
 	// ffmpeg is started in another folder, where a path that is not whole
 	// would lead somewhere else: the film's, and ffmpeg's own if it was
 	// given as a path and not as a bare name to look up.
@@ -260,8 +282,13 @@ func (e *extraction) run(ctx context.Context) (Result, error) {
 		e.prepared(work)
 	}
 
+	var damaged map[int]bool
 	if j.runs() {
-		if err := e.convert(ctx, j, seen, film, work); err != nil {
+		err := e.convert(ctx, j, seen, film, work)
+		if j.outputs() > 0 && dataFault(err) {
+			damaged, err = e.salvage(ctx, j, seen, film, work, err)
+		}
+		if err != nil {
 			return Result{}, err
 		}
 	}
@@ -275,8 +302,18 @@ func (e *extraction) run(ctx context.Context) (Result, error) {
 		if f == formNone {
 			continue
 		}
+		if damaged[n] {
+			t.Damaged = true
+			continue
+		}
 		name := f.file(n)
 		facts, size, err := check(f, work, n)
+		if errors.Is(err, errNotText) {
+			// A track that calls itself text and is not: left out, like a
+			// track ffmpeg could make nothing of.
+			t.Damaged = true
+			continue
+		}
 		if err != nil {
 			return Result{}, fmt.Errorf("subtitle track %d was not written whole: %w", n, err)
 		}
@@ -332,6 +369,109 @@ func removeWork(work string) error {
 	return err
 }
 
+// stopped is a run of ffmpeg that ended badly.
+type stopped struct {
+	err  error  // how it ended
+	said string // its last words, without the film's folder
+}
+
+func (s *stopped) Error() string {
+	return fmt.Sprintf("the converter stopped before the subtitles were written: %v %s", s.err, s.said)
+}
+
+func (s *stopped) Unwrap() error { return s.err }
+
+// dataFault says whether ffmpeg ended the way it does when something in
+// the film is not in order: with the status that stands for "invalid data
+// found", or the one for "too many captions could not be read". (Out of
+// disk space, a film that is not there, being stopped: those end with
+// other numbers, and are no reason to look for a damaged track.)
+//
+// "Invalid data" is a negative number inside ffmpeg. As a status, Linux
+// and macOS keep its lowest eight bits (183) and Windows all 32.
+func dataFault(err error) bool {
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		return false
+	}
+	code := exit.ExitCode()
+	return code == 183 || uint32(code) == 0xBEBBB1B7 || code == 69
+}
+
+// salvage is what is done when ffmpeg gave up on a film because something
+// in it is damaged. One damaged track stops the whole pass; ffmpeg has no
+// way of leaving just that one out, and what it says does not name the
+// track in any form to rely on. So the film is read again for half the
+// tracks at a time, and a half that fails is halved again, until each
+// damaged track has failed in a reading of its own. Those are returned;
+// every other track has by then been written in a reading that ended
+// well.
+//
+// That costs a reading of the film for each try: for one damaged track
+// among thirty some eight of them, where trying each track by itself
+// would be thirty. It happens once for a film, since the outcome is kept.
+//
+// A track is only called damaged if the film itself can be read to its
+// end. If nothing came out at all, the film is read once more for its
+// clock alone; if that fails too, the fault is not a track's, and the
+// first error is returned.
+func (e *extraction) salvage(ctx context.Context, j job, seen inventory, film, work string, first error) (map[int]bool, error) {
+	var all []int
+	for n, f := range j.forms {
+		if f != formNone {
+			all = append(all, n)
+		}
+	}
+	damaged := map[int]bool{}
+	through := false // a reading has ended well
+	// try reads the film for a group of tracks, and for parts of the group
+	// if that fails. fails says the group is already known to fail as a
+	// whole. It reports whether every track of the group is in order.
+	var try func(group []int, fails bool) (bool, error)
+	try = func(group []int, fails bool) (bool, error) {
+		// (A single track is always read for, whatever is known: a track
+		// is not blamed for what was only seen to go wrong in company.)
+		if !fails || len(group) == 1 {
+			err := e.convert(ctx, j.only(group), seen, film, work)
+			switch {
+			case err == nil:
+				through = true
+				return true, nil
+			case !dataFault(err):
+				return false, err
+			case len(group) == 1:
+				damaged[group[0]] = true
+				return false, nil
+			}
+		}
+		half := len(group) / 2
+		sound, err := try(group[:half], false)
+		if err != nil {
+			return false, err
+		}
+		// If the first half is in order, the second is what fails.
+		_, err = try(group[half:], sound)
+		return false, err
+	}
+	if _, err := try(all, true); err != nil {
+		return nil, err
+	}
+	if !through {
+		if j.clock == clockNone {
+			return nil, first // nothing to tell by how far a reading gets
+		}
+		none := j.only(nil)
+		none.through = true
+		if err := e.convert(ctx, none, seen, film, work); err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, first
+		}
+	}
+	return damaged, nil
+}
+
 // convert runs ffmpeg and follows its clock.
 func (e *extraction) convert(ctx context.Context, j job, seen inventory, film, work string) error {
 	cmd := exec.CommandContext(ctx, e.tools.FFmpeg, j.args(film)...)
@@ -349,14 +489,14 @@ func (e *extraction) convert(ctx context.Context, j job, seen inventory, film, w
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("the converter could not be started: %w", err)
 	}
-	reading := j.outputs() > 0 // otherwise only fonts are fetched, and none of the film is read
+	reading := j.outputs() > 0 || j.through // otherwise only fonts are fetched, and none of the film is read
 	reachedMs, timed := e.follow(out, seen, reading)
 	err = cmd.Wait()
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
 	if err != nil {
-		return fmt.Errorf("the converter stopped before the subtitles were written: %v %s", err, pathless(said.String(), film))
+		return &stopped{err: err, said: pathless(said.String(), film)}
 	}
 	// ffmpeg ends well even when it could not read the film to its end: it
 	// says what stopped it and makes do with what it has, and every file
@@ -386,7 +526,6 @@ func (e *extraction) convert(ctx context.Context, j job, seen inventory, film, w
 // of the film's own clock in thousandths of a second. It returns the
 // latest of them, if there was one.
 func (e *extraction) follow(out io.Reader, seen inventory, reading bool) (reachedMs int64, timed bool) {
-	last := -1
 	lines := bufio.NewScanner(out)
 	for lines.Scan() {
 		ms, err := strconv.ParseInt(strings.TrimSpace(lines.Text()), 10, 64)
@@ -401,8 +540,8 @@ func (e *extraction) follow(out io.Reader, seen inventory, reading bool) (reache
 		}
 		// 100 is kept for "finished and in place".
 		percent := int(min(max((ms-seen.startMs)*100/seen.durationMs, 0), 99))
-		if percent > last {
-			last = percent
+		if percent > e.reported {
+			e.reported = percent
 			e.progress(percent)
 		}
 	}

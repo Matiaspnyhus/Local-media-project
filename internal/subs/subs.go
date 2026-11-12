@@ -12,7 +12,8 @@
 // Getting at any of them means reading the whole film once, so it is done
 // once: Extract has ffmpeg read the film through and write every track and
 // every font into a folder, under names this package chooses, and notes
-// what it found in an index there. Load reads that index back.
+// what it found in an index there. Load reads that index back. (Only a
+// film with a damaged track is read more than once, to find which it is.)
 //
 // A folder that Extract has finished holds, for a film whose subtitle
 // tracks are numbered 0, 1, 2 ... in the film's order and whose attachments
@@ -185,9 +186,15 @@ type Track struct {
 	Width  int `json:"width,omitempty"`
 	Height int `json:"height,omitempty"`
 	// Done says the whole track was written. It is false for a kind that
-	// cannot be taken out, and for the tracks beyond the most this package
-	// takes from one film.
+	// cannot be taken out, for the tracks beyond the most this package
+	// takes from one film, and for a track that is damaged.
 	Done bool `json:"done"`
+	// Damaged says the track could not be taken out because of what is in
+	// it: ffmpeg found its data not to be in order, in a reading of the
+	// film that was for this track alone, while the film itself could be
+	// read to its end. Such a track has no file. Trying again gives the
+	// same unless the film's file changes.
+	Damaged bool `json:"damaged,omitempty"`
 }
 
 // JumpBaseMs is the moment ffmpeg counts from when it is told where to

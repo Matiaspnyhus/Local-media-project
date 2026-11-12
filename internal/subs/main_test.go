@@ -9,6 +9,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -361,7 +364,14 @@ func supPieces(t *testing.T, b []byte) (pieces [][]byte) {
 // The stand-in. A test that wants one sets standInVar to how it should
 // behave and gives Extract this program as both tools.
 
-const standInVar = "LM_SUBS_STANDIN"
+const (
+	standInVar = "LM_SUBS_STANDIN"
+	// What the stand-in for ffprobe says a file holds, if not standInFilm.
+	standInFilmVar = "LM_SUBS_STANDIN_FILM"
+	// A file to which the stand-in for ffmpeg adds a line each time it is
+	// run: the files it was asked to write.
+	standInLogVar = "LM_SUBS_STANDIN_LOG"
+)
 
 func standInTools(t *testing.T, how string) Tools {
 	t.Helper()
@@ -371,6 +381,19 @@ func standInTools(t *testing.T, how string) Tools {
 	}
 	t.Setenv(standInVar, how)
 	return Tools{FFmpeg: self, FFprobe: self}
+}
+
+// standInRuns has the stand-in for ffmpeg keep a list of its runs, and
+// returns a function that reads the list: for each run, the files it was
+// asked to write.
+func standInRuns(t *testing.T) func() []string {
+	t.Helper()
+	log := filepath.Join(t.TempDir(), "runs")
+	t.Setenv(standInLogVar, log)
+	return func() []string {
+		b, _ := os.ReadFile(log)
+		return strings.Split(strings.TrimSuffix(string(b), "\n"), "\n")
+	}
 }
 
 // standInFilm is what the stand-in for ffprobe says every file holds: 100
@@ -383,12 +406,15 @@ const standInFilm = `{"format": {"start_time": "0.000000", "duration": "100.0000
  {"codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle"},
  {"codec_type": "attachment", "tags": {"filename": "Some.ttf", "mimetype": "font/ttf"}}]}`
 
+// A file the stand-in may be asked to write, as this package names them.
+var standInOutput = regexp.MustCompile(`^(s[0-9]+\.ass|t[0-9]+\.(mks|vtt)|p[0-9]+\.(sup|mks)|fonts/f[0-9]+)$`)
+
 // standIn behaves as ffprobe when it is asked to describe a file, and
-// otherwise as ffmpeg: it writes the four files that go with standInFilm
-// into the folder it was started in (the text track as ffmpeg copies one
-// out: a small Matroska file), says on its clock that it has read 0,
-// 10, 50, 99.9 and 100.5 seconds, and ends. how changes one thing about
-// that:
+// otherwise as ffmpeg: it writes every file it is asked for into the
+// folder it was started in (for standInFilm those are s0.ass, p2.sup,
+// fonts/f0 and t1.mks, the text track as ffmpeg copies one out), says on
+// its clock that it has read 0, 10, 50, 99.9 and 100.5 seconds, and ends.
+// how changes one thing about that:
 //
 //	ok           nothing
 //	hang         after the first two times on the clock it never ends
@@ -400,19 +426,41 @@ const standInFilm = `{"format": {"start_time": "0.000000", "duration": "100.0000
 //	short:WORDS  it says WORDS as ffmpeg says what troubles it, stops
 //	             reading at 50 seconds, and ends well
 //	whole:WORDS  it says WORDS, reads to the end, and ends well
+//	bad:FILES    whenever it is asked for one of FILES (with commas between
+//	             them) it ends as ffmpeg does over damaged data, half-way
+//	statuses:N,N its first run ends with the first status, its second with
+//	             the second, and so on; the last goes for all later runs
+//	             (it needs the list of runs to count them by)
 func standIn(how string) {
 	how, words, _ := strings.Cut(how, ":")
 	args := os.Args[1:]
 	for _, a := range args {
 		if a == "-print_format" {
-			fmt.Println(standInFilm)
+			film := os.Getenv(standInFilmVar)
+			if film == "" {
+				film = standInFilm
+			}
+			fmt.Println(film)
 			os.Exit(0)
 		}
 	}
 	var filmPath string
+	var asked []string
 	for i, a := range args {
 		if a == "-i" && i+1 < len(args) {
 			filmPath = args[i+1]
+		}
+		if standInOutput.MatchString(a) {
+			asked = append(asked, a)
+		}
+	}
+	run := 0 // how many runs came before this one
+	if log := os.Getenv(standInLogVar); log != "" {
+		before, _ := os.ReadFile(log)
+		run = bytes.Count(before, []byte("\n"))
+		if err := os.WriteFile(log, append(before, strings.Join(asked, " ")+"\n"...), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
 		}
 	}
 	sup, err := substest.PGS(1920, 1080, twoCaptions)
@@ -420,11 +468,22 @@ func standIn(how string) {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
-	files := map[string][]byte{
-		"s0.ass":   []byte(strings.ReplaceAll(script, "\n", "\r\n")),
-		"t1.mks":   textMKS("S_TEXT/UTF8", textCaption{500, 1000, "First plain line"}),
-		"p2.sup":   sup,
-		"fonts/f0": fontA,
+	files := map[string][]byte{}
+	for _, name := range asked {
+		switch {
+		case strings.HasPrefix(name, "fonts/"):
+			files[name] = fontA
+		case strings.HasSuffix(name, ".ass"):
+			files[name] = []byte(strings.ReplaceAll(script, "\n", "\r\n"))
+		case strings.HasSuffix(name, ".vtt"):
+			files[name] = []byte("WEBVTT\n\n00:00.500 --> 00:01.500\nFirst plain line\n\n")
+		case strings.HasSuffix(name, ".sup"):
+			files[name] = sup
+		case strings.HasPrefix(name, "t"):
+			files[name] = textMKS("S_TEXT/UTF8", textCaption{500, 1000, "First plain line"})
+		default:
+			files[name] = textMKS("S_VOBSUB", textCaption{2000, 1500, "a picture"})
+		}
 	}
 	switch how {
 	case "cut-sup":
@@ -459,11 +518,29 @@ func standIn(how string) {
 		os.Exit(3)
 	}
 	fmt.Println(50000)
-	if words != "" {
-		fmt.Fprintln(os.Stderr, words)
-	}
-	if how == "short" {
-		os.Exit(0)
+	switch how {
+	case "bad":
+		for _, name := range asked {
+			if slices.Contains(strings.Split(words, ","), name) {
+				// What the converter that ships says of a disc's track
+				// with a piece that is not whole.
+				fmt.Fprintln(os.Stderr, "[sup @ 0x561c1ae74480] Not enough data, skipping 1262 bytes\n[out#2/sup @ 0x561c1aeb1740] Error muxing a packet")
+				os.Exit(183)
+			}
+		}
+	case "statuses":
+		list := strings.Split(words, ",")
+		if status, _ := strconv.Atoi(list[min(run, len(list)-1)]); status != 0 {
+			fmt.Fprintln(os.Stderr, "[out#0 @ 0x1] Something went wrong")
+			os.Exit(status)
+		}
+	case "short", "whole":
+		if words != "" {
+			fmt.Fprintln(os.Stderr, words)
+		}
+		if how == "short" {
+			os.Exit(0)
+		}
 	}
 	fmt.Println(99900)
 	// The last piece of sound often ends a little after the film is said
