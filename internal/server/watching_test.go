@@ -431,6 +431,34 @@ func TestAPausedRepackagedFilmIsStillBeingWatched(t *testing.T) {
 	e.wantWatching("its sign-in was signed out")
 }
 
+// Whether a sign-in is still good is asked of the database. When that
+// question cannot be answered, the viewer must go on counting: a wrong
+// "nobody is watching" lets an update restart the program under a film,
+// while a wrong "someone is" only makes it look again a minute later.
+func TestAViewerStillCountsWhenTheDatabaseCannotBeAsked(t *testing.T) {
+	e := newEnv(t)
+	e.setup()
+	phone := e.signIn(iPhone)
+	film := e.firstItem(phone, "clip")
+	if w := e.do("POST", "/api/items/"+film+"/play", remote, phone, nil); w.Code != 200 {
+		t.Fatalf("play: %d %s", w.Code, w.Body)
+	}
+	before := e.s.Watching()
+	if len(before) != 1 || before[0].Who != "owner on an iPhone" {
+		t.Fatalf("a film was opened on the phone, but watching = %+v", before)
+	}
+	// The plainest way to make every question fail.
+	e.s.db.Close()
+	after := e.s.Watching()
+	if len(after) != 1 || after[0].SignIn != before[0].SignIn {
+		t.Fatalf("with the database out of reach, watching = %+v; want the phone's sign-in still counted", after)
+	}
+	// Who it is cannot be read either, and the owner is not told a guess.
+	if after[0].Who != "Someone on another device" {
+		t.Errorf("the viewer is called %q", after[0].Who)
+	}
+}
+
 // fakeUpdater stands in for the part of the program that installs updates.
 type fakeUpdater struct {
 	status    UpdateStatus

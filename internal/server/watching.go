@@ -1,6 +1,8 @@
 package server
 
 import (
+	"database/sql"
+	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -53,6 +55,7 @@ import (
 // was sent as it is, and 4 hours after the end if it was repackaged (the
 // server cannot tell a finished repackaged film from a paused one). A
 // sign-in that has been signed out, or has run out, is never watching.
+// (If the database cannot say whether it has, it still counts.)
 //
 // Times are by the PC's clock, not by how long the program has been
 // awake: a PC that slept through the night was quiet all night.
@@ -184,11 +187,20 @@ func (s *Server) Watching() []Watcher {
 	sort.Strings(ids)
 	var out []Watcher
 	for _, id := range ids {
-		if !s.signInAlive(id) {
+		var name, device string
+		var created int64
+		var revoked sql.NullInt64
+		err := s.db.QueryRow(`SELECT u.name, s.device_name, s.created_at, s.revoked_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id=?`, id).
+			Scan(&name, &device, &created, &revoked)
+		// Only a clear answer takes a sign-in off the list: there is no
+		// such sign-in, it has been signed out, or it has run out (the
+		// test signInAlive makes). A question the database could not
+		// answer is not a "no": the sign-in goes on counting, because
+		// waiting a minute too long costs nothing, and restarting under a
+		// film does.
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && (revoked.Valid || signInExpired(created))) {
 			continue
 		}
-		var name, device string
-		s.db.QueryRow(`SELECT u.name, s.device_name FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id=?`, id).Scan(&name, &device)
 		if name == "" {
 			name = "Someone"
 		}
