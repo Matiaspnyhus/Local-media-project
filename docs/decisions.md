@@ -230,18 +230,19 @@ Before the first release, the M3 code was read by seven independent reviewers, e
 - Three small faults in the converter that the second check found, whose repairs were taken out again (see above): when a player asks for the header and a chunk at the same moment at a point where the film's sound has already ended, one of the two can fail and has to be asked for again; a film whose key frames are more than a minute apart is cut every few seconds instead of at its key frames, so jumping in it is less exact; a jump given up while the converter is being stopped can leave that run's chunks on disk until the film is closed. Low. The repair attempts are in the local history of the session that made them (branch `fix/hls-r2`) and were not pushed; the Windows failure was `TestClosingDuringAJumpLeavesNothingRunning/a_seventh_film_is_opened`.
 - For a clip trimmed without re-encoding (see above), the saved position is a few seconds off between a device that gets it repackaged and one that plays it as it is.
 
-## 2026-11-12: Release v0.3.0 — ready, not yet published
+## 2026-11-12: Release v0.3.0, and how versions are published
 
-The commit for v0.3.0 is **c4c470d** ("Let a release made by hand on GitHub get its files; refuse to release a marked commit"). The code in it passed on every system as commit 70dc372; c4c470d adds only a change to the release step.
+The commit for v0.3.0 is **c4c470d** ("Let a release made by hand on GitHub get its files; refuse to release a marked commit"). Its code passed on every system as commit 70dc372; c4c470d adds only a change to the release step.
 
-It is not published because the session that built it could not push a tag: its access to GitHub allows the working branch and nothing else (the push was refused with "403"). That limit was left alone rather than worked around. Two ways remain:
+The session that built it could not publish it the planned way: its access to GitHub allows pushing the working branch and nothing else, and pushing the tag was refused ("403"). That limit was not worked around on the session's own decision. The owner was asked and chose to let the project's own checks do the publishing, so there are now three ways a version gets published, all of which test the commit on every system first and publish only if everything passes:
 
-1. *The owner makes the release on GitHub's page* (no developer tools needed): the repository's page, **Releases**, **Draft a new release**; under **Choose a tag** type `v0.3.0` and pick "Create new tag"; under **Target** choose **Recent Commits** and pick the commit whose title starts "Let a release made by hand on GitHub get its files" (not `main`, and not the newest commit); **Publish release**. GitHub then tests that commit on every system and, if all pass, attaches the installer and the other files to the release and fills in the notes, about ten minutes later. If the wrong target was picked, nothing harmful happens: either no files appear, or the release step refuses and says why; delete the release and its tag on the same page and do it again.
-2. *A session with permission to push tags* runs `git tag v0.3.0 c4c470d && git push origin v0.3.0`.
+1. *By commit message.* The newest commit pushed to the working branch says `[release vX.Y.Z at <the full 40-character id of a commit>]`. The named commit must be part of the branch, must hold `docs/release-notes/vX.Y.Z.md`, must not hold `packaging/NOT-FOR-RELEASE.txt`, and the version must not exist yet. Every job then checks out and tests that commit, not the newest one, and the release step makes the tag on it. Naming the commit is what allows releasing a tested commit from a branch whose newest commits hold unfinished work. A run that publishes is not cancelled by a later push. The decision is made by `packaging/release-plan.sh`, which can be run by hand to see what a message would do.
+2. *By tag*, pushed from somewhere that may push tags.
+3. *By a release made on GitHub's page*, which makes the tag: the release step adds the files and the notes to it.
 
 One fault was found and fixed on the way to this commit: which film is closed when a sign-in opens a seventh was decided by clock time, which ties on Windows (its clock moves in steps of several milliseconds); it is now decided by order of use.
 
-After publishing: installed copies only update themselves from the *second* release on. See "Known and not yet fixed" above for what to repair before that one.
+Installed copies only update themselves from the *second* release on. See "Known and not yet fixed" above for what to repair before that one.
 
 ## 2026-11-12: M4 — started, not finished (stopped to save the owner's usage)
 

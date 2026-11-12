@@ -13,24 +13,48 @@ on:
 permissions:
   contents: read
 
+# A newer push to a branch cancels the run of the push before it, except a
+# run that publishes a version (see the plan job): that one finishes.
 concurrency:
-  group: checks-${{ github.ref }}
+  group: checks-${{ github.ref }}-${{ contains(github.event.head_commit.message, '[release v') && github.sha || 'latest' }}
   cancel-in-progress: true
 
 env:
   ALL_OS: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[all-os]') || github.event.repository.visibility == 'public' }}
 
 jobs:
+  # Decides what this run tests and whether it publishes a version.
+  #
+  # A version is published in one of two ways:
+  #   - a version tag (v1.2.3) appears, pushed or made with a release on
+  #     GitHub's page: the tagged commit is tested and published;
+  #   - the newest commit pushed to a branch says, in its message,
+  #       [release v1.2.3 at <the full 40-character id of a commit>]
+  #     Then that commit (which must be part of the branch) is what every job
+  #     below checks out, tests and builds, and it is published under that
+  #     version once all of them pass. This exists because some sessions that
+  #     work on the project may push to their branch but not push tags. A
+  #     version that already exists is never published again.
   plan:
     runs-on: ubuntu-latest
     outputs:
       all_os: ${{ steps.v.outputs.all_os }}
       public: ${{ steps.v.outputs.public }}
+      sha: ${{ steps.r.outputs.sha }}
+      version: ${{ steps.r.outputs.version }}
+      release: ${{ steps.r.outputs.release }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - id: v
         run: |
           echo "all_os=${ALL_OS}" >> "$GITHUB_OUTPUT"
           echo "public=${{ github.event.repository.visibility == 'public' }}" >> "$GITHUB_OUTPUT"
+      - id: r
+        env:
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: bash packaging/release-plan.sh >> "$GITHUB_OUTPUT"
 
   # Measures how fast the test machine converts pictures with the pinned
   # converter (see packaging/speed-probe.sh). Only on request: put
@@ -52,9 +76,14 @@ jobs:
         run: bash packaging/speed-probe.sh "$RUNNER_TEMP/ffmpeg/ffmpeg" "$RUNNER_TEMP/probe" 20
 
   linux:
+    needs: plan
     runs-on: ubuntu-latest
+    env:
+      LM_VERSION: ${{ needs.plan.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -86,7 +115,7 @@ jobs:
           bash packaging/third-party-licenses.sh
           git diff --exit-code -- packaging/THIRD-PARTY-LICENSES.txt || { echo "Run: bash packaging/third-party-licenses.sh, and commit the result"; exit 1; }
       - name: Build every platform with cgo off
-        run: make cross VERSION=${GITHUB_REF_NAME}
+        run: make cross VERSION="$LM_VERSION"
       - name: End-to-end test in Chromium (keyboard only, plain HTTP)
         run: |
           cp release/localmedia-linux-amd64 localmedia
@@ -102,7 +131,7 @@ jobs:
           unzip -q -j ffmpeg-win64.zip ffprobe.exe ffmpeg.exe -d package/LocalMedia
           # The packaged program has no console window: its sign of life is
           # the icon beside the clock.
-          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=${GITHUB_REF_NAME}" -o package/LocalMedia/localmedia.exe ./cmd/localmedia
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "-s -w -H windowsgui -X main.version=${LM_VERSION}" -o package/LocalMedia/localmedia.exe ./cmd/localmedia
           cp LICENSE package/LocalMedia/LICENSE.txt
           cp packaging/THIRD-PARTY.txt package/LocalMedia/THIRD-PARTY.txt
           cp packaging/THIRD-PARTY-LICENSES.txt package/LocalMedia/THIRD-PARTY-LICENSES.txt
@@ -123,6 +152,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -177,7 +208,7 @@ jobs:
         run: |
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
-          $ver = "${{ github.ref_name }}" -replace '^v', ''
+          $ver = "${{ needs.plan.outputs.version }}" -replace '^v', ''
           if ($ver -notmatch '^\d+\.\d+\.\d+$') { $ver = "0.0.0" }
           & $iscc "/DAppVersion=$ver" "packaging\installer.iss"
           if ($LASTEXITCODE -ne 0) { throw "the installer did not build" }
@@ -241,6 +272,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -278,6 +311,8 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -285,20 +320,25 @@ jobs:
         run: go test ./...
 
   release:
-    needs: [linux, windows, macos]
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [plan, linux, windows, macos]
+    if: needs.plan.outputs.release != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.plan.outputs.release }}
+      SHA: ${{ needs.plan.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
       - name: Refuse a commit that is marked as not for release
         run: |
           if [ -f packaging/NOT-FOR-RELEASE.txt ]; then
             cat packaging/NOT-FOR-RELEASE.txt
             exit 1
           fi
-          test -f "docs/release-notes/$GITHUB_REF_NAME.md" || { echo "docs/release-notes/$GITHUB_REF_NAME.md is missing: write the release notes first"; exit 1; }
+          test -f "docs/release-notes/$TAG.md" || { echo "docs/release-notes/$TAG.md is missing: write the release notes first"; exit 1; }
       - uses: actions/download-artifact@v4
         with:
           name: localmedia-builds
@@ -328,13 +368,15 @@ jobs:
           rm -f localmedia-windows-amd64.zip
           (cd ../package && zip -q -r ../release/LocalMedia-Windows.zip LocalMedia)
           sha256sum *.zip LocalMedia-Setup.exe > SHA256SUMS.txt
-          notes=../docs/release-notes/"$GITHUB_REF_NAME".md
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          notes=../docs/release-notes/"$TAG".md
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             # The release was made by hand on GitHub's page, which also made
             # the tag that started this run: give it its files and its notes.
-            gh release upload "$GITHUB_REF_NAME" *.zip LocalMedia-Setup.exe SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
-            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Local Media $GITHUB_REF_NAME" --notes-file "$notes"
+            gh release upload "$TAG" *.zip LocalMedia-Setup.exe SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "Local Media $TAG" --notes-file "$notes"
           else
-            gh release create "$GITHUB_REF_NAME" *.zip LocalMedia-Setup.exe SHA256SUMS.txt \
-              --repo "$GITHUB_REPOSITORY" --title "Local Media $GITHUB_REF_NAME" --notes-file "$notes"
+            # Where the tag does not exist yet, this makes it, on the commit
+            # that was just tested.
+            gh release create "$TAG" *.zip LocalMedia-Setup.exe SHA256SUMS.txt --target "$SHA" \
+              --repo "$GITHUB_REPOSITORY" --title "Local Media $TAG" --notes-file "$notes"
           fi
