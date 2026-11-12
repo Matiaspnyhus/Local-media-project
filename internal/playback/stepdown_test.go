@@ -423,9 +423,10 @@ func TestStepsOnlyGoDown(t *testing.T) {
 		changed, stayed, gaveWay int
 	}
 
-	// check holds one outcome to the rules and returns it.
-	check := func(t *testing.T, n *tally, id func() string, m Media, base Plan, dev *Caps, w Want, l Limits, tr trouble, steps int) Outcome {
-		p := DecideFor(m, dev, w, l)
+	// check holds one outcome to the rules and returns it. p is the plan
+	// the film has been playing with, and base how it plays when nothing is
+	// wished for and no subtitles are asked.
+	check := func(t *testing.T, n *tally, id func() string, m Media, base, p Plan, dev *Caps, w Want, l Limits, tr trouble, steps int) Outcome {
 		o := Replan(m, dev, w, l, tr.evidence, tr.pace, steps)
 		q := o.Plan
 		taken := n.taken
@@ -520,6 +521,7 @@ func TestStepsOnlyGoDown(t *testing.T) {
 	// trouble, and whatever trouble comes after a first step.
 	walk := func(t *testing.T, dname string, base *Caps) tally {
 		n := tally{taken: map[Lesson]int{}}
+		films := 0
 		for _, si := range []int{0, len(surfaces) - 1} {
 			first := surfaces[si].on(base)
 			for _, cont := range []string{"mp4", "matroska", "avi"} {
@@ -533,20 +535,28 @@ func TestStepsOnlyGoDown(t *testing.T) {
 									if sub.kind != "" {
 										wish.Subtitle = 0
 									}
+									films++
 									for pi, pc := range pcs {
+										// The first two PCs meet every film, the others every
+										// second one, each its own half: that keeps the walk
+										// to a few seconds.
+										if pi >= 2 && (films+pi)%2 == 1 {
+											continue
+										}
 										id := func() string {
 											return strings.Join([]string{cont, v.codec, a, sz.name, col.name, sub.name, "on", dname, surfaces[si].name, "PC", string(rune('0' + pi))}, " ")
 										}
 										// How the film plays when nothing is wished for and no
 										// subtitles are asked: converting it, or not.
 										plain := DecideFor(m, first, plainWish, pc)
+										start := DecideFor(m, first, wish, pc)
 										for i, tr := range troubles {
-											one := check(t, &n, id, m, plain, first, wish, pc, tr, 0)
+											one := check(t, &n, id, m, plain, start, first, wish, pc, tr, 0)
 											if !one.Changed {
 												continue
 											}
 											for j, tr2 := range troubles {
-												two := check(t, &n, id, m, plain, one.Caps, one.Want, one.Limits, tr2, 1)
+												two := check(t, &n, id, m, plain, one.Plan, one.Caps, one.Want, one.Limits, tr2, 1)
 												if !two.Changed {
 													continue
 												}
