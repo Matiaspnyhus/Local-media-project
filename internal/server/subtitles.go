@@ -33,7 +33,7 @@ func decodeText(raw []byte) []byte {
 	if utf8.Valid(raw) {
 		return raw
 	}
-	return fromWindows1252(raw)
+	return mended(raw)
 }
 
 // inTwoBytes reports whether raw is text saved two bytes a letter (UTF-16),
@@ -74,6 +74,43 @@ func inTwoBytes(raw []byte) (bigEnd bool, mark int, ok bool) {
 		return true, 0, true
 	}
 	return false, 0, false
+}
+
+// mended reads text that is not UTF-8 throughout. Nearly always that is
+// text in the old Western European encoding, and all of it is read as that.
+// It can also be UTF-8 with a few stray bytes in it (a damaged file, or one
+// put together from several). Read as the old encoding, every accented
+// letter of such a file would become two wrong ones. The two cases are told
+// apart by counting. In UTF-8 an accented letter is a group of bytes of a
+// form the old encoding gives rise to only by chance ("ß…" is one such
+// pair). Where those groups outnumber the bytes that fit no group, the text
+// is UTF-8, and only its stray bytes are read as the old encoding.
+func mended(raw []byte) []byte {
+	var groups, stray int
+	for i := 0; i < len(raw); {
+		r, n := utf8.DecodeRune(raw[i:])
+		switch {
+		case r == utf8.RuneError && n == 1:
+			stray++
+		case n > 1:
+			groups++
+		}
+		i += n
+	}
+	if groups <= stray {
+		return fromWindows1252(raw)
+	}
+	out := make([]byte, 0, len(raw)+2*stray)
+	for i := 0; i < len(raw); {
+		r, n := utf8.DecodeRune(raw[i:])
+		if r == utf8.RuneError && n == 1 {
+			out = append(out, fromWindows1252(raw[i:i+1])...)
+		} else {
+			out = append(out, raw[i:i+n]...)
+		}
+		i += n
+	}
+	return out
 }
 
 // fromWindows1252 reads bytes as the old Western European encoding

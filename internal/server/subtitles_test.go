@@ -529,6 +529,15 @@ func TestWhichEncodingASubtitleFileIsIn(t *testing.T) {
 		{"Chinese, two bytes a letter without the mark", twoBytesBare(chinese, false), chinese},
 		{"Chinese the other way round", twoBytesBare(chinese, true), chinese},
 		{"Chinese in today's encoding", chinese, chinese},
+		// One stray byte in a file that is otherwise in today's encoding (a
+		// damaged file, or one put together from two) used to have the
+		// whole file read as the old encoding: every accented letter in it
+		// became two wrong ones.
+		{"today's encoding with a stray byte", strings.Replace(text, "Jeg", "Jeg\xff", 1), strings.Replace(text, "Jeg", "Jegÿ", 1)},
+		// The old encoding can by chance hold a pair of bytes that reads as
+		// one letter of today's ("ß…" is such a pair). The file is still in
+		// the old encoding throughout.
+		{"the old encoding with a pair that looks like today's", oldText + "\r\n3\r\n00:00:05,000 --> 00:00:06,000\r\nIch wei\xdf\x85\r\n", text + "\r\n3\r\n00:00:05,000 --> 00:00:06,000\r\nIch weiß…\r\n"},
 		{"nothing", "", ""},
 		{"one letter", "a", "a"},
 	} {
