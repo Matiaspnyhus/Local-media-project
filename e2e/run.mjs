@@ -289,10 +289,50 @@ try {
     }
   })
 
-  await step('changing the sound twice in a row keeps the place in the film', async () => {
+  // "Show subtitles" in the settings, set with the keyboard.
+  const showSubtitles = async (when) => {
+    await focusByText(page, 'Settings')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('[data-testid=pref-when]')
+    await pressUntilFocused(page, '[data-testid=pref-when]')
+    await page.keyboard.press(when === 'always' ? 'ArrowDown' : 'ArrowUp')
+    if ((await page.inputValue('[data-testid=pref-when]')) !== when) await page.selectOption('[data-testid=pref-when]', when)
+    await page.waitForFunction(async (w) => (await (await fetch('/api/prefs')).json()).subs === w, when, { timeout: 10000 })
+  }
+  // Waits until the subtitles that are switched on show the given words.
+  const subtitleShows = (words) => page.waitForFunction((w) => {
+    const t = Array.from(document.querySelector('video').textTracks).find((x) => x.mode === 'showing')
+    return !!t && !!t.activeCues && t.activeCues.length > 0 && t.activeCues[0].text.trim() === w
+  }, words, { timeout: 15000 }).catch(() => assert.fail(`the subtitles did not come to show "${words}"`))
+
+  await step('a film starts without waiting for its subtitles, and they join it when they arrive', async () => {
+    await showSubtitles('always')
+    // Subtitles stored inside a film take as long to arrive as the PC takes
+    // to read the film through: minutes, for a long one. Here they are held
+    // back until the film has been seen playing.
+    let wanted = false
+    let release
+    const held = new Promise((r) => (release = r))
+    await page.route('**/subtitles/**', async (route) => {
+      wanted = true
+      await held
+      await route.continue()
+    })
     await focusByText(page, 'Three Sounds Test')
     await page.keyboard.press('Enter')
-    await waitPlaying(page, 1)
+    await waitPlaying(page, 1).catch(() => assert.fail('the film did not start while its subtitles were still on their way'))
+    assert.notEqual(await page.inputValue('[data-testid=pick-subtitles]'), '', 'subtitles were chosen when the film opened')
+    for (let i = 0; !wanted; i++) {
+      assert.ok(i < 50, 'the chosen subtitles were not asked for once the film was playing')
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    release()
+    await subtitleShows('Said in the first half')
+    await page.unroute('**/subtitles/**')
+  })
+
+  await step('changing the sound twice in a row keeps the place in the film, and the subtitles', async () => {
+    const subtitles = await page.inputValue('[data-testid=pick-subtitles]')
     await page.evaluate(() => (document.querySelector('video').currentTime = 60))
     await playsBeyond(page, 60.5, 'a jump to one minute')
     const place = await page.evaluate(() => document.querySelector('video').currentTime)
@@ -316,10 +356,17 @@ try {
       await new Promise((r) => setTimeout(r, 100))
     }
     console.log(`      (was at ${place.toFixed(2)} s, plays on at ${v.at.toFixed(2)} s by method ${v.method})`)
+    // Changing the sound hands the film to the player afresh. The subtitles
+    // are switched back on once it plays.
+    assert.equal(await page.inputValue('[data-testid=pick-subtitles]'), subtitles, 'the same subtitles are still chosen')
+    await subtitleShows('Said in the second half')
     await page.evaluate(() => document.querySelector('video').pause())
     await focusByText(page, '← Back')
     await page.keyboard.press('Enter')
     await page.waitForSelector('text=Continue watching')
+    // Back to how it was, so that the next film's subtitles are down to
+    // what was chosen for that film.
+    await showSubtitles('auto')
   })
 
   await step('a repackaged film resumes where it stopped, with its subtitles', async () => {

@@ -824,6 +824,32 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
 
   const showPlayer = !!info && (info.plan.playable !== 'no' || tryAnyway)
 
+  // Subtitles: the chosen track is switched on and every other off. A
+  // track that is off is not even downloaded. None is switched on before
+  // the film is playing, because a browser will not start a film while
+  // subtitles that were already on when it began loading are still on
+  // their way, and subtitles stored inside a film take as long to arrive
+  // as the PC takes to read the film through. So each time the film is
+  // handed to the player they are all switched off, and the chosen one is
+  // switched on once the film plays.
+  const started = useRef(false) // the film has played since it was last handed to the player
+  const subWanted = useRef('') // the same as subKey, for code that runs between two drawings of the page
+  const applySubs = useCallback(() => {
+    const tracks = videoRef.current ? videoRef.current.querySelectorAll('track') : []
+    for (let i = 0; i < tracks.length; i++) {
+      const want = started.current && tracks[i].getAttribute('data-key') === subWanted.current ? 'showing' : 'disabled'
+      if (tracks[i].track.mode !== want) tracks[i].track.mode = want
+    }
+  }, [])
+  const subsOff = useCallback(() => {
+    started.current = false
+    applySubs()
+  }, [applySubs])
+  const onPlaying = () => {
+    started.current = true
+    applySubs()
+  }
+
   // Hand the address to the player. The original file, and a list of
   // chunks where the browser plays those by itself (Safari, every iPhone),
   // go straight in. Elsewhere the chunks are played by hls.js, which is
@@ -835,6 +861,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     const stop = () => token && api.hlsStop(token)
     window.addEventListener('pagehide', stop)
     chunkPlayer.current = false
+    subsOff()
     if (!token || builtInChunks()) {
       v.src = info.url
       return () => {
@@ -862,6 +889,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
           if (!data.fatal) return
           if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recovered) {
             recovered = true
+            subsOff() // recovering hands the film to the player afresh
             hls.recoverMediaError()
             return
           }
@@ -878,23 +906,14 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       if (player) player.destroy()
       stop()
     }
-  }, [info, showPlayer, report])
+  }, [info, showPlayer, report, subsOff])
 
-  // Switch the chosen subtitles on and every other off. A track that is
-  // off is not even downloaded.
+  // A choice of subtitles takes effect at once when the film is playing,
+  // and is kept for when it does otherwise.
   useEffect(() => {
-    const v = videoRef.current
-    if (!info || !showPlayer || !v) return
-    const apply = () => {
-      for (let i = 0; i < v.textTracks.length; i++) {
-        const want = info.subtitles[i] && info.subtitles[i].key === subKey ? 'showing' : 'disabled'
-        if (v.textTracks[i].mode !== want) v.textTracks[i].mode = want
-      }
-    }
-    apply()
-    v.addEventListener('loadedmetadata', apply)
-    return () => v.removeEventListener('loadedmetadata', apply)
-  }, [info, showPlayer, subKey])
+    subWanted.current = subKey
+    applySubs()
+  }, [info, showPlayer, subKey, applySubs])
 
   const remember = (audioIndex: number, sub: string) => {
     if (!info) return
@@ -921,6 +940,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     if (!v || !info) return
     // hls.js was told where to start; everything else is told here.
     if (!chunkPlayer.current && info.positionMs > 0 && info.positionMs / 1000 < v.duration - 5) v.currentTime = info.positionMs / 1000
+    applySubs() // a track the browser switched on by itself goes off again, like the rest
     if (v.videoWidth === 0) {
       setProblem(
         "This browser can play this file's sound but not its picture. Converting the picture of such files arrives in a later version (M4).",
@@ -983,13 +1003,14 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
             preload="metadata"
             data-method={info.plan.method}
             onLoadedMetadata={onLoaded}
+            onPlaying={onPlaying}
             onTimeUpdate={onTime}
             onPause={() => save(true)}
             onEnded={() => save(true)}
             onError={onError}
           >
             {info.subtitles.map((s) => (
-              <track key={s.key} kind="subtitles" src={s.url} srcLang={s.language || 'und'} label={s.label} />
+              <track key={s.key} data-key={s.key} kind="subtitles" src={s.url} srcLang={s.language || 'und'} label={s.label} />
             ))}
           </video>
           <div className="bar picks">
