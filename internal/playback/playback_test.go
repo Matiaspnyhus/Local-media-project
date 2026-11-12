@@ -223,8 +223,9 @@ func TestChoosingAnotherSoundTrack(t *testing.T) {
 	if p := Decide(m, devices["chrome"], -1); p.Method != Direct || p.AudioTrack != 0 {
 		t.Fatalf("by default: %+v", p)
 	}
-	// A browser handed the file plays its first track, so another track
-	// means repackaging, which costs nothing.
+	// A browser handed this file plays its first track, which is also the
+	// one marked as main. Another track means repackaging, which costs
+	// nothing.
 	if p := Decide(m, devices["chrome"], 1); p.Method != Remux || p.AudioTrack != 1 || !strings.Contains(strings.Join(p.Reasons, " "), "sound track") {
 		t.Fatalf("second track: %+v", p)
 	}
@@ -236,5 +237,60 @@ func TestChoosingAnotherSoundTrack(t *testing.T) {
 	}
 	if p := Decide(m, devices["old-tv"], 1); p.Method != None {
 		t.Fatalf("another track on a device that cannot take repackaged video: %+v", p)
+	}
+}
+
+// Browsers do not agree on which sound track of a file they play by
+// themselves: Chrome plays the track an MP4 marks as main, but the first
+// track of an MKV whatever it marks. So the original is only sent when
+// there is no doubt: the wanted track is the first one and the file does
+// not mark another as main, or there is only one.
+func TestTheMainSoundTrackIsNotTheFirst(t *testing.T) {
+	// What MKVToolNix makes when someone sets the default language without
+	// reordering: Japanese first, English marked as the main track.
+	m := Media{Probed: true, Container: "matroska", Video: []Track{{Codec: "h264", BitDepth: 8}},
+		Audio: []Track{{Codec: "aac", Language: "jpn"}, {Codec: "aac", Language: "eng", Default: true}}}
+	for _, track := range []int{-1, 0, 1} {
+		want := track
+		if track < 0 {
+			want = 1 // the one the file marks as main
+		}
+		p := Decide(m, devices["chrome"], track)
+		if p.Method != Remux || !p.AudioCopy || p.AudioTrack != want || !strings.Contains(strings.Join(p.Reasons, " "), "sound track") {
+			t.Errorf("asking for track %d: %+v; want it repackaged with track %d and a reason that names the sound tracks", track, p, want)
+		}
+	}
+	// Where the file cannot be repackaged, it is still sent rather than
+	// refused: it plays, with the track the browser picks.
+	if p := Decide(m, devices["old-tv"], -1); p.Method != None {
+		t.Errorf("an MKV on a device that opens only MP4: %+v", p)
+	}
+	mp4 := m
+	mp4.Container = "mp4"
+	if p := Decide(mp4, devices["old-tv"], -1); p.Method != Direct || p.Playable != Yes || len(p.Reasons) != 0 || p.AudioTrack != 1 {
+		t.Errorf("a device that cannot take repackaged video: %+v; want the original sent", p)
+	}
+	webm := Media{Probed: true, Container: "webm", Video: []Track{{Codec: "vp9", BitDepth: 8}},
+		Audio: []Track{{Codec: "opus"}, {Codec: "opus", Default: true}}}
+	if p := Decide(webm, devices["chrome"], -1); p.Method != Direct || p.Playable != Yes || len(p.Reasons) != 0 {
+		t.Errorf("a picture that cannot be repackaged: %+v; want the original sent", p)
+	}
+	// But a track the viewer asked for by hand is not quietly swapped.
+	if p := Decide(webm, devices["chrome"], 0); p.Method != None {
+		t.Errorf("asking for the other track of a file that cannot be repackaged: %+v", p)
+	}
+
+	// No doubt, no repackaging: one track, whatever it is marked as; and
+	// several with the first as the main one or none marked at all.
+	for name, audio := range map[string][]Track{
+		"one track, not marked":         {{Codec: "aac"}},
+		"two tracks, the first is main": {{Codec: "aac", Default: true}, {Codec: "aac"}},
+		"two tracks, none marked":       {{Codec: "aac"}, {Codec: "aac"}},
+		"two tracks, both marked":       {{Codec: "aac", Default: true}, {Codec: "aac", Default: true}},
+	} {
+		m.Audio = audio
+		if p := Decide(m, devices["chrome"], -1); p.Method != Direct || p.AudioTrack != 0 || len(p.Reasons) != 0 {
+			t.Errorf("%s: %+v; want the original sent with its first track", name, p)
+		}
 	}
 }
