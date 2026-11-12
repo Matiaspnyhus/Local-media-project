@@ -125,15 +125,24 @@ func TestDecide(t *testing.T) {
 	}
 }
 
-// Every combination of package, picture, sound and device must obey the
-// rules below, whatever the answer is. This is where most of the cases are.
-func TestDecideRulesHoldForEveryCombination(t *testing.T) {
-	containers := []string{"mp4", "mov", "matroska", "webm", "avi", "mpegts"}
-	videos := []struct {
+// The packages, pictures and sounds that M3's table of combinations was
+// built from. With the five devices they make 1,890 combinations. The
+// table has since grown by size, colour, subtitles and surface (see
+// TestRulesHoldForEveryCombination in convert_test.go).
+var (
+	oldContainers = []string{"mp4", "mov", "matroska", "webm", "avi", "mpegts"}
+	oldVideos     = []struct {
 		codec string
 		depth int
 	}{{"h264", 8}, {"h264", 10}, {"hevc", 8}, {"hevc", 10}, {"av1", 8}, {"vp9", 8}, {"mpeg4", 8}}
-	audios := []string{"", "aac", "ac3", "eac3", "dts", "truehd", "flac", "opus", "mp3"}
+	oldAudios = []string{"", "aac", "ac3", "eac3", "dts", "truehd", "flac", "opus", "mp3"}
+)
+
+// Every combination of package, picture, sound and device must obey the
+// rules below, whatever the answer is. This is M3's table, for a PC that
+// cannot convert pictures.
+func TestDecideRulesHoldForEveryCombination(t *testing.T) {
+	containers, videos, audios := oldContainers, oldVideos, oldAudios
 	n := 0
 	for dname, dev := range devices {
 		for _, cont := range containers {

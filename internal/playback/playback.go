@@ -3,15 +3,20 @@
 // can play and what the viewer wants go in; a decision with reasons in
 // plain words comes out.
 //
-// There are four possible answers, tried in this order because each costs
+// There are five possible answers, tried in this order because each costs
 // more than the one before:
 //
 //	direct   send the original file as it is
 //	remux    repackage it without touching picture or sound (no quality
 //	         loss, almost no work for the PC)
 //	audio    repackage it and convert only the sound
-//	none     this device cannot play it until the picture is converted too,
-//	         which arrives in M4
+//	convert  convert the picture too, to H.264 in normal colour, at a size
+//	         and effort this PC can keep up with (see convert.go)
+//	none     it cannot be played on this device from this PC, and the
+//	         reasons say why
+//
+// When something goes wrong while a film plays, StepDown says what to
+// change and what to remember (see stepdown.go).
 package playback
 
 import "strings"
@@ -20,7 +25,9 @@ import "strings"
 // containers "mp4", "matroska", "webm", "mov"; codecs "h264", "hevc", "ac3".
 // "hevc10" stands for 10-bit HEVC, which many devices that play HEVC cannot,
 // and "h264-10" for 10-bit H.264. "hevc-hev1" says the device plays HEVC
-// under the label "hev1" as well as "hvc1" (see Decide).
+// under the label "hev1" as well as "hvc1" (see DecideFor). "dovi5" says it
+// shows Dolby Vision profile 5, which looks green and purple on a device
+// that plays it as ordinary HEVC.
 type Caps struct {
 	Containers map[string]bool `json:"containers"`
 	Video      map[string]bool `json:"video"`
@@ -28,6 +35,25 @@ type Caps struct {
 	// HLS says the device can play repackaged video (the chunked format
 	// phones and browsers accept), natively or through the page's player.
 	HLS bool `json:"hls"`
+	// Tall says, under the same keys as Video, that the device plays that
+	// format smoothly when the picture is larger than 1080p (4K). A format
+	// that is not listed is played up to 1080p only.
+	Tall map[string]bool `json:"tall"`
+	// PageFullscreen says the page itself can fill the screen, so whatever
+	// the page draws over the film is still there in fullscreen. It is
+	// false on an iPhone, where only the video can: there the film leaves
+	// the page for the phone's own player and takes nothing drawn with it.
+	PageFullscreen bool `json:"pageFullscreen"`
+	// Draw says which subtitles the page can draw over the film itself.
+	Draw Drawing `json:"draw"`
+}
+
+// Drawing names the two kinds of subtitle that are not plain text: styled
+// ones (with their own fonts, colours and positions) and ones stored as
+// pictures.
+type Drawing struct {
+	Styled  bool `json:"styled"`
+	Picture bool `json:"picture"`
 }
 
 // Track is one video, audio or subtitle track of a file.
@@ -44,7 +70,25 @@ type Track struct {
 	HearingImpaired bool
 	Language        string
 	Title           string
+	// Width and Height are the picture's size in pixels, and FrameRate how
+	// many pictures it shows a second; 0 where not read.
+	Width, Height int
+	FrameRate     float64
+	// Transfer says how the picture stores brightness: SDR (normal
+	// colour), PQ or HLG (the two kinds of HDR). "" counts as SDR.
+	Transfer string
+	// DoVi is the picture's Dolby Vision profile number, 0 for none. Only
+	// profile 5 matters here: the others carry a picture that plays as
+	// ordinary HDR or normal colour on a device without Dolby Vision.
+	DoVi int
 }
+
+// How a picture stores brightness (Track.Transfer).
+const (
+	SDR = "sdr"
+	PQ  = "pq"
+	HLG = "hlg"
+)
 
 // Media is what is known about a file.
 type Media struct {
@@ -52,6 +96,12 @@ type Media struct {
 	Container string
 	Video     []Track
 	Audio     []Track
+	// Subtitles are the subtitles a viewer could switch on, inside the
+	// file and beside it. Want.Subtitle counts into this list.
+	Subtitles []Subtitle
+	// BitRate is how many bits the whole file spends on a second of film;
+	// 0 where not known. Only a lesson about a slow connection asks.
+	BitRate int
 }
 
 // Answer says whether a device can play a file today.
@@ -67,10 +117,11 @@ const (
 type Method string
 
 const (
-	Direct Method = "direct"
-	Remux  Method = "remux"
-	Audio  Method = "audio"
-	None   Method = "none"
+	Direct  Method = "direct"
+	Remux   Method = "remux"
+	Audio   Method = "audio"
+	Convert Method = "convert"
+	None    Method = "none"
 )
 
 // Plan is a decision and why.
@@ -89,6 +140,21 @@ type Plan struct {
 	// DeviceUnknown says the answer is "unknown" because the device has not
 	// said what it can play, not because the file has not been inspected.
 	DeviceUnknown bool `json:"deviceUnknown"`
+	// Video says what the picture is converted to. It is empty unless the
+	// method is convert.
+	Video Video `json:"video"`
+	// Subtitles says how the chosen subtitles reach the viewer, and
+	// SubtitleKind what kind they are ("" when none are shown).
+	Subtitles    SubtitleMode `json:"subtitles"`
+	SubtitleKind SubtitleKind `json:"subtitleKind"`
+	// Lost says in plain words what the viewer does not get compared with
+	// the original: a smaller picture, normal colour in place of HDR,
+	// stereo in place of surround. Empty when nothing is lost.
+	Lost []string `json:"lost"`
+	// Picture is the kind of picture the device is asked to show: the
+	// film's own for direct, remux and audio, the converted one for
+	// convert. StepDown needs it when the device turns out not to manage.
+	Picture PictureKind `json:"picture"`
 }
 
 // packaged lists what the repackaged format can carry. Anything else in a
@@ -98,56 +164,110 @@ var (
 	packagedAudio = map[string]bool{"aac": true, "ac3": true, "eac3": true}
 )
 
-// Decide chooses how to play a file. audioTrack is the sound track the
-// viewer wants, counted from 0, or -1 for the file's own main track (see
-// BrowserAudio).
+// Decide chooses how to play a file where pictures cannot be converted and
+// no subtitles are asked for. audioTrack is the sound track the viewer
+// wants, counted from 0, or -1 for the file's own main track (see
+// BrowserAudio). It is DecideFor with nothing more wanted and no limits
+// given, and it answers exactly as it did before pictures could be
+// converted (TestWithoutConversionNothingChanged holds it to that).
 func Decide(m Media, c *Caps, audioTrack int) Plan {
+	return DecideFor(m, c, Want{Audio: audioTrack, Subtitle: -1}, Limits{})
+}
+
+// DecideFor chooses how to play a file: m is the file, c what the device
+// says it plays, w what the viewer wants, and l what this PC can do and
+// what earlier trouble has taught (see Want and Limits).
+//
+// The original is sent whenever it would play, and repackaged when that is
+// all it takes. The picture is converted only when nothing less will do:
+// the device cannot show the film's own picture, the subtitles have to be
+// put into it, or a lighter picture was asked for.
+func DecideFor(m Media, c *Caps, w Want, l Limits) Plan {
+	sub := wanted(m, w)
 	if !m.Probed {
 		// Nothing is known: send the file and let the player find out.
-		return Plan{Playable: Unknown, Method: Direct, HasAudio: true, AudioTrack: -1, Reasons: []string{}}
+		return blind(Plan{Playable: Unknown, Method: Direct, HasAudio: true, AudioTrack: -1}, sub, w)
 	}
-	p := Plan{Playable: Yes, Method: Direct, HasAudio: len(m.Audio) > 0, AudioTrack: -1, Reasons: []string{}}
+	hasAudio := len(m.Audio) > 0
 	if len(m.Video) == 0 {
-		return Plan{Playable: No, Method: None, HasAudio: p.HasAudio, AudioTrack: -1, Reasons: []string{"This file has no picture track."}}
+		return refuse(Plan{HasAudio: hasAudio, AudioTrack: -1}, []string{"This file has no picture track."})
 	}
 	if c == nil || c.Containers == nil {
-		p.Playable, p.DeviceUnknown = Unknown, true
-		return p
+		return blind(Plan{Playable: Unknown, Method: Direct, HasAudio: hasAudio, AudioTrack: -1, DeviceUnknown: true,
+			Picture: pictureOf(m.Video[0])}, sub, w)
 	}
+	mode := showing(sub, c, w)
+	p := decide(m, c, w, l, sub, mode)
+	if p.Playable == No && mode == SubsBurn && kindOf(sub) == StyledSubs {
+		// The design cannot be put into the picture here. If that is all
+		// that stands in the way, the words alone are worth more than no
+		// film. (Subtitles stored as pictures have no words to fall back
+		// on: there the answer stays no, and says why.)
+		if q := decide(m, c, w, l, sub, SubsTrack); q.Playable != No {
+			q.Lost = append(q.Lost, lostDesign)
+			return q
+		}
+	}
+	return p
+}
+
+// decide is DecideFor once the file and the device are known and the way
+// the subtitles are shown is settled.
+func decide(m Media, c *Caps, w Want, l Limits, sub *Subtitle, mode SubtitleMode) Plan {
+	v := m.Video[0]
+	key := videoKey(v.Codec, v.BitDepth)
 	natural := BrowserAudio(m.Audio)
+	audioTrack := w.Audio
 	if audioTrack < 0 || audioTrack >= len(m.Audio) {
 		audioTrack = natural
-	}
-	p.AudioTrack = audioTrack
-
-	v := m.Video[0]
-	key := v.Codec
-	if v.Codec == "hevc" && v.BitDepth > 8 {
-		key = "hevc10"
-	}
-	if v.Codec == "h264" && v.BitDepth > 8 {
-		key = "h264-10"
-	}
-	if !c.Video[key] {
-		return Plan{Playable: No, Method: None, HasAudio: p.HasAudio, AudioTrack: audioTrack,
-			Reasons: []string{"Its picture is " + VideoName(v) + ", which this browser cannot play. Converting the picture arrives in a later version."}}
 	}
 	var a *Track
 	if audioTrack >= 0 {
 		a = &m.Audio[audioTrack]
 	}
+	p := Plan{Playable: Yes, Method: Direct, HasAudio: len(m.Audio) > 0, AudioTrack: audioTrack, Reasons: []string{},
+		Subtitles: mode, Lost: []string{}, Picture: pictureOf(v)}
+	if sub != nil {
+		p.SubtitleKind = kindOf(sub)
+	}
+
+	// First, what keeps the film's own picture from being shown on this
+	// device at all. Each of these means the picture has to be converted.
+	var picture []string
+	lacks := !c.Video[key]
+	switch {
+	case lacks:
+		picture = append(picture, "Its picture is "+VideoName(v)+", which this browser cannot play.")
+	case sizeOf(v.Width, v.Height) == Size4K && !c.Tall[key]:
+		picture = append(picture, "Its picture is "+sizeWord(v.Width, v.Height)+", which this device does not say it plays smoothly.")
+	}
+	if v.DoVi == 5 && !lacks && !c.Video["dovi5"] {
+		picture = append(picture, "Its picture is Dolby Vision (profile 5), which this device cannot show in the right colours.")
+	}
+	if mode == SubsBurn {
+		picture = append(picture, burnReason(sub, c))
+	}
+	if w.Lower > 0 {
+		picture = append(picture, "A lighter picture was asked for.")
+	}
+
+	// Second, what keeps the original file from simply being sent although
+	// the device could show its picture.
+	var other []string
 	if !c.Containers[m.Container] {
-		p.Reasons = append(p.Reasons, "It is packaged as "+containerName(m.Container)+", which this browser cannot open.")
+		other = append(other, "It is packaged as "+containerName(m.Container)+", which this browser cannot open.")
 	}
 	if a != nil && !c.Audio[a.Codec] {
-		p.Reasons = append(p.Reasons, "Its sound is "+AudioName(a.Codec)+", which this browser cannot play.")
+		other = append(other, "Its sound is "+AudioName(a.Codec)+", which this browser cannot play.")
 	}
 	// HEVC in an MP4 or MOV carries one of two labels. Apple devices play
 	// "hvc1" and refuse "hev1", which ffmpeg and many encoders write. The
 	// repackaged stream is always labelled "hvc1" (see package hls), so
 	// unless the device says it plays "hev1" too, that is the way to go.
+	label := ""
 	if v.Codec == "hevc" && v.Tag == "hev1" && (m.Container == "mp4" || m.Container == "mov") && !c.Video["hevc-hev1"] {
-		p.Reasons = append(p.Reasons, `Its HEVC picture carries the label "hev1", which this device does not say it plays (Apple devices want "hvc1"). Repackaging puts the other label on it and leaves the picture itself untouched.`)
+		label = `Its HEVC picture carries the label "hev1", which this device does not say it plays (Apple devices want "hvc1"). Repackaging puts the other label on it and leaves the picture itself untouched.`
+		other = append(other, label)
 	}
 	copyable := a == nil || (c.Audio[a.Codec] && packagedAudio[a.Codec])
 	// Which sound track a browser plays when simply handed a file is only
@@ -155,42 +275,90 @@ func Decide(m Media, c *Caps, audioTrack int) Plan {
 	// no other is marked as the main one (see BrowserAudio). Repackaging
 	// names the track, so in any other case that is the way to be sure.
 	inDoubt := len(m.Audio) > 1 && (audioTrack != 0 || natural != 0)
-	if inDoubt && audioTrack == natural && len(p.Reasons) == 0 && !(c.HLS && packagedVideo[v.Codec] && (copyable || c.Audio["aac"])) {
+	if inDoubt && audioTrack == natural && len(other) == 0 && !(c.HLS && packagedVideo[v.Codec] && (copyable || c.Audio["aac"])) {
 		// Nothing else is wrong and repackaging is not possible here: the
 		// file plays as it is, with whichever track the browser picks.
 		inDoubt = false
 	}
 	switch {
 	case inDoubt && natural != 0:
-		p.Reasons = append(p.Reasons, "The sound track this file marks as its main one is not its first, and browsers differ in which of the two they play by themselves.")
+		other = append(other, "The sound track this file marks as its main one is not its first, and browsers differ in which of the two they play by themselves.")
 	case inDoubt:
-		p.Reasons = append(p.Reasons, "You chose a sound track other than the one a browser plays by itself.")
+		other = append(other, "You chose a sound track other than the one a browser plays by itself.")
 	}
-	if len(p.Reasons) == 0 {
-		p.AudioCopy = true
-		return p
-	}
-	// The original cannot simply be sent. Can it be repackaged?
-	if !c.HLS {
-		p.Playable, p.Method = No, None
-		p.Reasons = append(p.Reasons, "This browser cannot play repackaged video either.")
-		return p
-	}
-	if !packagedVideo[v.Codec] {
-		return Plan{Playable: No, Method: None, HasAudio: p.HasAudio, AudioTrack: audioTrack,
-			Reasons: append(p.Reasons, "Its picture ("+VideoName(v)+") cannot be repackaged without converting it, which arrives in a later version.")}
-	}
-	p.Method = Remux
-	p.AudioCopy = copyable
-	if !p.AudioCopy {
-		if !c.Audio["aac"] {
-			p.Playable, p.Method = No, None
-			p.Reasons = append(p.Reasons, "This browser reports no sound format the sound could be converted to.")
-			return p
+
+	// The reasons a converted film is given: why its picture is converted,
+	// then whatever else is in the way. The sentence about the label is
+	// left out, since it promises an untouched picture.
+	why := func(more ...string) []string {
+		out := append([]string{}, picture...)
+		for _, r := range other {
+			if r != label {
+				out = append(out, r)
+			}
 		}
-		p.Method = Audio
+		return append(out, more...)
 	}
-	return p
+
+	if len(picture) == 0 {
+		// The device can show the picture as it is. What follows, down to
+		// the end of this block, was decided this way before pictures
+		// could be converted, and each sentence is still M3's.
+		if len(other) == 0 {
+			p.AudioCopy = true
+			return advised(p, why(), m, a, c, w, l)
+		}
+		// The original cannot simply be sent. Can it be repackaged?
+		if !c.HLS {
+			return refuse(p, append(other, "This browser cannot play repackaged video either."))
+		}
+		if packagedVideo[v.Codec] {
+			p.Reasons, p.Method, p.AudioCopy = other, Remux, copyable
+			if !copyable {
+				if !c.Audio["aac"] {
+					return refuse(p, append(other, "This browser reports no sound format the sound could be converted to."))
+				}
+				p.Method = Audio
+				if a.Channels > 2 {
+					p.Lost = append(p.Lost, lostSurround)
+				}
+			}
+			return advised(p, why(), m, a, c, w, l)
+		}
+		if !l.Convert {
+			return refuse(p, append(other, "Its picture ("+VideoName(v)+") cannot be repackaged without converting it, which arrives in a later version."))
+		}
+		return converted(p, why("Its picture ("+VideoName(v)+") cannot be repackaged without converting it."), m, a, c, w, l)
+	}
+
+	// The picture has to be converted. Can this PC do that?
+	if !l.Convert {
+		if lacks {
+			// M3's answer and M3's words, kept while Decide stands in for
+			// a PC without picture conversion.
+			return refuse(p, []string{"Its picture is " + VideoName(v) + ", which this browser cannot play. Converting the picture arrives in a later version."})
+		}
+		return refuse(p, why("This PC cannot convert pictures."))
+	}
+	return converted(p, why(), m, a, c, w, l)
+}
+
+// refuse is the answer "this cannot be played here", with the reasons.
+func refuse(p Plan, reasons []string) Plan {
+	return Plan{Playable: No, Method: None, HasAudio: p.HasAudio, AudioTrack: p.AudioTrack, Reasons: reasons,
+		Subtitles: SubsNone, Lost: []string{}}
+}
+
+// videoKey is the name a picture format goes by in Caps.Video and
+// Caps.Tall.
+func videoKey(codec string, bitDepth int) string {
+	if codec == "hevc" && bitDepth > 8 {
+		return "hevc10"
+	}
+	if codec == "h264" && bitDepth > 8 {
+		return "h264-10"
+	}
+	return codec
 }
 
 // BrowserAudio is the file's own main sound track: the first one flagged
@@ -310,6 +478,20 @@ func (p Plan) Explain() string {
 		return "Repackaging the file as it plays. Picture and sound are untouched, so nothing is lost, and it costs the PC almost nothing."
 	case Audio:
 		return "Repackaging the file and converting its sound as it plays. The picture is untouched; the sound becomes stereo AAC."
+	case Convert:
+		s := "Converting the picture as it plays"
+		if p.Subtitles == SubsBurn {
+			s += ", with the subtitles put into it"
+		}
+		s += ", which is heavy work for the PC."
+		switch {
+		case !p.HasAudio:
+		case p.AudioCopy:
+			s += " The sound is untouched."
+		default:
+			s += " The sound becomes stereo AAC."
+		}
+		return s
 	}
 	return "This browser cannot play this file yet."
 }

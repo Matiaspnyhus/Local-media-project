@@ -51,6 +51,10 @@ type Subtitle struct {
 	HearingImpaired bool
 	Default         bool
 	Title           string
+	// Kind says what the subtitle is made of: plain text, styled text, or
+	// pictures. "" counts as text. It settles how the subtitle can be
+	// shown (see DecideFor).
+	Kind SubtitleKind
 }
 
 // Choice is which tracks to start with: indexes into the lists given, -1
