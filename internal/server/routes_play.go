@@ -239,10 +239,12 @@ const playedFile = ` FROM items i JOIN versions v ON v.item_id=i.id JOIN files f
 // handleChoice remembers the sound and subtitles a viewer picked, so the
 // same film, and the next episode of a show, start the same way.
 //
-// The page says which tracks were picked (audioIndex and subKey). What is
-// kept of them, their language and kind, is read from the server's own
-// record of the file. A page loaded before those two were added sends only
-// two languages and whether subtitles were on, which is kept as it comes.
+// The page says which sound track is playing and which subtitle is showing
+// (audioIndex and subKey), whichever of the two the viewer just changed.
+// What is kept of them, their language and kind, is read from the server's
+// own record of the file. A page loaded before those two were added sends
+// only two languages and whether subtitles were on, which is kept as it
+// comes.
 func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 	itemID := chi.URLParam(r, "id")
 	var in struct {
@@ -276,7 +278,10 @@ func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 				// A pick the file does not have (it changed meanwhile) is
 				// not kept as one; the languages sent with it still are.
 				if m, ok := playback.Remember(ft.media.Audio, ft.subs, *in.AudioIndex, *in.SubKey); ok {
-					mem = m
+					// A subtitle sent along with a change of sound is the one
+					// the app itself had showing, not a pick (see AfterPick).
+					u := currentUser(r).ID
+					mem = playback.AfterPick(ft.media.Audio, ft.subs, s.loadPrefs(u), s.loadMemory(u, scope), m)
 				}
 			}
 		}
@@ -313,7 +318,9 @@ func (s *Server) loadMemory(userID, scope string) *playback.Memory {
 		return nil
 	}
 	m.SubsOn, m.Commentary = on != 0, audioKind == "commentary"
-	if m.SubKind != "" {
+	// A record from an earlier version has neither a kind nor a track. One
+	// with a track and no kind is such a record after a pick of sound alone.
+	if m.SubKind != "" || audioIndex >= 0 {
 		m.Pick = &playback.Pick{Audio: audioIndex, Subtitle: subKey}
 	}
 	return &m
@@ -604,16 +611,41 @@ func (s *Server) noteConversion(token, path string) {
 // bundle. ffmpeg names a file it cannot open by its full path, and on the
 // owner's PC that path holds their account name, or the name or address of
 // their network drive. The file's own name stays, because it says which
-// film had the problem. The data folder, which is under the account's name
-// too, becomes a placeholder.
+// film had the problem. The data folder and the folder the program was
+// installed in, with ffmpeg and ffprobe beside it, are under the account's
+// name too, and each becomes a placeholder.
 func (s *Server) pathless(text string) string {
 	s.convMu.Lock()
 	for _, p := range s.converting {
 		text = strings.ReplaceAll(text, p, filepath.Base(p))
 	}
 	s.convMu.Unlock()
-	if dir := filepath.Clean(s.dataDir); len(dir) > 1 {
-		text = strings.ReplaceAll(text, dir, "[data folder]")
+	if s.dataDir != "" {
+		if dir, err := filepath.Abs(s.dataDir); err == nil {
+			text = hideFolder(text, dir, "[data folder]")
+		}
+	}
+	for _, program := range []string{s.ffmpeg, s.ffprobe} {
+		if program != "" {
+			text = hideFolder(text, filepath.Dir(program), "[program folder]")
+		}
+	}
+	return text
+}
+
+// hideFolder puts a placeholder wherever text names a folder by its full
+// path. The path is looked for as it is and as Go writes it inside quotes
+// ("C:\\Users\\..."), which some errors do with the name of a program they
+// could not find. Anything but a full path is left alone: a folder given
+// as "data" is also an ordinary word.
+func hideFolder(text, dir, placeholder string) string {
+	dir = filepath.Clean(dir)
+	if !filepath.IsAbs(dir) || filepath.Dir(dir) == dir {
+		return text
+	}
+	text = strings.ReplaceAll(text, dir, placeholder)
+	if quoted := strconv.Quote(dir); quoted != `"`+dir+`"` {
+		text = strings.ReplaceAll(text, quoted[1:len(quoted)-1], placeholder)
 	}
 	return text
 }

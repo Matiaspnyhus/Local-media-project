@@ -144,6 +144,37 @@ func TestWhatADeviceCanPlayIsRememberedAcrossARestart(t *testing.T) {
 	}
 }
 
+// When the report cannot be written to the database (the disk is full, the
+// data folder cannot be written), it must still be used for as long as the
+// program runs. Thrown away, every film would be "unknown" for that visit
+// and sent as it is: Dolby films silent, MKV not opening on a phone.
+func TestADeviceReportThatCannotBeStoredIsStillUsed(t *testing.T) {
+	r := newRestartEnv(t)
+	c := r.setup()
+	r.inspected(c)
+	// A stand-in for a disk that is full: every write to this table fails.
+	if _, err := r.s.db.Exec(`CREATE TRIGGER disk_full BEFORE INSERT ON device_reports BEGIN SELECT RAISE(FAIL, 'database or disk is full'); END`); err != nil {
+		t.Fatal(err)
+	}
+	// A phone, as in the test above: the honest answer for this film is "no".
+	w := r.do("POST", "/api/capabilities", remote, c, map[string]any{"containers": map[string]bool{"mp4": true}, "video": map[string]bool{"h264": true},
+		"audio": map[string]bool{"aac": true, "ac3": true}, "hls": true})
+	if w.Code != 200 {
+		t.Errorf("the report answered %d %s; the page can do nothing about the PC's disk", w.Code, w.Body)
+	}
+	var list struct{ Items []itemView }
+	decode(t, r.do("GET", "/api/movies", remote, c, nil), &list)
+	if len(list.Items) != 1 || list.Items[0].Playable != "no" {
+		t.Errorf("after a report that could not be stored the list says %+v; want playable=no, as the report implies", list.Items)
+	}
+	var n int
+	r.s.db.QueryRow(`SELECT count(*) FROM device_reports`).Scan(&n)
+	log, _ := os.ReadFile(filepath.Join(r.data, "logs", "localmedia.log"))
+	if n != 0 || strings.Count(string(log), "could not be stored") != 1 {
+		t.Errorf("%d reports stored, and the log says:\n%s\nwant none stored and one line saying so", n, log)
+	}
+}
+
 // A sign-in whose device has not reported yet is told so, not that the
 // file has not been inspected.
 func TestPlayingBeforeTheDeviceHasReported(t *testing.T) {

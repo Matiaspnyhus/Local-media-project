@@ -95,7 +95,8 @@ func (s *Server) rememberCaps(sessionID string, c *playback.Caps) {
 // measures it once per visit; nothing is guessed from the browser's name
 // except the corrections below. What is kept is the report as it came: the
 // corrections are applied each time it is read, so a later version of the
-// program can correct differently.
+// program can correct differently. A report that cannot be written to the
+// database is still kept in memory.
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	var c playback.Caps
 	if !readJSON(w, r, &c) {
@@ -107,20 +108,22 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	}
 	u := currentUser(r)
 	userAgent := clip(r.UserAgent(), 300)
-	raw, err := json.Marshal(c)
+	raw, err := json.Marshal(c) // as it came, before the corrections
+	applyOverrides(&c, userAgent)
+	s.capsMu.Lock()
+	s.rememberCaps(u.SessionID, &c)
+	s.capsMu.Unlock()
+	// The report is in use from here on, whatever becomes of the write
+	// below, which may have to wait its turn or may fail (a full disk).
 	if err == nil {
 		_, err = s.db.Exec(`INSERT INTO device_reports(session_id,caps,user_agent,updated_at) VALUES(?,?,?,?)
 			ON CONFLICT(session_id) DO UPDATE SET caps=excluded.caps, user_agent=excluded.user_agent, updated_at=excluded.updated_at`,
 			u.SessionID, string(raw), userAgent, time.Now().Unix())
 	}
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not save what this device can play.")
-		return
+		// The page could do nothing about an error, so it is not sent one.
+		s.log.Printf("what a device can play could not be stored, so it is kept only until the program next starts: %s", s.pathless(err.Error()))
 	}
-	applyOverrides(&c, userAgent)
-	s.capsMu.Lock()
-	s.rememberCaps(u.SessionID, &c)
-	s.capsMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

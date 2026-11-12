@@ -26,8 +26,10 @@ type Memory struct {
 	Commentary bool
 	// SubKind is the kind of subtitle picked: "full", "described" (with
 	// sounds described, for the hard of hearing), "forced" or "off". It is
-	// "" on a record that holds only the languages and SubsOn, as an
-	// earlier version kept them.
+	// "untouched" when the viewer has picked a sound track and never the
+	// subtitles, which then go by their preferences as if nothing were
+	// remembered (see AfterPick). It is "" on a record that holds only the
+	// languages and SubsOn, as an earlier version kept them.
 	SubKind string
 	// Pick is the very tracks that were picked, nil when not recorded.
 	Pick *Pick
@@ -75,6 +77,9 @@ type Choice struct {
 // "auto", when the sound is not in the viewer's language.
 func Choose(audio []Track, subs []Subtitle, prefs Prefs, mem *Memory) Choice {
 	c := Choice{Audio: pickAudio(audio, prefs, mem), Subtitle: -1}
+	if mem != nil && mem.SubKind == "untouched" {
+		mem = nil // only a sound track was ever picked: nothing is remembered about subtitles
+	}
 	mode := prefs.Subs
 	if mode == "" {
 		mode = "auto"
@@ -164,6 +169,46 @@ func Remember(audio []Track, subs []Subtitle, audioIndex int, subKey string) (m 
 		return m, true
 	}
 	return Memory{}, false
+}
+
+// AfterPick is what to keep once a viewer has made a pick (see Remember),
+// given their preferences and what was kept before it (nil for nothing).
+//
+// The page sends the sound track and the subtitle that is showing with
+// every pick, and most picks change only one of the two. When only the
+// sound was changed, the subtitle is whatever the app itself had switched
+// on, or nothing. Kept as if the viewer had asked for it, that would make
+// a rule for the whole show out of something they never touched: "off"
+// hides the foreign lines' subtitles of every later episode, and "forced"
+// hides the full ones from a viewer who always wants them.
+//
+// So a subtitle counts as picked only when it is not what the app would
+// have started this file with by itself, going by what was kept before or
+// with the sound track just picked. Otherwise the pick is kept as a pick
+// of sound alone, and what was kept about subtitles stays as it was.
+func AfterPick(audio []Track, subs []Subtitle, prefs Prefs, before *Memory, pick Memory) Memory {
+	if pick.Pick == nil {
+		return pick
+	}
+	soundOnly := pick
+	soundOnly.SubLang, soundOnly.SubsOn, soundOnly.SubKind = "", false, "untouched"
+	soundOnly.Pick = &Pick{Audio: pick.Pick.Audio}
+	if before != nil {
+		soundOnly.SubLang, soundOnly.SubsOn, soundOnly.SubKind = before.SubLang, before.SubsOn, before.SubKind
+		if before.Pick != nil {
+			soundOnly.Pick.Subtitle = before.Pick.Subtitle
+		}
+	}
+	for _, mem := range []*Memory{before, &soundOnly} {
+		own := ""
+		if i := Choose(audio, subs, prefs, mem).Subtitle; i >= 0 {
+			own = subs[i].Key
+		}
+		if own == pick.Pick.Subtitle {
+			return soundOnly
+		}
+	}
+	return pick
 }
 
 func isDescription(t Track) bool {

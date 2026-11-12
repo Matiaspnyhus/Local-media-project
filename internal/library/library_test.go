@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -303,48 +304,62 @@ func TestProbePendingStoresTracksOnce(t *testing.T) {
 	}
 }
 
-// A file named .webm is stored as WebM, not as MKV (ffprobe has one name
-// for both). And a file an earlier version stored as MKV, which the
-// upgrade marked with a size that cannot match, is inspected again.
+// A WebM file is stored as WebM, not as MKV (ffprobe has one name for
+// both), and a file that is only named .webm is not. And a file an earlier
+// version stored as MKV, which the upgrade marked with a size that cannot
+// match, is inspected again.
 func TestWebMIsStoredAsWebMAndMarkedFilesAreInspectedAgain(t *testing.T) {
-	ff := probe.Find()
-	if ff == "" {
+	ff, ffmpeg := probe.Find(), probe.FindFFmpeg()
+	if ff == "" || ffmpeg == "" {
 		if os.Getenv("LM_REQUIRE_FFMPEG") != "" {
-			t.Fatal("ffprobe was not found, and LM_REQUIRE_FFMPEG says it must be")
+			t.Fatal("ffmpeg and ffprobe were not found, and LM_REQUIRE_FFMPEG says they must be")
 		}
-		t.Skip("ffprobe is not installed here")
+		t.Skip("ffmpeg and ffprobe are not installed here")
 	}
 	media := t.TempDir()
-	// Any Matroska file will do: what makes this one WebM is its name.
+	// A real WebM: VP8 picture, Opus sound.
+	if out, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12:duration=2", "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+		"-c:v", "libvpx", "-deadline", "realtime", "-cpu-used", "8", "-b:v", "100k", "-c:a", "libopus", "-b:a", "24k",
+		"-f", "webm", filepath.Join(media, "Web Clip.webm")).CombinedOutput(); err != nil {
+		if os.Getenv("LM_REQUIRE_FFMPEG") != "" {
+			t.Fatalf("ffmpeg could not make the WebM file: %v %s", err, out)
+		}
+		t.Skipf("this ffmpeg cannot make the WebM file: %v %s", err, out)
+	}
+	// An MKV with an H.264 picture that is only named .webm, as recorders
+	// name theirs.
 	src, err := os.ReadFile(filepath.Join("..", "..", "e2e", "fixtures", "Dolby.Sound.Test.mkv"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(media, "Web Clip.webm"), src, 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(media, "Recorder Clip.webm"), src, 0o644); err != nil {
 		t.Fatal(err)
 	}
 	d := open(t)
 	lib, _ := Add(d, media)
 	Scan(d, lib)
-	stored := func() (container string) {
-		d.QueryRow(`SELECT container FROM files`).Scan(&container)
-		return container
+	stored := func() string {
+		var real, named string
+		d.QueryRow(`SELECT container FROM files WHERE rel_path='Web Clip.webm'`).Scan(&real)
+		d.QueryRow(`SELECT container FROM files WHERE rel_path='Recorder Clip.webm'`).Scan(&named)
+		return real + " " + named
 	}
-	if res, err := ProbePending(context.Background(), d, ff); err != nil || res.Inspected != 1 || stored() != "webm" {
-		t.Fatalf("inspected %+v %v, stored as %q; want webm", res, err, stored())
+	if res, err := ProbePending(context.Background(), d, ff); err != nil || res.Inspected != 2 || stored() != "webm matroska" {
+		t.Fatalf("inspected %+v %v, stored as %q; want the real WebM as webm and the one only named so as matroska", res, err, stored())
 	}
-	// As an earlier version left it. Nothing looks at the file again...
+	// As an earlier version left them. Nothing looks at the files again...
 	d.Exec(`UPDATE files SET container='matroska'`)
-	if res, _ := ProbePending(context.Background(), d, ff); res.Inspected != 0 || stored() != "matroska" {
-		t.Fatalf("an unmarked file was inspected again: %+v", res)
+	if res, _ := ProbePending(context.Background(), d, ff); res.Inspected != 0 || stored() != "matroska matroska" {
+		t.Fatalf("unmarked files were inspected again: %+v", res)
 	}
-	// ...until the upgrade marks it.
+	// ...until the upgrade marks them.
 	d.Exec(`UPDATE files SET probed_size=-1`)
-	if res, err := ProbePending(context.Background(), d, ff); err != nil || res.Inspected != 1 || stored() != "webm" {
-		t.Fatalf("a marked file: inspected %+v %v, stored as %q; want webm", res, err, stored())
+	if res, err := ProbePending(context.Background(), d, ff); err != nil || res.Inspected != 2 || stored() != "webm matroska" {
+		t.Fatalf("marked files: inspected %+v %v, stored as %q; want webm and matroska", res, err, stored())
 	}
 	if res, _ := ProbePending(context.Background(), d, ff); res.Inspected != 0 {
-		t.Fatalf("it was inspected a third time: %+v", res)
+		t.Fatalf("they were inspected a third time: %+v", res)
 	}
 }
 

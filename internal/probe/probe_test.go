@@ -2,6 +2,8 @@ package probe
 
 import (
 	"context"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -40,9 +42,54 @@ func TestParse(t *testing.T) {
 	}
 }
 
+// A file is WebM by what is inside it, not by its name. Screen recorders,
+// and Chrome's own recorder, write H.264 into files named .webm; Firefox and
+// Safari play only VP8, VP9 and AV1 from a WebM, so such a file called WebM
+// would be sent to them as it is and not play.
+func TestAFileNamedWebMIsJudgedByWhatIsInside(t *testing.T) {
+	ffprobe, ffmpeg := Find(), FindFFmpeg()
+	if ffprobe == "" || ffmpeg == "" {
+		if os.Getenv("LM_REQUIRE_FFMPEG") != "" {
+			t.Fatal("ffmpeg and ffprobe were not found, and LM_REQUIRE_FFMPEG says they must be")
+		}
+		t.Skip("ffmpeg and ffprobe are not installed here")
+	}
+	dir := t.TempDir()
+	film := func(name string, codecs ...string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		args := append([]string{"-hide_banner", "-loglevel", "error", "-y",
+			"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12:duration=2", "-f", "lavfi", "-i", "sine=frequency=440:duration=2"}, codecs...)
+		if out, err := exec.Command(ffmpeg, append(args, path)...).CombinedOutput(); err != nil {
+			if os.Getenv("LM_REQUIRE_FFMPEG") != "" {
+				t.Fatalf("ffmpeg could not make %s: %v %s", name, err, out)
+			}
+			t.Skipf("this ffmpeg cannot make %s: %v %s", name, err, out)
+		}
+		return path
+	}
+	webm := []string{"-c:v", "libvpx", "-deadline", "realtime", "-cpu-used", "8", "-b:v", "100k", "-c:a", "libopus", "-b:a", "24k"}
+	for _, c := range []struct {
+		why, path, want string
+	}{
+		{"H.264 and Opus in a file named .webm, as a recorder writes it",
+			film("Recorder Clip (2018).webm", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p", "-c:a", "libopus", "-b:a", "24k", "-f", "matroska"), "matroska"},
+		{"a real WebM", film("Real Clip (2018).webm", append(webm, "-f", "webm")...), "webm"},
+		{"a real WebM named .mkv", film("Real Clip (2019).mkv", append(webm, "-f", "webm")...), "webm"},
+	} {
+		r, err := Run(context.Background(), ffprobe, c.path)
+		if err != nil {
+			t.Fatalf("%s: %v", c.why, err)
+		}
+		if r.Container != c.want {
+			t.Errorf("%s: stored as %q, want %q", c.why, r.Container, c.want)
+		}
+	}
+}
+
 // ffprobe gives MKV and WebM one name ("matroska,webm"). Browsers do not
 // treat them as one: Firefox and Safari play WebM and not MKV. So the two
-// are told apart here, by the file's name or by what is inside.
+// are told apart here, by what is inside the file.
 func TestWebMIsToldApartFromMKV(t *testing.T) {
 	file := func(name string, streams ...string) []byte {
 		list := ""
@@ -68,7 +115,8 @@ func TestWebMIsToldApartFromMKV(t *testing.T) {
 	}{
 		{"named .webm", file("Clip.webm", "vp9", "opus"), "webm"},
 		{"named .WEBM", file("CLIP.WEBM", "vp8", "vorbis"), "webm"},
-		{"named .webm, whatever is inside", file("Odd.webm", "h264", "aac"), "webm"},
+		{"named .webm, but not WebM inside", file("Odd.webm", "h264", "aac"), "matroska"},
+		{"named .webm, with H.264 as a browser's recorder writes it", file("Recorder.webm", "h264", "opus"), "matroska"},
 		{"an .mkv that holds only what WebM holds", file("Clip.mkv", "av1", "opus"), "webm"},
 		{"the same with WebM's own kind of subtitles", file("Clip.mkv", "vp9", "opus", "webvtt"), "webm"},
 		{"an ordinary .mkv", file("Film.mkv", "h264", "ac3"), "matroska"},

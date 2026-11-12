@@ -2,9 +2,13 @@ package server
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"testing/fstest"
+
+	"github.com/Matiaspnyhus/Local-media-project/internal/db"
 )
 
 // What a player reports is kept for the support bundle. It must leave the
@@ -89,6 +93,105 @@ func TestASubtitleThatCouldNotBeWrittenInFullIsNotKept(t *testing.T) {
 		t.Fatalf("after a good run the folder holds %v and %v, want one kept copy", kept, other)
 	}
 	whole("from the kept copy")
+}
+
+// The installer puts the program, with ffmpeg and ffprobe beside it, in a
+// folder under the owner's account name. When one of the two cannot be
+// started (an antivirus program removed it, or an update is half done) the
+// operating system's error names it by its full path. That folder must not
+// reach the log or the support bundle either.
+func TestAConverterThatCannotBeStartedLeavesNoFolderNamesInTheLogOrTheBundle(t *testing.T) {
+	program := filepath.Join(t.TempDir(), "Users", "Some Owner", "AppData", "Local", "Programs", "LocalMedia")
+	// Neither file is there: both have been taken away.
+	ffmpeg, ffprobe := filepath.Join(program, "ffmpeg.exe"), filepath.Join(program, "ffprobe.exe")
+	data, media := t.TempDir(), t.TempDir()
+	os.MkdirAll(filepath.Join(media, "Films"), 0o755)
+	os.WriteFile(filepath.Join(media, "Films", "Track Film (2019).mkv"), []byte("x"), 0o644)
+	d, err := db.Open(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.Close() })
+	s, err := New(Config{DB: d, DataDir: data, Version: "test", Port: 8177, Assets: fstest.MapFS{"index.html": {Data: []byte("<html>app</html>")}}, FFmpeg: ffmpeg})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	e := &env{t: t, s: s, media: media}
+	c := e.setup()
+	film := e.firstItem(c, "Track Film")
+	// The film was inspected while ffprobe was still there: H.264 picture
+	// and DTS sound, which a browser needs converted.
+	var fileID string
+	s.db.QueryRow(`SELECT f.id FROM files f JOIN versions v ON v.id=f.version_id WHERE v.item_id=?`, film).Scan(&fileID)
+	s.db.Exec(`UPDATE files SET probed=1, container='matroska', duration_ms=5400000 WHERE id=?`, fileID)
+	if _, err := s.db.Exec(`INSERT INTO streams(file_id,idx,kind,codec,bit_depth,is_default) VALUES(?,0,'video','h264',8,1),(?,1,'audio','dts',0,1)`, fileID, fileID); err != nil {
+		t.Fatal(err)
+	}
+	s.ffprobe = ffprobe
+	e.do("POST", "/api/capabilities", remote, c, map[string]any{"containers": map[string]bool{"mp4": true, "matroska": true},
+		"video": map[string]bool{"h264": true}, "audio": map[string]bool{"aac": true}, "hls": true})
+	var p playAnswer
+	decode(t, e.do("POST", "/api/items/"+film+"/play", remote, c, nil), &p)
+	if !strings.HasPrefix(p.URL, "/hls/") {
+		t.Fatalf("play: %+v", p)
+	}
+	if w := e.do("GET", strings.TrimSuffix(p.URL, "index.m3u8")+"seg-0.m4s", remote, nil, nil); w.Code != 500 {
+		t.Fatalf("a chunk, with no converter to make it, answered %d %s", w.Code, w.Body)
+	}
+
+	files := bundleFiles(t, e.do("GET", "/api/support-bundle", remote, c, nil))
+	onDisk, err := os.ReadFile(filepath.Join(data, "logs", "localmedia.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	files["the log on disk"] = string(onDisk)
+	// Both failures are still reported, and say which program it was.
+	if problems := files["playback-problems.json"]; !strings.Contains(problems, "convert-failed") || !strings.Contains(problems, "could not be started") || !strings.Contains(problems, "ffmpeg.exe") {
+		t.Errorf("the bundle does not say the converter could not be started: %s", problems)
+	}
+	if !strings.Contains(string(onDisk), "could not find where to cut Track Film (2019).mkv") || !strings.Contains(string(onDisk), "ffprobe.exe") {
+		t.Errorf("the log does not say the search for cuts failed for want of ffprobe:\n%s", onDisk)
+	}
+	for name, text := range files {
+		// The made-up account name catches the folder however the error
+		// wrote its path.
+		for _, bad := range []string{program, "Some Owner", data} {
+			if strings.Contains(text, bad) {
+				i := strings.Index(text, bad)
+				t.Errorf("%s contains %q: ...%s...", name, bad, text[max(0, i-100):min(len(text), i+100)])
+			}
+		}
+	}
+}
+
+// Only a full path is taken out of what is logged. A data folder given as
+// a short relative path ("--data data") is also an ordinary word, and
+// replacing it everywhere would garble the very lines someone has to read.
+func TestOnlyFullPathsAreTakenOutOfWhatIsLogged(t *testing.T) {
+	e := newEnv(t)
+	real := e.s.dataDir
+	e.s.dataDir = "data"
+	defer func() { e.s.dataDir = real }()
+	line := "Invalid data found when processing input; metadata was read from data/cache/chunks/x"
+	if got := e.s.pathless(line); got != line {
+		t.Errorf("with the data folder given as \"data\", a line was rewritten:\n%s\nbecame\n%s", line, got)
+	}
+	// The same folder by its full path is still taken out.
+	full, err := filepath.Abs("data")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := e.s.pathless("open " + filepath.Join(full, "cache", "x") + ": no such file"); strings.Contains(got, full) || !strings.Contains(got, "[data folder]") {
+		t.Errorf("the data folder's full path was left in: %s", got)
+	}
+	// So is a program folder the way Go writes it inside quotes, with each
+	// backslash doubled: some errors name a program they could not find so.
+	e.s.ffmpeg = filepath.Join(real, `Users\Some "Other" Owner`, "ffmpeg.exe")
+	quoted := (&exec.Error{Name: e.s.ffmpeg, Err: exec.ErrNotFound}).Error()
+	if got := e.s.pathless(quoted); strings.Contains(got, "Owner") || !strings.Contains(got, "[program folder]") {
+		t.Errorf("a quoted program path was left in:\n%s\nbecame\n%s", quoted, got)
+	}
 }
 
 // When the converter cannot open a film (its drive dropped out, or it was
