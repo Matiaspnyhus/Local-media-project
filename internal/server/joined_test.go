@@ -76,12 +76,28 @@ func TestAFileOfUnknownLengthIsNotRepackaged(t *testing.T) {
 	c := e.setup()
 	e.s.InspectNow()
 	film := e.firstItem(c, "Test Film")
-	e.s.db.Exec(`UPDATE files SET duration_ms=0`)
 	chrome := map[string]any{"containers": map[string]bool{"mp4": true, "matroska": true}, "video": map[string]bool{"h264": true},
 		"audio": map[string]bool{"aac": true}, "hls": true}
 	e.do("POST", "/api/capabilities", remote, c, chrome)
+	// The length is taken away by hand. On a slow machine the inspector that
+	// ran when the library was set up can still be writing what it found,
+	// and write the length back; so this is done until it has stayed away
+	// across a whole Play.
 	var p playAnswer
-	decode(t, e.do("POST", "/api/items/"+film+"/play", remote, c, nil), &p)
+	for try := 0; ; try++ {
+		e.s.db.Exec(`UPDATE files SET duration_ms=0`)
+		p = playAnswer{}
+		decode(t, e.do("POST", "/api/items/"+film+"/play", remote, c, nil), &p)
+		length := int64(-1)
+		e.s.db.QueryRow(`SELECT max(duration_ms) FROM files`).Scan(&length)
+		if length == 0 || try == 100 {
+			break
+		}
+		if p.HLS != "" {
+			e.do("POST", "/api/hls/"+p.HLS+"/stop", remote, c, nil)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	if p.Plan.Playable != "no" || p.Plan.Method != "none" || p.HLS != "" || !strings.Contains(strings.Join(p.Plan.Reasons, " "), "how long") {
 		t.Fatalf("play: %+v", p)
 	}

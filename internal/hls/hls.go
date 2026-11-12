@@ -226,12 +226,11 @@ func (m *Manager) end(token string, s *session) {
 // the only way to reach the session's chunks.
 func (m *Manager) Open(spec Spec) string {
 	if !spec.Grid.Valid() {
-		// Nothing to cut by, or cuts so far apart that the list is not to be
-		// believed or a chunk could never be made in time (see Grid.Valid):
-		// cut evenly instead, on the same clock.
+		// Nothing to cut by, or cuts so far apart that a chunk could never
+		// be made in time: cut evenly instead, on the same clock.
 		lead := spec.Grid.LeadMs
 		spec.Grid = uniform(spec.Grid.StartMs, spec.Grid.EndMs-spec.Grid.StartMs)
-		if lead > 0 && lead <= maxLeadMs {
+		if lead > 0 && lead <= maxChunkMs {
 			spec.Grid.LeadMs = lead
 		}
 	}
@@ -596,14 +595,10 @@ func (m *Manager) launch(ctx context.Context, s *session, startSeg int) error {
 	if s.gone {
 		return ErrNoSession // closed meanwhile: nothing may be started for it
 	}
-	// One run's chunks are never mixed with another's. They go now, whether
-	// or not a new run follows: the run that made them has been stopped, so
-	// nothing hands them out any more, and the idle check only tidies up
-	// after a session that has a run.
-	os.RemoveAll(s.dir)
 	if err := ctx.Err(); err != nil {
 		return err // given up meanwhile: the next request starts what it needs
 	}
+	os.RemoveAll(s.dir) // one run's chunks are never mixed with another's
 	s.gen++
 	spec := s.spec
 	quiet := spec.AudioTrack >= 0 && s.quietFrom > 0 && startSeg >= s.quietFrom
