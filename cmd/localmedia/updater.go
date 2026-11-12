@@ -39,6 +39,10 @@ var (
 // folder of their own.
 var executable = os.Executable
 
+// backUp copies the database before an update. Tests put a wait in front
+// of it, so that a film can be started while the copy is being made.
+var backUp = db.Backup
+
 // updater runs the update steps that need the whole program: it knows
 // where the program is installed, and it can stop and restart it.
 type updater struct {
@@ -226,7 +230,7 @@ func (u *updater) install(byOwner bool) error {
 	// The backup is made last, so that it holds everything up to the
 	// restart, however long the unpacked version had to wait.
 	dataDir := u.app.opts.dataDir
-	backup, err := db.Backup(u.db, dataDir, db.SchemaVersion())
+	backup, err := backUp(u.db, dataDir, db.SchemaVersion())
 	if err != nil {
 		return fail(fmt.Errorf("the database could not be backed up, so nothing was changed: %w", err))
 	}

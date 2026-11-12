@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -327,6 +328,64 @@ func TestAnUpdateWaitsWhileSomeoneIsWatching(t *testing.T) {
 	}
 
 	// The viewer leaves. The next look finds nobody, and the update goes in.
+	if code := viewer.call("POST", "/api/logout", nil, nil); code != 200 {
+		t.Fatalf("sign-out: %d", code)
+	}
+	q.untilRestart("after the viewer left")
+	if n := q.downloads.Load(); n != 1 {
+		t.Errorf("the new version was downloaded %d times; want once", n)
+	}
+}
+
+// The question that counts is the last one, asked when everything else has
+// been done. The database backup is the last thing done before it, so a
+// film started while the backup is being made is the latest a viewer can
+// arrive and still be seen. The update must wait for that viewer too, and
+// the backup made for a restart that did not happen must not be left lying.
+func TestAFilmStartedDuringTheBackupStillPutsTheUpdateOff(t *testing.T) {
+	backingUp, goOn := make(chan struct{}), newGate()
+	var first sync.Once
+	real := backUp
+	backUp = func(d *sql.DB, dataDir string, schema int) (string, error) {
+		first.Do(func() { close(backingUp) })
+		<-goOn.c
+		return real(d, dataDir, schema)
+	}
+	// Put back last of all, when the program has stopped.
+	t.Cleanup(func() { goOn.open(); backUp = real })
+	q := startQuiet(t, nil)
+	t.Cleanup(goOn.open) // first of all, so that the program can stop
+	q.letDownloadFinish()
+	select {
+	case <-backingUp:
+	case <-time.After(60 * time.Second):
+		t.Fatalf("the program never got as far as backing up the database: %+v", q.status())
+	}
+	// Nobody was watching before the download or after it. Now someone is.
+	viewer := q.watchAFilm("Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1")
+	goOn.open()
+
+	st := q.untilWaiting()
+	if len(st.Watching) != 1 || st.Watching[0] != "owner on an iPhone" {
+		t.Errorf("the settings page is told %+v; want that the owner on an iPhone is watching", st)
+	}
+	q.stillRunning("after a film was started during the backup")
+	// The try that found the viewer removes its backup as it gives up, a
+	// moment after the wait is shown. Later tries stop at their first
+	// question, long before a backup, so none is made meanwhile.
+	for deadline := time.Now().Add(60 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		m, _ := filepath.Glob(filepath.Join(q.data, "backups", "*.db"))
+		if len(m) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the backup made for a restart that did not happen was left behind: %v", m)
+		}
+	}
+	if st := update.ReadState(q.data); st.Result != "" {
+		t.Errorf("an update that has not happened is on record: %+v", st)
+	}
+
 	if code := viewer.call("POST", "/api/logout", nil, nil); code != 200 {
 		t.Fatalf("sign-out: %d", code)
 	}
