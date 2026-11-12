@@ -188,7 +188,8 @@ func (u *updater) install(byOwner bool) error {
 	u.mu.Unlock()
 	fail := func(err error) error {
 		u.mu.Lock()
-		u.installing, u.problem = false, err.Error()
+		// It is no longer a quiet moment that the version waits for.
+		u.installing, u.waiting, u.problem = false, false, err.Error()
 		u.mu.Unlock()
 		return err
 	}

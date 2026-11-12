@@ -16,32 +16,37 @@ import (
 // is watching. This file is how the server knows whether anyone is.
 //
 // WHAT COUNTS AS WATCHING. A sign-in (one signed-in browser or app) is
-// watching when either of these holds:
+// watching when either of two things holds.
 //
-//  1. Within the last 15 minutes (quietFor) it was sent part of a film, or
-//     its player said it was playing. That is any of:
-//     - a chunk, the list of chunks or the header of a repackaged film;
-//     - a piece of an original file. A film sent as it is, is usually one
-//     long answer that the device reads a little at a time, so every
-//     piece that really goes out counts afresh, and a device that has
-//     stopped reading stops counting;
-//     - subtitle text (a track being taken out of a film is sent while it
-//     is made);
-//     - a film being opened (Play), or the player saving how far it has
-//     got. The app's own player saves every ten seconds while a film
-//     plays, and when it is paused, ends or is left.
-//     Only answers that succeed count: a refused link is nobody watching.
+// The first: within the last 15 minutes (quietFor) it showed a sign of
+// watching. The signs are:
 //
-//  2. It has a repackaged film open that it last asked for less than 4
-//     hours ago (pausedFor). This is the paused film. A paused film asks
-//     for nothing, and a repackaged one does not survive a restart: its
-//     chunk addresses die with the program, and the page left open on it
-//     ends in an error when Play is pressed. So it is protected for much
-//     longer than the 15 minutes. A film sent as it is needs no more than
-//     those: after a restart the browser simply asks for the next piece.
-//     "Open" means the converter still holds it: the player has not been
-//     closed, the sign-in not signed out, and it is not one of the films
-//     the converter has closed or forgotten by itself.
+//   - a chunk, the list of chunks or the header of a repackaged film being
+//     sent to it;
+//   - a piece of an original file being sent to it. A film sent as it is,
+//     is usually one long answer that the device reads a little at a time,
+//     so every piece that really goes out counts afresh, and a device that
+//     has stopped reading stops counting;
+//   - subtitle text being sent to it (a track being taken out of a film is
+//     sent while it is made);
+//   - its player opening a film (Play) or saving how far it has got. The
+//     app's own player saves every ten seconds while a film plays, and when
+//     it is paused, ends or is left. These count from the moment they are
+//     asked, since a film that takes a while to open is being waited for.
+//
+// What is sent only counts when the answer is a success: a link that is
+// refused is nobody watching.
+//
+// The second: it has a repackaged film open that it last asked for less
+// than 4 hours ago (pausedFor). This is the paused film. A paused film
+// asks for nothing, and a repackaged one does not survive a restart: its
+// chunk addresses die with the program, and the page left open on it ends
+// in an error when Play is pressed. So it is protected for much longer
+// than the 15 minutes. A film sent as it is needs no more than those:
+// after a restart the browser simply asks for the next piece. "Open" means
+// the converter still holds the film: the player has not been closed, the
+// sign-in not signed out, and it is not one of the films the converter has
+// closed or forgotten by itself.
 //
 // WHAT DOES NOT. A browser tab left open on a film that has finished asks
 // for nothing more. It stops counting 15 minutes after the end if the film
@@ -105,10 +110,25 @@ func (w *watchers) sign(signIn, token string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.seen[signIn] = now
-	if token != "" {
-		w.films[token] = openFilm{signIn: signIn, asked: now}
+	if token == "" {
+		return
+	}
+	w.films[token] = openFilm{signIn: signIn, asked: now}
+	// Every film that is opened gets a token of its own. Watching clears
+	// out the ones that are over, but it is only called when someone asks;
+	// on a PC where nobody does, the list is kept short here.
+	if len(w.films) > manyFilms {
+		for t, f := range w.films {
+			if now.Sub(f.asked) >= pausedFor {
+				delete(w.films, t)
+			}
+		}
 	}
 }
+
+// manyFilms is how many repackaged films are remembered before the ones
+// that can no longer count are looked for and dropped.
+const manyFilms = 200
 
 // Watcher is one sign-in that is watching right now.
 type Watcher struct {
