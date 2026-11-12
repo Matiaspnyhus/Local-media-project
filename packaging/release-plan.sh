@@ -15,21 +15,14 @@ release=""
 if [[ "$GITHUB_REF" =~ ^refs/tags/(v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
   release="${BASH_REMATCH[1]}"
 elif [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/* &&
-        "${MESSAGE:-}" =~ \[release\ (v[0-9]+\.[0-9]+\.[0-9]+)\ at\ ([0-9a-f]{40})\] ]]; then
+        "${MESSAGE:-}" =~ \[release\ (v[0-9]+\.[0-9]+\.[0-9]+)\] ]]; then
   release="${BASH_REMATCH[1]}"
-  sha="${BASH_REMATCH[2]}"
-  if ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
-    echo "The commit named for $release ($sha) does not exist here." >&2
-    exit 1
-  fi
-  if ! git merge-base --is-ancestor "$sha" "$GITHUB_SHA"; then
-    echo "The commit named for $release ($sha) is not part of this branch." >&2
-    exit 1
-  fi
   if git rev-parse -q --verify "refs/tags/$release" >/dev/null ||
      [ -n "$(git ls-remote --tags origin "refs/tags/$release" 2>/dev/null)" ]; then
-    echo "$release exists already. A version is published once; choose the next number." >&2
-    exit 1
+    # A later commit may quote an earlier one's message (a revert does).
+    # That must not publish anything, and must not fail the checks either.
+    echo "$release exists already, so nothing is published by this commit." >&2
+    release=""
   fi
 fi
 

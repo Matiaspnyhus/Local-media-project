@@ -23,18 +23,22 @@ env:
   ALL_OS: ${{ startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[all-os]') || github.event.repository.visibility == 'public' }}
 
 jobs:
-  # Decides what this run tests and whether it publishes a version.
+  # Decides whether this run publishes a version, and stamps the programs
+  # with it.
   #
   # A version is published in one of two ways:
   #   - a version tag (v1.2.3) appears, pushed or made with a release on
   #     GitHub's page: the tagged commit is tested and published;
-  #   - the newest commit pushed to a branch says, in its message,
-  #       [release v1.2.3 at <the full 40-character id of a commit>]
-  #     Then that commit (which must be part of the branch) is what every job
-  #     below checks out, tests and builds, and it is published under that
-  #     version once all of them pass. This exists because some sessions that
-  #     work on the project may push to their branch but not push tags. A
-  #     version that already exists is never published again.
+  #   - the newest commit pushed to a branch says [release v1.2.3] in its
+  #     message: that commit is tested on every system and, if everything
+  #     passes, published under that version (the release step makes the
+  #     tag). This exists because some sessions that work on the project
+  #     may push to their branch but not push tags. Only the newest commit
+  #     can be published this way: GitHub does not let checks tag an older
+  #     commit whose checks file differs from the one that is running.
+  # Either way the commit must hold docs/release-notes/<version>.md and must
+  # not hold packaging/NOT-FOR-RELEASE.txt. A version that exists already is
+  # never published again. The rules are in packaging/release-plan.sh.
   plan:
     runs-on: ubuntu-latest
     outputs:
@@ -74,33 +78,6 @@ jobs:
           tar -xJf ffmpeg-linux64.tar.xz -C "$RUNNER_TEMP/ffmpeg"
       - name: Measure
         run: bash packaging/speed-probe.sh "$RUNNER_TEMP/ffmpeg/ffmpeg" "$RUNNER_TEMP/probe" 20
-
-  # Answers one question, when a commit message asks with [release-probe]:
-  # may these checks make a tag in this repository, and on which commits?
-  # (Publishing a version by commit message needs it.) It makes tags named
-  # probe-... and removes them again at once; nothing else is touched.
-  release-probe:
-    if: contains(github.event.head_commit.message, '[release-probe]')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set +e
-          repo="$GITHUB_REPOSITORY"
-          main="$(gh api "repos/$repo/git/ref/heads/main" -q .object.sha)"
-          for target in c4c470dbda3ad759afdd46c7c78f58625b50ad77 "$GITHUB_SHA" "$main"; do
-            name="probe-$GITHUB_RUN_ID-${target:0:7}"
-            echo "=== a tag at $target"
-            gh api -i --method POST "repos/$repo/git/refs" -f ref="refs/tags/$name" -f sha="$target" > out.txt 2>&1
-            grep -iE "^HTTP|x-accepted-github-permissions|\"message\"|\"ref\"|documentation_url" out.txt
-            gh api --method DELETE "repos/$repo/git/refs/tags/$name" >/dev/null 2>&1 && echo "(removed again)"
-          done
-          echo "=== reading the releases list"
-          gh api -i "repos/$repo/releases" 2>&1 | grep -iE "^HTTP|x-accepted-github-permissions" | head -3
-          exit 0
 
   linux:
     needs: plan
