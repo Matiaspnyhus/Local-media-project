@@ -590,16 +590,41 @@ func (s *Server) noteConversion(token, path string) {
 // bundle. ffmpeg names a file it cannot open by its full path, and on the
 // owner's PC that path holds their account name, or the name or address of
 // their network drive. The file's own name stays, because it says which
-// film had the problem. The data folder, which is under the account's name
-// too, becomes a placeholder.
+// film had the problem. The data folder and the folder the program was
+// installed in, with ffmpeg and ffprobe beside it, are under the account's
+// name too, and each becomes a placeholder.
 func (s *Server) pathless(text string) string {
 	s.convMu.Lock()
 	for _, p := range s.converting {
 		text = strings.ReplaceAll(text, p, filepath.Base(p))
 	}
 	s.convMu.Unlock()
-	if dir := filepath.Clean(s.dataDir); len(dir) > 1 {
-		text = strings.ReplaceAll(text, dir, "[data folder]")
+	if s.dataDir != "" {
+		if dir, err := filepath.Abs(s.dataDir); err == nil {
+			text = hideFolder(text, dir, "[data folder]")
+		}
+	}
+	for _, program := range []string{s.ffmpeg, s.ffprobe} {
+		if program != "" {
+			text = hideFolder(text, filepath.Dir(program), "[program folder]")
+		}
+	}
+	return text
+}
+
+// hideFolder puts a placeholder wherever text names a folder by its full
+// path. The path is looked for as it is and as Go writes it inside quotes
+// ("C:\\Users\\..."), which some errors do with the name of a program they
+// could not find. Anything but a full path is left alone: a folder given
+// as "data" is also an ordinary word.
+func hideFolder(text, dir, placeholder string) string {
+	dir = filepath.Clean(dir)
+	if !filepath.IsAbs(dir) || filepath.Dir(dir) == dir {
+		return text
+	}
+	text = strings.ReplaceAll(text, dir, placeholder)
+	if quoted := strconv.Quote(dir); quoted != `"`+dir+`"` {
+		text = strings.ReplaceAll(text, quoted[1:len(quoted)-1], placeholder)
 	}
 	return text
 }
