@@ -815,6 +815,16 @@ func TestHandoffAddressIsAlwaysOneOfTheServersOwn(t *testing.T) {
 		{"a made-up Host is never repeated", two, req(remote, "evil.example", nil), "http://10.0.0.5:8177", true},
 		{"the right address on another port", two, req(remote, "192.168.1.10:9999", nil), "http://10.0.0.5:8177", true},
 		{"from the PC itself", two, req(local, "localhost:8177", nil), "http://10.0.0.5:8177", true},
+		// A device that came by the PC's name is given the address its
+		// connection arrived at, which it can certainly reach; the first of
+		// the list may belong to a network connection a phone cannot use.
+		{"by name: the address the connection arrived at", two, req(remote, "mediapc.local:8177", &net.TCPAddr{IP: net.ParseIP("192.168.1.10"), Port: 8177}), "http://192.168.1.10:8177", true},
+		{"by name, arriving at an address the list lacks", two, req("[fd00::7]:40000", "mediapc.local:8177", &net.TCPAddr{IP: net.ParseIP("fd00::1"), Port: 8177}), "http://[fd00::1]:8177", true},
+		{"the address in use wins over where the connection arrived", two, req(remote, "10.0.0.5:8177", &net.TCPAddr{IP: net.ParseIP("192.168.1.10"), Port: 8177}), "http://10.0.0.5:8177", true},
+		{"from the PC itself, arriving at the PC's address for itself", two, req(local, "localhost:8177", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8177}), "http://10.0.0.5:8177", true},
+		{"from the PC itself over IPv6", two, req("[::1]:50000", "localhost:8177", &net.TCPAddr{IP: net.ParseIP("::1"), Port: 8177}), "http://10.0.0.5:8177", true},
+		{"arriving at an address that works on one network connection only", two, req("[fe80::7%eth0]:40000", "mediapc.local:8177", &net.TCPAddr{IP: net.ParseIP("fe80::1"), Port: 8177, Zone: "eth0"}), "http://10.0.0.5:8177", true},
+		{"arriving nowhere in particular", two, req(remote, "mediapc.local:8177", &net.TCPAddr{IP: net.IPv4zero, Port: 8177}), "http://10.0.0.5:8177", true},
 		{"no home address: where the connection arrived", nil, req("169.254.7.7:40000", "169.254.1.2:8177", &net.TCPAddr{IP: net.ParseIP("169.254.1.2"), Port: 8177}), "http://169.254.1.2:8177", true},
 		{"no home address, an IPv6 connection", nil, req("[fd00::7]:40000", "[fd00::1]:8177", &net.TCPAddr{IP: net.ParseIP("fd00::1"), Port: 8177}), "http://[fd00::1]:8177", true},
 		{"no home address, on the PC", nil, req(local, "localhost:8177", nil), "http://127.0.0.1:8177", true},

@@ -324,13 +324,24 @@ func (s *Server) handoffBase(r *http.Request) (string, bool) {
 			return u, true
 		}
 	}
+	// A device that came by the PC's name, not by an address in the list:
+	// the address its connection arrived at is one it can certainly reach,
+	// which the first of the list may not be (a PC can have network
+	// connections that lead nowhere a phone can go). Not for the PC's own
+	// browser, whose connection arrives at an address that means the PC
+	// only to itself; and not an address that works on one network
+	// connection only, which a link cannot say.
+	arrived, _ := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
+	if arrived != nil && len(arrived.IP) > 0 && !arrived.IP.IsUnspecified() && !arrived.IP.IsLoopback() && arrived.Zone == "" {
+		return "http://" + net.JoinHostPort(arrived.IP.String(), strconv.Itoa(arrived.Port)), true
+	}
 	if len(urls) > 0 {
 		return urls[0], true // the address the QR code shows
 	}
 	// No home network address is known (see LANURLs for which count). The
 	// address this very connection arrived at still works for whoever is
 	// asking.
-	if a, ok := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr); ok && len(a.IP) > 0 && !a.IP.IsUnspecified() {
+	if a := arrived; a != nil && len(a.IP) > 0 && !a.IP.IsUnspecified() {
 		return "http://" + net.JoinHostPort(a.IP.String(), strconv.Itoa(a.Port)), true
 	}
 	if isLoopback(r) {
