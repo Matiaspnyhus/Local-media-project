@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -659,6 +660,30 @@ func TestTheSameTroubleForAnotherReasonIsAnotherReport(t *testing.T) {
 	decode(t, e.pc.do("POST", "/api/items/"+e.oldFilm+"/play", nil), &next)
 	if next.Plan.Playable != "no" || !next.Plan.TooSlow || next.Play != "" || !strings.Contains(strings.Join(next.Plan.Reasons, " "), "0.5 seconds of film a second") {
 		t.Errorf("the next play of the film: %+v", next)
+	}
+}
+
+// A player can notice the same stall in more than one way at the same
+// moment. However many reports about one film arrive together, they are
+// one step, and every one of them gets the same answer.
+func TestReportsAtTheSameMomentAreOneStep(t *testing.T) {
+	e := newTroubleEnv(t)
+	e.s.testPace = slow
+	p := e.pc.play(e.oldFilm, nil)
+	const host = "192.168.1.10:8177"
+	answers := together(8, func(int) *httptest.ResponseRecorder {
+		return e.ask("POST", "/api/hls/"+p.Play+"/trouble", remote, host, e.pc.session(), fromPage(host), `{"evidence":"starved"}`)
+	})
+	for i, w := range answers {
+		if w.Code != 200 || w.Body.String() != answers[0].Body.String() || !strings.Contains(w.Body.String(), `"action":"replay"`) {
+			t.Errorf("report %d was answered %d %s; the first %s", i, w.Code, w.Body, answers[0].Body)
+		}
+	}
+	if n := e.stepsTaken(p.Play); n != 1 {
+		t.Errorf("8 reports at once count as %d steps", n)
+	}
+	if lines, counted := e.troubleLines(), e.troubleCount("starved", cameReplay); lines != 1 || counted != 1 {
+		t.Errorf("8 reports at once wrote %d lines and were counted %d times", lines, counted)
 	}
 }
 
