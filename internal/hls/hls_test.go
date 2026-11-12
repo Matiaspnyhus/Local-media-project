@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -860,6 +861,80 @@ func TestAFileThatCannotBeConvertedFailsOnceAndSaysWhy(t *testing.T) {
 	m.mu.Unlock()
 	if starts != 1 {
 		t.Errorf("ffmpeg was started %d times for one request on a broken file", starts)
+	}
+}
+
+// When ffmpeg cannot open a film it says so with the film's full path. What
+// it says goes into the log and back to whoever asked, and from there into
+// a support bundle the owner may send to someone. Which folders a household
+// keeps its films in, on which disk or at which address, is nobody else's
+// business: only the file's own name may leave this package.
+func TestWhatTheConverterSaysNamesTheFilmButNotItsFolder(t *testing.T) {
+	ffmpeg, _ := tools(t)
+	m := manager(t, ffmpeg)
+	var mu sync.Mutex
+	var logged strings.Builder
+	m.Log = func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		fmt.Fprintf(&logged, format+"\n", args...)
+	}
+	folder := filepath.Join(t.TempDir(), "192.168.1.20", "Household Videos")
+	film := filepath.Join(folder, "Test Film (2020).mkv") // the disk it was on has gone: there is no such file
+	token := m.Open(Spec{Path: film, Grid: Uniform(40000), VideoCodec: "h264", AudioTrack: 0})
+	_, err := m.Segment(context.Background(), token, 0)
+	if err == nil {
+		t.Fatal("a film that is not there was converted")
+	}
+	mu.Lock()
+	said := map[string]string{"the answer": err.Error(), "the log": logged.String()}
+	mu.Unlock()
+	for where, text := range said {
+		if strings.Contains(text, "Household Videos") || strings.Contains(text, "192.168.1.20") || strings.Contains(text, filepath.Dir(folder)) {
+			t.Errorf("%s names the folder the film is in:\n%s", where, text)
+		}
+		if !strings.Contains(text, "Test Film (2020).mkv") {
+			t.Errorf("%s should still say which film it is about:\n%s", where, text)
+		}
+	}
+	// The same for the folder the chunks are kept in, which is named when
+	// a chunk cannot be written: here because the folder was taken away
+	// under a converter that was waiting for its viewer.
+	src := source(t, ffmpeg, "plain")
+	m.Ahead = 1
+	token = m.Open(Spec{Path: src, Grid: Uniform(40000), VideoCodec: "h264", AudioTrack: 0, AudioCopy: true})
+	if _, err := m.Segment(context.Background(), token, 0); err != nil {
+		t.Fatal(err)
+	}
+	m.mu.Lock()
+	s := m.sessions[token]
+	m.mu.Unlock()
+	mu.Lock()
+	logged.Reset()
+	mu.Unlock()
+	// With chunks 0 and 1 made it waits, no file open, for its viewer.
+	if !settled(func() bool { m.mu.Lock(); defer m.mu.Unlock(); return s.run.next == 2 }) {
+		t.Fatal("the converter did not get one chunk ahead of its viewer")
+	}
+	os.RemoveAll(s.dir) // inside this test's own temporary folder
+	if _, err := m.Segment(context.Background(), token, 2); err != nil {
+		t.Errorf("after the chunk folder was taken away: %v", err)
+	}
+	mu.Lock()
+	text := logged.String()
+	mu.Unlock()
+	if !strings.Contains(text, "the converter stopped") || strings.Contains(text, filepath.Dir(m.root)) {
+		t.Errorf("the log should say that the converter stopped, without the folder the chunks are in:\n%s", text)
+	}
+	// Only whole lines of what ffmpeg wrote are kept, so a path cannot
+	// slip through with its beginning cut off.
+	var kept tail
+	end := filepath.Join("Household Videos", "Test Film (2020).mkv") + "\n"
+	kept.Write([]byte("could not open " + film + "\n"))
+	kept.Write(bytes.Repeat([]byte("x"), 4096-len(end)-len("\nlast line\n")))
+	kept.Write([]byte("\nlast line\n"))
+	if text := kept.String(); strings.Contains(text, "Videos") || !strings.HasPrefix(text, "xxx") || !strings.HasSuffix(text, "last line") {
+		t.Errorf("a line cut off at its beginning was kept: %.60q ... %d bytes", text, len(text))
 	}
 }
 

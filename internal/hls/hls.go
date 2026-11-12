@@ -18,6 +18,7 @@ package hls
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -443,7 +444,7 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 				case lost:
 					err = errors.New("the converter's files are removed from the disk as fast as it makes them")
 				case r != nil && !alive && r.first == startAt:
-					err = fmt.Errorf("the converter stopped: %s", r.stderr.String())
+					err = fmt.Errorf("the converter stopped: %s", s.spec.said(r.stderr))
 				}
 				m.mu.Unlock()
 				return nil, err
@@ -583,7 +584,10 @@ func (m *Manager) pump(s *session, r *run, out io.Reader) {
 	case <-r.stop: // stopped on purpose: nothing to report
 	default:
 		if !r.ended {
-			m.Log("the converter stopped: %v %v %s", err, werr, r.stderr.String())
+			// Nor does the log need to say where on this PC the chunks are
+			// kept, which is under the name of whoever uses it.
+			why := strings.ReplaceAll(fmt.Sprint(err), m.root, "chunks")
+			m.Log("the converter stopped: %s %v %s", why, werr, s.spec.said(r.stderr))
 		}
 	}
 	close(r.exited)
@@ -795,8 +799,9 @@ func (m *Manager) janitor() {
 
 // tail keeps the last part of what ffmpeg wrote to its error output.
 type tail struct {
-	mu sync.Mutex
-	b  []byte
+	mu  sync.Mutex
+	b   []byte
+	cut bool // the beginning has been dropped
 }
 
 func (t *tail) Write(p []byte) (int, error) {
@@ -804,7 +809,7 @@ func (t *tail) Write(p []byte) (int, error) {
 	defer t.mu.Unlock()
 	t.b = append(t.b, p...)
 	if len(t.b) > 4096 {
-		t.b = t.b[len(t.b)-4096:]
+		t.b, t.cut = t.b[len(t.b)-4096:], true
 	}
 	return len(p), nil
 }
@@ -812,5 +817,26 @@ func (t *tail) Write(p []byte) (int, error) {
 func (t *tail) String() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return strings.TrimSpace(string(t.b))
+	b := t.b
+	if t.cut {
+		// Only whole lines: the first is likely cut off at its beginning,
+		// and half a line says little (and half a path cannot be told from
+		// a whole one by what removes paths, see Spec.said).
+		_, rest, _ := bytes.Cut(b, []byte("\n"))
+		b = rest
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// said returns what ffmpeg wrote when a run of this film failed, with the
+// folder the film is in taken out. ffmpeg names the file it was given in
+// full; only the file's own name is let out of this package, into errors
+// and the log, from where it may travel in a support bundle.
+func (spec Spec) said(t *tail) string {
+	text := strings.ReplaceAll(t.String(), spec.Path, filepath.Base(spec.Path))
+	if dir := filepath.Dir(spec.Path); len(dir) > 1 {
+		// And anything else it names in the same folder.
+		text = strings.ReplaceAll(text, dir+string(filepath.Separator), "")
+	}
+	return text
 }
