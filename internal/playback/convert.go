@@ -254,9 +254,9 @@ func burnReason(sub *Subtitle, c *Caps) string {
 	if can {
 		// The iPhone's case: the page could draw them, but not where the
 		// film is shown once it goes fullscreen.
-		return "The subtitles you chose " + what + ". This device can draw them only while the film plays inside the page, not in fullscreen, so they are put into the picture."
+		return "The subtitles you chose " + what + ". This device can draw them only while the film plays inside the page, not in fullscreen, so they have to be put into the picture."
 	}
-	return "The subtitles you chose " + what + ", which this device cannot draw over the film, so they are put into the picture."
+	return "The subtitles you chose " + what + ", which this device cannot draw over the film, so they have to be put into the picture."
 }
 
 // blind finishes a plan made without knowing the file or the device. Text
@@ -335,7 +335,9 @@ func converted(p Plan, why []string, m Media, a *Track, c *Caps, w Want, l Limit
 	class := classOf(v)
 	rung, best := pickRung(v, w, l)
 	if rung == 0 {
-		return refuse(p, append(why, tooSlow(best, barFor(class), l.Busy)))
+		no := refuse(p, append(why, tooSlow(best, barFor(class), l.Busy)))
+		no.TooSlow = true
+		return no
 	}
 	r := ladder[rung-1]
 	width, height := fit(v.Width, v.Height, r.Height)

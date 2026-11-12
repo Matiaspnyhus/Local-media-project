@@ -103,7 +103,7 @@ func sameAsM3(got, m3 Plan) string {
 	if got.Explain() != m3.Explain() {
 		return fmt.Sprintf("explained as %q, M3 said %q", got.Explain(), m3.Explain())
 	}
-	if got.Video != (Video{}) || got.Subtitles != SubsNone || got.SubtitleKind != "" || len(got.Lost) != 0 {
+	if got.Video != (Video{}) || got.Subtitles != SubsNone || got.SubtitleKind != "" || len(got.Lost) != 0 || got.TooSlow {
 		return fmt.Sprintf("a plan without conversion says something about conversion: %+v", got)
 	}
 	return ""

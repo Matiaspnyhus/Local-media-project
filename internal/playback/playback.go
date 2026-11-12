@@ -140,6 +140,10 @@ type Plan struct {
 	// DeviceUnknown says the answer is "unknown" because the device has not
 	// said what it can play, not because the file has not been inspected.
 	DeviceUnknown bool `json:"deviceUnknown"`
+	// TooSlow says the answer is no for one reason only: this PC cannot
+	// convert the film as fast as it plays. The film itself is fine, so
+	// the page can offer to open it in another player.
+	TooSlow bool `json:"tooSlow"`
 	// Video says what the picture is converted to. It is empty unless the
 	// method is convert.
 	Video Video `json:"video"`
@@ -492,6 +496,9 @@ func (p Plan) Explain() string {
 			s += " The sound becomes stereo AAC."
 		}
 		return s
+	}
+	if p.TooSlow {
+		return "This PC cannot convert this film fast enough to watch."
 	}
 	return "This browser cannot play this file yet."
 }

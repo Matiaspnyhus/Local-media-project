@@ -260,6 +260,9 @@ func broken(m Media, dev *Caps, w Want, l Limits, p, m3 Plan) string {
 	if (p.Method == Direct) != (len(p.Reasons) == 0) {
 		return "only the original sent as it is comes without a reason, and it always does"
 	}
+	if p.TooSlow != tooSlow || tooSlow != (p.Explain() == "This PC cannot convert this film fast enough to watch.") {
+		return "the answer is unsure whether this PC is too slow"
+	}
 	for _, said := range [3][]string{{p.Explain()}, p.Reasons, p.Lost} {
 		for _, s := range said {
 			if !strings.HasSuffix(s, ".") {
@@ -1048,6 +1051,23 @@ func TestTooSlowIsSaidPlainly(t *testing.T) {
 	if p.Playable != No || p.Method != None || !sameStrings(p.Reasons, want) {
 		t.Errorf("got %s %q, want %q", p.Method, p.Reasons, want)
 	}
+	// The plan says so in a way the page can act on (it offers another
+	// player), and in its one-sentence summary.
+	if !p.TooSlow || p.Explain() != "This PC cannot convert this film fast enough to watch." {
+		t.Errorf("too slow: tooSlow=%v, explained as %q", p.TooSlow, p.Explain())
+	}
+	// Other refusals are not about speed.
+	for name, q := range map[string]Plan{
+		"a PC that cannot convert":                             DecideFor(m, newDevices["chrome"], Want{Audio: -1, Subtitle: -1}, Limits{}),
+		"a device that takes no chunks":                        DecideFor(m, newDevices["old-tv"], Want{Audio: -1, Subtitle: -1}, slow),
+		"a film that plays":                                    DecideFor(m, newDevices["chrome"], Want{Audio: -1, Subtitle: -1}, able),
+		"a lesson this PC is too slow for":                     DecideFor(film("mp4", "h264", 8, "aac", sizes[1], colours[0], ""), newDevices["chrome"], Want{Audio: -1, Subtitle: -1}, func() Limits { l := slow; l.MaxRate = 4_000_000; return l }()),
+		"a design this PC is too slow to put into the picture": DecideFor(film("mp4", "h264", 8, "aac", sizes[1], colours[0], StyledSubs), surfaces[3].on(newDevices["safari"]), Want{Audio: -1, Subtitle: 0}, slow),
+	} {
+		if q.TooSlow || strings.Contains(q.Explain(), "fast enough") {
+			t.Errorf("%s: tooSlow=%v, explained as %q", name, q.TooSlow, q.Explain())
+		}
+	}
 	slow.Busy = 2
 	p = DecideFor(m, newDevices["chrome"], Want{Audio: -1, Subtitle: -1}, slow)
 	if last := p.Reasons[len(p.Reasons)-1]; last != "This PC cannot convert this film fast enough to watch: at best it manages 0.4 seconds of film a second, and it takes 1.5 to keep up while it is converting for 2 other screens as well." {
@@ -1168,7 +1188,7 @@ func TestPlanJSON(t *testing.T) {
 		sort.Strings(names)
 		return strings.Join(names, " ")
 	}
-	if want := "audioCopy audioTrack deviceUnknown hasAudio lost method picture playable reasons subtitleKind subtitles video"; keys(got) != want {
+	if want := "audioCopy audioTrack deviceUnknown hasAudio lost method picture playable reasons subtitleKind subtitles tooSlow video"; keys(got) != want {
 		t.Errorf("a plan has the fields %q, want %q", keys(got), want)
 	}
 	if want := "class encoder hdrToSdr height rung"; keys(got["video"].(map[string]any)) != want {
