@@ -331,3 +331,72 @@ func TestProgressAndPicksCarryOverBetweenVersions(t *testing.T) {
 		t.Errorf("after English sound was picked on the TV the phone starts with %v", picked(onPhone))
 	}
 }
+
+// A copy that does not say how long it is cannot be handed out as chunks,
+// so it cannot be repackaged or have its sound converted. That rule was
+// known to Play alone. The lists ranked such a copy as one that plays
+// repackaged: it was preferred to a copy that really plays, the list said
+// "plays", and Play then refused the film.
+func TestACopyThatCannotBeRepackagedIsNotPreferredToOneThatPlays(t *testing.T) {
+	onlyMP4 := map[string]any{"containers": map[string]bool{"mp4": true}, "video": map[string]bool{"h264": true}, "audio": map[string]bool{"aac": true}, "hls": true}
+	h264, h264Large := picture("h264", 8, 1920, 1080), picture("h264", 8, 3840, 2160)
+	aac, dts := sound("aac", "eng", "", true, false), sound("dts", "eng", "", true, false)
+	const noLength = "does not say how long it is"
+	// reasons asks Play again for the reasons it gives.
+	reasons := func(v versionsEnv) string {
+		var p struct{ Plan struct{ Reasons []string } }
+		decode(t, v.do("POST", "/api/items/"+v.film+"/play", remote, v.c, nil), &p)
+		return strings.Join(p.Plan.Reasons, " ")
+	}
+
+	// The other copy plays with its sound converted: that one is chosen.
+	v := twoVersions(t)
+	v.pretendConverter(t)
+	v.do("POST", "/api/capabilities", remote, v.c, onlyMP4)
+	v.inspected(t, "1080p", "matroska", h264, dts)
+	v.inspected(t, "2160p", "matroska", h264Large, aac)                       // would only need repackaging,
+	v.s.db.Exec(`UPDATE files SET duration_ms=0 WHERE id=?`, v.file["2160p"]) // but does not say how long it is
+	list, play := v.answers(t, v.c)
+	if list.Playable != "yes" || list.Method != "audio" || which(list.DurationMs) != "1080p" {
+		t.Errorf("the list says %s/%s, judging the %s copy; want the 1080p copy, which plays with its sound converted", list.Playable, list.Method, which(list.DurationMs))
+	}
+	if play.Plan.Playable != "yes" || play.Plan.Method != "audio" || which(play.DurationMs) != "1080p" {
+		t.Errorf("Play answers %s/%s with the %s copy; want the 1080p copy, which plays with its sound converted", play.Plan.Playable, play.Plan.Method, which(play.DurationMs))
+	}
+
+	// No copy plays: the list and Play both say so, and both say why.
+	v = twoVersions(t)
+	v.pretendConverter(t)
+	v.do("POST", "/api/capabilities", remote, v.c, onlyMP4)
+	v.inspected(t, "1080p", "matroska", picture("hevc", 10, 1920, 1080), aac) // this device cannot show it
+	v.inspected(t, "2160p", "matroska", h264Large, aac)
+	v.s.db.Exec(`UPDATE files SET duration_ms=0 WHERE id=?`, v.file["2160p"])
+	list, play = v.answers(t, v.c)
+	if list.Playable != "no" || list.Method != "none" || !strings.Contains(strings.Join(list.Reasons, " "), noLength) {
+		t.Errorf("the list says %s/%s because %q; want no, because the copy %s", list.Playable, list.Method, list.Reasons, noLength)
+	}
+	if why := reasons(v); play.Plan.Playable != "no" || play.Plan.Method != "none" || !strings.Contains(why, noLength) {
+		t.Errorf("Play answers %s/%s because %q; want no, because the copy %s", play.Plan.Playable, play.Plan.Method, why, noLength)
+	}
+
+	// A copy of unknown length that this device plays as it is. The viewer
+	// prefers its second sound track, which only repackaging can reach. The
+	// film's own main sound is better than no film: that is the rule for
+	// every other obstacle to the preferred sound, and it holds for this one.
+	v = twoVersions(t)
+	v.pretendConverter(t)
+	v.do("POST", "/api/capabilities", remote, v.c, onlyMP4)
+	v.inspected(t, "1080p", "matroska", picture("hevc", 10, 1920, 1080), aac)
+	v.inspected(t, "2160p", "mp4", h264Large, aac, sound("aac", "nor", "", false, false))
+	v.s.db.Exec(`UPDATE files SET duration_ms=0 WHERE id=?`, v.file["2160p"])
+	if w := v.do("PUT", "/api/prefs", remote, v.c, map[string]any{"audioLang": "no", "subLang": "", "subs": "auto"}); w.Code != 200 {
+		t.Fatalf("preferences: %d %s", w.Code, w.Body)
+	}
+	list, play = v.answers(t, v.c)
+	if list.Playable != "yes" || list.Method != "direct" {
+		t.Errorf("the list says %s/%s of a copy that plays as it is", list.Playable, list.Method)
+	}
+	if play.Plan.Playable != "yes" || play.Plan.Method != "direct" || !strings.HasPrefix(play.URL, "/stream/"+v.file["2160p"]+"?") {
+		t.Errorf("Play answers %s/%s (%s) because %q; want the file as it is, with its main sound", play.Plan.Playable, play.Plan.Method, play.URL, reasons(v))
+	}
+}

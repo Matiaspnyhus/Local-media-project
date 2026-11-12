@@ -458,21 +458,16 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		choice.Audio = *in.Audio
 	}
 	caps := s.playCaps(u)
-	plan := playback.Decide(ft.media, caps, choice.Audio)
+	plan := withLength(playback.Decide(ft.media, caps, choice.Audio), durationMs)
 	if plan.Playable == playback.No {
 		// The preferred sound track may be what stands in the way (it takes
-		// repackaging to switch). The file's own main track is better than
-		// nothing.
-		if alt := playback.Decide(ft.media, caps, -1); alt.Playable != playback.No {
+		// repackaging to switch, which a file that does not say how long it
+		// is cannot have). The file's own main track is better than nothing.
+		// This second plan is the one the copy was judged by (see judge), so
+		// a copy the lists say plays is never refused here.
+		if alt := withLength(playback.Decide(ft.media, caps, -1), durationMs); alt.Playable != playback.No {
 			plan = alt
 		}
-	}
-
-	if (plan.Method == playback.Remux || plan.Method == playback.Audio) && durationMs <= 0 {
-		// The list of chunks a player is given covers the whole film, so
-		// its length has to be known.
-		plan.Playable, plan.Method = playback.No, playback.None
-		plan.Reasons = append(plan.Reasons, "The file does not say how long it is, so it cannot be repackaged for this device.")
 	}
 
 	var subtitleShift int64

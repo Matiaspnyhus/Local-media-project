@@ -233,6 +233,22 @@ func preferred(copies []*version) *version {
 	return best
 }
 
+// withLength finishes the plan for a copy by asking whether the copy says
+// how long it is. One that does not can only be sent as it is: the list of
+// chunks a player is given covers the whole film, so its length has to be
+// known. The lists and Play both ask here, as they both ask preferred, so
+// that such a copy is not chosen while another plays, and a list does not
+// say "plays" of a film that Play then refuses.
+func withLength(p playback.Plan, durationMs int64) playback.Plan {
+	if durationMs > 0 || p.Playable == playback.No || p.Method == playback.Direct {
+		return p
+	}
+	p.Playable, p.Method = playback.No, playback.None
+	// (A new list, in case the plan shares the one it was made with.)
+	p.Reasons = append(append([]string{}, p.Reasons...), "The file does not say how long it is, so it cannot be repackaged for this device.")
+	return p
+}
+
 // judge works out how this device would get each copy (see version.plan).
 func (s *Server) judge(u *User, copies []*version) error {
 	byFile := make(map[string]*version, len(copies))
@@ -279,7 +295,7 @@ func (s *Server) judge(u *User, copies []*version) error {
 	}
 	caps := s.playCaps(u)
 	for _, v := range copies {
-		v.plan = playback.Decide(*media[v.fileID], caps, -1)
+		v.plan = withLength(playback.Decide(*media[v.fileID], caps, -1), v.durationMs)
 	}
 	return nil
 }
