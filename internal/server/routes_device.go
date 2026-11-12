@@ -185,7 +185,7 @@ func (s *Server) learnedReport() map[string]any {
 		Lessons         []lessonLine `json:"lessons"`
 	}
 	byDevice := map[string][]lessonLine{}
-	if rows, err := s.db.Query(`SELECT device_id, kind, value, file_id IS NOT NULL, hits, expires_at FROM lessons ORDER BY learned_at, id`); err == nil {
+	if rows, err := s.db.Query(`SELECT device_id, kind, value, file_id IS NOT NULL, hits, expires_at FROM lessons ORDER BY learned_at, rowid`); err == nil {
 		for rows.Next() {
 			var device string
 			var l lessonLine

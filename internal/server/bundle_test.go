@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"testing/fstest"
 
 	"github.com/Matiaspnyhus/Local-media-project/internal/db"
+	"github.com/Matiaspnyhus/Local-media-project/internal/playback"
 )
 
 // What a player reports is kept for the support bundle. It must leave the
@@ -20,16 +22,212 @@ func TestProblemsInTheSupportBundleAreScrubbedLikeTheLog(t *testing.T) {
 	id := e.firstItem(c, "clip")
 	e.do("POST", "/api/client-events", remote, c, map[string]string{"kind": "play-error", "itemId": id,
 		"detail": "could not load http://192.168.1.50:8177/stream/abc?g=" + strings.Repeat("k", 43) + " MEDIA_ERR_NETWORK"})
+	// Something was learned about the device as well, and the page said a
+	// few words about trouble in a film, which go to the log.
+	if w := e.do("POST", "/api/device/hdr-wrong", remote, c, map[string]bool{"on": true}); w.Code != 200 {
+		t.Fatal(w.Body)
+	}
+	var p struct{ Play string }
+	decode(t, e.do("POST", "/api/items/"+id+"/play", remote, c, nil), &p)
+	e.do("POST", "/api/hls/"+p.Play+"/trouble", remote, c, map[string]string{"evidence": "starved",
+		"detail": "stalled fetching http://192.168.1.50:8177/stream/abc?g=" + strings.Repeat("k", 43)})
+	var device, lesson, signIn string
+	if err := e.s.db.QueryRow(`SELECT s.id, s.device_id, l.id FROM sessions s JOIN lessons l ON l.device_id = s.device_id`).Scan(&signIn, &device, &lesson); err != nil {
+		t.Fatal(err)
+	}
+
 	files := bundleFiles(t, e.do("GET", "/api/support-bundle", remote, c, nil))
 	problems := files["playback-problems.json"]
 	if !strings.Contains(problems, "MEDIA_ERR_NETWORK") || !strings.Contains(problems, "clip.mp4") {
 		t.Fatalf("the problem itself is missing from the bundle: %s", problems)
 	}
+	if !strings.Contains(files["learned.json"], `"kind": "hdr"`) || !strings.Contains(files["log.txt"], "trouble while playing: starved") {
+		t.Fatalf("what was learned, or the trouble, is missing from the bundle: %s\n%s", files["learned.json"], files["log.txt"])
+	}
 	for name, text := range files {
-		for _, bad := range []string{"192.168.1.50", strings.Repeat("k", 43)} {
+		// Addresses and secrets, and anything that could be used to pass
+		// for a device or a sign-in or to find a film: ids, tokens.
+		for _, bad := range []string{"192.168.1.50", strings.Repeat("k", 43), device, lesson, signIn, p.Play, id, e.s.deviceCookieValue(device)} {
 			if strings.Contains(text, bad) {
 				t.Errorf("%s in the bundle contains %q", name, bad)
 			}
+		}
+	}
+}
+
+// What was learned leaves the PC as kinds and counts: kinds of device,
+// kinds of film, how often films ran into trouble. Never a title, a file,
+// a folder, a person, or what a browser said about itself. The same holds
+// for what is kept about devices and lessons on the PC.
+func TestWhatWasLearnedLeavesThePCAsKindsOnly(t *testing.T) {
+	e := newTroubleEnv(t)
+	// The PC: two large films it could not show, a film this PC converted
+	// too slowly, and the owner's word about HDR.
+	for _, film := range []string{e.big, e.big2} {
+		if a := e.pc.mustTrouble(e.pc.play(film, nil).Play, "decode"); a.Action != "replay" {
+			t.Fatalf("%+v", a)
+		}
+	}
+	e.s.testPace = slow
+	e.pc.mustTrouble(e.pc.play(e.oldFilm, nil).Play, "starved")
+	e.pc.do("POST", "/api/device/hdr-wrong", map[string]bool{"on": true})
+	// A phone someone else is signed in on, with a slow connection.
+	e.member("kid", "member password")
+	phone := e.browser(pixelPhone)
+	phone.signIn("kid", "member password")
+	phone.do("POST", "/api/capabilities", playsMost)
+	e.s.testPace = healthy
+	phone.mustTrouble(phone.play(e.big, nil).Play, "starved")
+
+	type learnedFile struct {
+		Devices []struct {
+			Kind            string
+			LastSeenDaysAgo int
+			Lessons         []struct {
+				Kind, About, HoldsFor   string
+				TimesReported, DaysLeft int
+				RanOut                  bool
+			}
+		}
+		ThisPC struct {
+			ConverterVersion string
+			Processors       int
+			Speeds           map[string]struct {
+				SeenInRealPlays []struct {
+					Class       string
+					Setting     int
+					Speed       float64
+					StillCounts bool
+				}
+				PlannedWith map[string][]float64
+			}
+		}
+		Trouble struct {
+			CountedSince string
+			Reports      []struct {
+				Evidence, Outcome string
+				Count             int
+			}
+		}
+	}
+	bundle := func() (map[string]string, learnedFile) {
+		t.Helper()
+		files := bundleFiles(t, e.pc.do("GET", "/api/support-bundle", nil))
+		var l learnedFile
+		if err := json.Unmarshal([]byte(files["learned.json"]), &l); err != nil {
+			t.Fatalf("learned.json: %v\n%s", err, files["learned.json"])
+		}
+		return files, l
+	}
+	files, learned := bundle()
+	if !strings.Contains(files["README.txt"], "learned.json") {
+		t.Error("the bundle's own description does not mention learned.json")
+	}
+	if len(learned.Devices) != 2 {
+		t.Fatalf("learned.json: %s", files["learned.json"])
+	}
+	for _, d := range learned.Devices {
+		switch d.Kind {
+		case "Windows PC, Chrome":
+			if len(d.Lessons) != 2 || d.Lessons[0].Kind != "picture" || d.Lessons[0].About != "hevc/10/4k" || d.Lessons[0].HoldsFor != "every film" ||
+				d.Lessons[0].TimesReported != 2 || d.Lessons[0].DaysLeft != 30 || d.Lessons[0].RanOut || d.Lessons[1].Kind != "hdr" {
+				t.Errorf("the PC's lessons: %+v", d.Lessons)
+			}
+		case "Android phone":
+			if len(d.Lessons) != 1 || d.Lessons[0].Kind != "rate" || d.Lessons[0].About != "5000000" || d.Lessons[0].DaysLeft != 1 {
+				t.Errorf("the phone's lessons: %+v", d.Lessons)
+			}
+		default:
+			t.Errorf("a device of kind %q", d.Kind)
+		}
+	}
+	x264 := learned.ThisPC.Speeds["x264"]
+	if learned.ThisPC.ConverterVersion != "9.9" || learned.ThisPC.Processors < 1 || len(x264.SeenInRealPlays) != 1 ||
+		x264.SeenInRealPlays[0].Class != "hd" || x264.SeenInRealPlays[0].Setting != 1 || x264.SeenInRealPlays[0].Speed != 0.5 || !x264.SeenInRealPlays[0].StillCounts ||
+		len(x264.PlannedWith["hd"]) != playback.NumRungs || x264.PlannedWith["hd"][0] != 0.5 {
+		t.Errorf("what the bundle says about this PC: %+v", learned.ThisPC)
+	}
+	counted := map[string]int{}
+	for _, r := range learned.Trouble.Reports {
+		counted[r.Evidence+" "+r.Outcome] = r.Count
+	}
+	if counted["decode replay"] != 2 || counted["starved replay"] != 2 || len(counted) != 2 || learned.Trouble.CountedSince == "" {
+		t.Errorf("the counts of trouble: %+v", learned.Trouble)
+	}
+
+	// Nothing that says which film, where, whose, or exactly which device.
+	titles := []string{"Big Film", "Second Big", "Third Big", "Old Film", "Small Film", "(2020)", "(1999)"}
+	var secrets []string
+	for _, q := range []string{`SELECT id FROM devices`, `SELECT id FROM lessons`, `SELECT id FROM files`, `SELECT id FROM items`, `SELECT id FROM sessions`, `SELECT id FROM users`} {
+		rows, err := e.s.db.Query(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for rows.Next() {
+			var id string
+			rows.Scan(&id)
+			secrets = append(secrets, id)
+		}
+		rows.Close()
+	}
+	if len(secrets) < 15 {
+		t.Fatalf("only %d ids were found to look for", len(secrets))
+	}
+	for name, text := range files {
+		for _, bad := range append(append([]string{e.media, e.s.dataDir, "kid"}, titles...), secrets...) {
+			if strings.Contains(text, bad) {
+				i := strings.Index(text, bad)
+				t.Errorf("%s in the bundle contains %q: ...%s...", name, bad, text[max(0, i-80):min(len(text), i+80)])
+			}
+		}
+	}
+	// What a browser says about itself is in the bundle on purpose, in
+	// devices.json. What was learned must not repeat it.
+	for _, bad := range []string{"Pixel", "Mozilla", "AppleWebKit", "Chrome/130", ".mp4", "owner"} {
+		if strings.Contains(files["learned.json"], bad) {
+			t.Errorf("learned.json contains %q", bad)
+		}
+	}
+
+	// The same for what is kept on the PC about devices, lessons, speeds
+	// and counts. A lesson about one film holds that file's id, which is
+	// how the film is remembered, and nothing else about it.
+	var kept strings.Builder
+	for _, q := range []string{
+		`SELECT id || ' ' || label FROM devices`,
+		`SELECT id || ' ' || device_id || ' ' || kind || ' ' || value FROM lessons`,
+		`SELECT key || ' ' || CAST(value AS TEXT) FROM settings WHERE key LIKE 'speed:%' OR key = 'trouble_counts'`,
+		`SELECT facts FROM picture_facts`,
+	} {
+		rows, err := e.s.db.Query(q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		n := 0
+		for rows.Next() {
+			var line string
+			rows.Scan(&line)
+			kept.WriteString(line + "\n")
+			n++
+		}
+		rows.Close()
+		if n == 0 {
+			t.Fatalf("%s found nothing to check", q)
+		}
+	}
+	for _, bad := range append([]string{e.media, e.s.dataDir, "kid", "owner", "Pixel", "Mozilla", ".mp4"}, titles...) {
+		if strings.Contains(kept.String(), bad) {
+			t.Errorf("what is kept on the PC contains %q:\n%s", bad, kept.String())
+		}
+	}
+
+	// A lesson that has run out is marked as such, not dropped: it is
+	// still part of what the PC remembers.
+	e.clock.forward(2 * day)
+	_, learned = bundle()
+	for _, d := range learned.Devices {
+		if d.Kind == "Android phone" && (len(d.Lessons) != 1 || !d.Lessons[0].RanOut || d.Lessons[0].DaysLeft != 0 || d.LastSeenDaysAgo != 2) {
+			t.Errorf("two days on, the phone: %+v", d)
 		}
 	}
 }

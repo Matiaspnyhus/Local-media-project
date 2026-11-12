@@ -257,7 +257,9 @@ func (s *Server) lessonsOf(deviceID string) ([]lesson, error) {
 		q += ` AND device_id = ?`
 		args = append(args, deviceID)
 	}
-	rows, err := s.db.Query(q+` ORDER BY learned_at, id`, args...)
+	// Those learned in the same second come in the order they were first
+	// learned, so that a list reads the same each time it is asked for.
+	rows, err := s.db.Query(q+` ORDER BY learned_at, rowid`, args...)
 	if err != nil {
 		return nil, err
 	}

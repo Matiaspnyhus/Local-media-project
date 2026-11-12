@@ -258,6 +258,80 @@ func TestOneLookAtAFilmsPictureServesEveryPlay(t *testing.T) {
 	}
 }
 
+// What a look at a film's picture finds is kept in the database, so the
+// film is not looked at again after the program restarts. It is kept for
+// the file as it was: a file that has changed is looked at afresh, and so
+// is one whose kept facts cannot be read.
+func TestWhatALookAtAFilmsPictureFindsIsKeptInTheDatabase(t *testing.T) {
+	e := newConvertEnv(t)
+	oldFilm(t, e, "Old Film (1999).mkv", "25")
+	c := e.setup()
+	e.s.InspectNow()
+	e.do("POST", "/api/capabilities", remote, c, chromeLike)
+	film := e.firstItem(c, "Old Film")
+	file := e.fileOf(film)
+	play := func(when string) {
+		t.Helper()
+		var p convertedAnswer
+		w := e.do("POST", "/api/items/"+film+"/play", remote, c, nil)
+		decode(t, w, &p)
+		if p.Plan.Method != "convert" || p.HLS == "" {
+			t.Fatalf("%s: play: %s", when, w.Body)
+		}
+		e.do("POST", "/api/hls/"+p.HLS+"/stop", remote, c, nil)
+	}
+	kept := func() (stamp string, facts hls.PictureFacts) {
+		t.Helper()
+		var raw string
+		if err := e.s.db.QueryRow(`SELECT stamp, facts FROM picture_facts WHERE file_id=?`, file).Scan(&stamp, &raw); err != nil {
+			t.Fatalf("nothing is kept about the film's picture: %v", err)
+		}
+		if err := json.Unmarshal([]byte(raw), &facts); err != nil {
+			t.Fatalf("what is kept cannot be read: %v", err)
+		}
+		return stamp, facts
+	}
+	play("the first time")
+	stamp, facts := kept()
+	if facts.Width != 320 || facts.Height != 180 || facts.RateNum != 25 || facts.RateDen != 1 || !strings.HasSuffix(stamp, "-"+factsForm) {
+		t.Fatalf("kept under %q: %+v", stamp, facts)
+	}
+	// Whatever a look finds comes back from the database as it went in.
+	if again, ok := e.s.keptFacts(file, stamp); !ok || !reflect.DeepEqual(again, facts) {
+		t.Errorf("read back as %+v", again)
+	}
+	// From here on every run of the inspector is counted.
+	ffprobe := newCounted(t, `'`+e.s.ffprobe+`' "$@"`)
+	e.s.ffprobe = ffprobe.Path
+	play("with the facts kept")
+	if n := ffprobe.runs(); n != 0 {
+		t.Errorf("the film was looked at again although what was found is kept (%d runs)", n)
+	}
+	// The file changes (the scan notes its new date): it is looked at
+	// again, and what is kept is replaced.
+	e.s.db.Exec(`UPDATE files SET mtime = mtime + 60 WHERE id=?`, file)
+	play("after the file changed")
+	one := ffprobe.runs()
+	if newStamp, _ := kept(); one == 0 || newStamp == stamp {
+		t.Errorf("after the file changed: %d runs of the inspector, kept under %q (was %q)", one, newStamp, stamp)
+	}
+	play("once more")
+	if n := ffprobe.runs(); n != one {
+		t.Errorf("the changed file was looked at twice (%d runs, one look takes %d)", n, one)
+	}
+	// Kept facts that cannot be read are no facts.
+	e.s.db.Exec(`UPDATE picture_facts SET facts='{"start": "soon"' WHERE file_id=?`, file)
+	play("with kept facts that cannot be read")
+	if _, facts := kept(); ffprobe.runs() != 2*one || facts.Width != 320 {
+		t.Errorf("after the kept facts were spoilt: %d runs, now kept %+v", ffprobe.runs(), facts)
+	}
+	// When the film leaves the library, what was kept about it goes too.
+	e.s.db.Exec(`DELETE FROM files WHERE id=?`, file)
+	if n := e.count(`SELECT count(*) FROM picture_facts`); n != 0 {
+		t.Errorf("%d films' facts are kept after the film was removed", n)
+	}
+}
+
 // A film whose picture cannot be made sense of is refused in plain words,
 // with nothing left open.
 func TestAFilmWhosePictureCannotBeReadIsNotConverted(t *testing.T) {
