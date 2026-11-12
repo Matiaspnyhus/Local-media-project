@@ -294,3 +294,27 @@ The owner answered the question that the M4 design left open ("graphics card and
 - **Nothing of this can be run where the app is built or at GitHub.** The only machine with the card is the owner's. So the hardware test is built first as a *report*: it tries each path on a generated clip, changes nothing about how films are played, and writes what worked, how fast, and what the driver said into the support bundle. The paths are switched on from what those reports show.
 - **A laptop sleeps.** Idle, it goes to sleep with a film still being sent to a phone, because Windows does not count sending as use. The program will ask Windows to stay awake while someone is watching (the definition of "watching" is the one the update fix introduced). Closing the lid is a Windows setting the app must not change; the checklist says where it is.
 - **The owner's bundle of this date came from a test build of 11 November, not v0.3.0** (schema 4, version shown as the branch name). Test builds refuse to update themselves, by design, so v0.3.0 has to be installed by hand once. Nothing in that bundle is committed anywhere.
+
+## 2026-11-12: The server repairs, second round; what the other systems said once they ran again
+
+**Merged (`fix/server-gaps`, final).** An independent check of the first round found eight further points; six are repaired, two are left and listed below.
+- Subtitle files in two bytes a letter (UTF-16) are recognised by the server with or without the mark at their start, and for the kinds ffmpeg converts they are handed to ffmpeg as text on its standard input. A subtitle *file* in which no caption is found is an error, never an empty success; an empty track *inside* a film is still kept.
+- An `.srt` or `.vtt` file is judged UTF-8 or old Western European by counting, so one stray byte no longer spoils the whole file.
+- "Needs chunks but does not say how long it is" is one rule (`withLength`) shared by the lists and Play, applied before Play falls back to the film's main sound. Converted pictures go through it as well. Whoever changes how Play decides must keep both calls going through it, and keep Play's fallback plan the one `judge` ranks by.
+- Play and the remembering of a pick skip a copy that is gone from the disk when another copy is there; the lists do not open files and may describe the missing copy until the next look at the library.
+- **Play's `durationMs` is the length of the timeline of the player the answer is for** (the film's length plus `clockAheadMs`). For nearly every film the two are the same. Anything new on the page that reads it must know.
+- Kept copies of subtitles made by v0.3.0 are not used again (their names lack the `-r2` at the end); any later change to how kept copies are decoded must change that ending.
+
+**Fixed by the two rounds, from the list under "Known and not yet fixed" above:** old-encoding `.ass`/`.ssa`/`.sub` files; two versions of one film judged and played differently; the saved position of a trimmed clip.
+
+**Known and not yet fixed, added by this check**
+- The copy of a film is chosen by the file's main sound, not by the sound the viewer will get: a film may play with its sound converted although another copy has the wanted language as it is. Doing it properly needs the page to say which copy it holds.
+- Text in an old encoding other than Western European (Central European, Cyrillic) keeps every line but shows wrong letters, and is kept so.
+- The page says nothing when a subtitle fails to load.
+- `.sub` files are not offered on the page (their address works).
+- "Open in another player" takes the first copy the database gives and does not look at the disk.
+
+**GitHub's other systems** had not run since the M4 parts were merged, because they waited for the Linux job, which one converter test keeps red. They now run on every push (the release rule is unchanged: Linux, Windows and Mac must all pass). First results:
+- Windows: everything passes, including installing and uninstalling, after one test of the lead's was taught about Windows line endings.
+- ARM Linux: passes (the updater test that read a result a moment early is confirmed fixed there).
+- Mac: the Go tests pass except the known converter test, which fails there some runs and not others. In Safari's engine the browser test plays a converted film and jumps in it. It fails later, in "Open in another player": the box with the link does not select its text when the keyboard reaches it. To fix after the security repair of that part (`m4/handoff-2`) is merged, so that the two do not collide.
