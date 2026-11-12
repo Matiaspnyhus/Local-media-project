@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -333,6 +334,61 @@ func (s *Server) loadMemory(userID, scope string) *playback.Memory {
 	return &m
 }
 
+// playerClocks is how the place a viewer stopped at stays the film's own
+// time whichever way the film reaches the device.
+//
+// A repackaged film can play with its clock a little ahead of the film's
+// own (see hls.Grid.LeadMs): every time its player reports, and every time
+// it is given, is that much later than the same moment in the file played
+// as it is. The page knows nothing of this, and does not need to. Play
+// notes how far ahead the player it has just answered will run, and gives
+// that player the place to carry on from on the player's clock. What the
+// player then reports is moved back by as much before it is saved (see
+// handleProgress).
+//
+// A note is kept by sign-in and film, in memory, and only for a clock that
+// does run ahead, which few do. It outlives the conversion it was made
+// for: the last things a page does are to save the place and to stop the
+// conversion, and the two can arrive in either order. It is lost when the
+// program restarts. So are the chunk addresses the page holds, and the
+// page then has to ask Play again, which makes the note afresh.
+type playerClocks struct {
+	mu    sync.Mutex
+	ahead map[string]int64 // milliseconds, by sign-in and item
+}
+
+// maxClockNotes bounds the notes. Signing out does not remove a sign-in's
+// notes, so they are all dropped when there are this many; a player still
+// open then saves a few seconds late until its film is next started.
+const maxClockNotes = 2000
+
+// noteClock records that the player this sign-in has just been given for
+// an item runs aheadMs ahead of the film: 0 for a file sent as it is and
+// for nearly every repackaged one.
+func (s *Server) noteClock(sessionID, itemID string, aheadMs int64) {
+	c := &s.helpers.clocks
+	key := sessionID + " " + itemID
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if aheadMs <= 0 {
+		delete(c.ahead, key)
+		return
+	}
+	if c.ahead == nil || len(c.ahead) >= maxClockNotes {
+		c.ahead = map[string]int64{}
+	}
+	c.ahead[key] = aheadMs
+}
+
+// clockAhead is how far ahead of the film the player runs that this
+// sign-in was last given for an item, in milliseconds.
+func (s *Server) clockAhead(sessionID, itemID string) int64 {
+	c := &s.helpers.clocks
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ahead[sessionID+" "+itemID]
+}
+
 // playCaps is what this device can do here and now: what it reported, less
 // repackaging when this PC has no converter to do it with.
 func (s *Server) playCaps(u *User) *playback.Caps {
@@ -459,6 +515,18 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		out["url"] = "/stream/" + fileID + "?e=" + strconv.FormatInt(exp, 10) + "&s=" + u.SessionID + "&g=" + sig
 		out["mimeType"] = mediaType(rel, container)
 	}
+	// The place to carry on from is kept in the film's own time. The player
+	// this answer is for gets it on its own clock, and what it reports from
+	// now on is read on that clock (see playerClocks). A film that starts
+	// from the beginning needs no place: its player starts where its list
+	// of chunks tells it to.
+	s.noteClock(u.SessionID, itemID, subtitleShift)
+	if pos > 0 {
+		out["positionMs"] = pos + subtitleShift
+	}
+	// For the page, should it ever need the film's own time from its
+	// player's clock: it is the player's time less this.
+	out["clockAheadMs"] = subtitleShift
 	planOut := map[string]any{"playable": plan.Playable, "method": plan.Method, "reasons": plan.Reasons, "audioTrack": plan.AudioTrack, "audioCopy": plan.AudioCopy, "hasAudio": nil,
 		"deviceUnknown": plan.DeviceUnknown}
 	if ft.media.Probed {

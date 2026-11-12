@@ -61,6 +61,11 @@ type helpers struct {
 	cutRuns  map[string]*cutSearch // by file and stamp
 	cutFails map[string]cutFailure // by file
 	cutSlots chan struct{}
+
+	// clocks has nothing to do with helper programs. It is kept here with
+	// the rest of what the server holds in memory about films being played
+	// (see playerClocks).
+	clocks playerClocks
 }
 
 func newHelpers() *helpers {

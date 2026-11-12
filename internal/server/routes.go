@@ -223,6 +223,12 @@ func (s *Server) handleProgress(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
 	}
+	// What is saved is the film's own time. This player's clock may run
+	// ahead of it (see playerClocks), and its timeline is then as much
+	// longer.
+	if ahead := s.clockAhead(u.SessionID, itemID); ahead > 0 {
+		in.PositionMs, in.DurationMs = max(in.PositionMs-ahead, 0), max(in.DurationMs-ahead, 0)
+	}
 	played := 0
 	if in.DurationMs > 0 && in.PositionMs*100 >= in.DurationMs*92 {
 		played = 1
