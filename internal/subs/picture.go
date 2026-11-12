@@ -19,7 +19,14 @@ type PictureFacts struct {
 	// Width and Height are the size of picture the track was made for.
 	// Its captions are drawn, and placed, for a picture that big, so laid
 	// over a picture of another size they have to be scaled by the
-	// difference. Both are 0 when the file does not say.
+	// difference.
+	//
+	// Both are 0 when the file does not say. That is so for a DVD's track
+	// taken from a file of the kind DVDs themselves use (".vob", ".mpg"),
+	// where the text that describes the track is not in the film, and for
+	// a disc's track without a single caption. Such a track was made for
+	// the film's own picture, as near as anyone can tell: whoever lays it
+	// over the film goes by the film's size.
 	Width, Height int
 	// FirstMs is when the first caption is shown, in thousandths of a
 	// second on the clock the file was written with, or -1 if the track
@@ -35,6 +42,10 @@ var errNotWhole = errors.New("the file is cut short")
 // (disc pictures, PGS), a ".mks" as Extract writes it (DVD or broadcast
 // pictures in a Matroska file), or the ".idx" half of a DVD subtitle pair
 // (VobSub), which is text and says what the ".sub" beside it holds.
+//
+// It is not for films: a film in a Matroska file (".mkv") is refused. It
+// reads the beginning of a file, as far as the first caption, and gives up
+// on a file that has a great deal in it before one.
 func ReadPicture(path string) (PictureFacts, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -44,7 +55,7 @@ func ReadPicture(path string) (PictureFacts, error) {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".sup":
 		return readSUP(f, false)
-	case ".mks", ".mkv":
+	case ".mks":
 		st, err := f.Stat()
 		if err != nil {
 			return PictureFacts{FirstMs: -1}, err
@@ -154,6 +165,15 @@ const unknownSize = -1
 
 var errNotMatroska = errors.New("this is not a Matroska file")
 
+// errNoCaptions means a file was given up on: it has more in it than any
+// subtitle track has before its first caption.
+var errNoCaptions = errors.New("the file holds a great deal and no caption was found in it")
+
+// maxLooked is how many pieces of a Matroska file are looked at for its
+// facts before it is given up on. A subtitle track has a few before its
+// first caption.
+const maxLooked = 100000
+
 // The size broadcast subtitles are made for when they do not say: that of
 // a standard-definition TV picture.
 const dvbWidth, dvbHeight = 720, 576
@@ -189,6 +209,13 @@ func readMKS(r io.ReaderAt, length int64, whole bool) (PictureFacts, error) {
 	}
 	about := mksAbout{scale: 1000000}
 	captions := 0
+	// looked counts the pieces looked at. A file that must be whole is gone
+	// through to its end however much it holds: that is what was asked.
+	looked := 0
+	tooMany := func() bool {
+		looked++
+		return !whole && looked > maxLooked
+	}
 	var saidW, saidH int // the size a broadcast caption gave, if one did
 	// enough says the captions need no more looking at: the first has given
 	// its time, and the first few have had their chance to give a size.
@@ -214,6 +241,9 @@ func readMKS(r io.ReaderAt, length int64, whole bool) (PictureFacts, error) {
 	}
 top:
 	for off := data; off < end; {
+		if tooMany() {
+			return facts, errNoCaptions
+		}
 		id, size, body, err := ebmlHeader(r, off)
 		if err != nil || size == unknownSize || body+size > end {
 			if whole {
@@ -239,7 +269,11 @@ top:
 				break // only its place in the file matters now
 			}
 			var clusterTime int64
+			inOrder := true
 			err := ebmlWalk(r, body, body+size, func(id uint32, at, n int64) bool {
+				if tooMany() {
+					return false
+				}
 				switch id {
 				case idClusterTime:
 					var b [8]byte
@@ -253,18 +287,23 @@ top:
 				case idBlockGroup:
 					// A caption that says how long it stays is wrapped in a
 					// group, with the length beside it.
-					ebmlWalk(r, at, at+n, func(id uint32, at, n int64) bool {
+					if ebmlWalk(r, at, at+n, func(id uint32, at, n int64) bool {
 						if id == idBlock {
 							caption(clusterTime, at, n)
 							return false
 						}
-						return true
-					})
+						return !tooMany()
+					}) != nil {
+						inOrder = false
+					}
 				}
 				return !enough()
 			})
-			if err != nil && whole {
+			if (err != nil || !inOrder) && whole {
 				return facts, errNotWhole
+			}
+			if !whole && looked > maxLooked {
+				return facts, errNoCaptions
 			}
 		}
 		off = body + size

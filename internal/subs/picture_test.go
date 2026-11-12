@@ -186,3 +186,95 @@ func TestReadingAMatroskaTrack(t *testing.T) {
 		t.Errorf("a text file as Matroska: %v", err)
 	}
 }
+
+// A DVD's picture track kept in the kind of file DVDs themselves use
+// (".vob", ".mpg") comes without the text that describes it, and nothing
+// in the film says what size of picture it was made for. It is taken out
+// like any other, with a size of 0 by 0: whoever lays it over the film
+// then goes by the film's own picture.
+func TestADVDTrackWithoutItsDescriptionHasNoSize(t *testing.T) {
+	tl := tools(t)
+	film := filepath.Join(t.TempDir(), "disc.vob")
+	made(t, tl, "-copyts", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=25:duration=6", "-f", "lavfi", "-i", "sine=duration=6",
+		"-fix_sub_duration", "-i", written(t, "two.sup", pgs(t, 1920, 1080, twoCaptions)),
+		"-map", "0:v", "-map", "1:a", "-map", "2:s", "-c:v", "mpeg2video", "-c:a", "mp2", "-c:s", "dvdsub", "-f", "vob", film)
+	dir, res, _ := extracted(t, tl, film)
+	if len(res.Tracks) != 1 {
+		t.Fatalf("tracks: %+v", res.Tracks)
+	}
+	tr := res.Tracks[0]
+	if tr.Codec != "dvd_subtitle" || tr.File != "p0.mks" || !tr.Done || tr.Width != 0 || tr.Height != 0 || tr.FirstMs < 2000 || tr.FirstMs > 3000 {
+		t.Errorf("the track: %+v", tr)
+	}
+	if facts, err := ReadPicture(filepath.Join(dir, "p0.mks")); err != nil || facts != (PictureFacts{FirstMs: tr.FirstMs}) {
+		t.Errorf("ReadPicture: %+v, %v", facts, err)
+	}
+}
+
+// counted counts how often a file is read from.
+type counted struct {
+	r     *bytes.Reader
+	reads int
+}
+
+func (c *counted) ReadAt(p []byte, off int64) (int, error) {
+	c.reads++
+	return c.r.ReadAt(p, off)
+}
+
+// ReadPicture is for picture subtitle files, and looks no further into a
+// file than it takes to find a first caption. A film is not such a file;
+// and a file with millions of things in it and no caption among them is
+// given up on, not gone through to its end.
+func TestReadPictureDoesNotReadWhatIsNotATrack(t *testing.T) {
+	whole := textMKS("S_VOBSUB", textCaption{2000, 1500, "a picture"})
+	if _, err := ReadPicture(written(t, "film.mkv", whole)); err == nil {
+		t.Error("a file called .mkv was read as a picture subtitle track")
+	}
+	if facts, err := ReadPicture(written(t, "track.mks", whole)); err != nil || facts.FirstMs != 2000 {
+		t.Errorf("the same as .mks: %+v, %v", facts, err)
+	}
+	// Two million elements with nothing in them, where the captions would
+	// be: by themselves, and inside one group.
+	nothing := bytes.Repeat([]byte{0xEC, 0x80}, 2000000)
+	about := element(idTracks, element(idTrackEntry, element(idCodecID, []byte("S_VOBSUB"))))
+	for name, file := range map[string][]byte{
+		"at the top":      append(element(idEBML), element(idSegment, about, nothing)...),
+		"inside a group":  append(element(idEBML), element(idSegment, about, element(idCluster, nothing))...),
+		"in group on row": append(element(idEBML), element(idSegment, about, bytes.Repeat(element(idCluster, nothing[:20]), 100000))...),
+	} {
+		c := &counted{r: bytes.NewReader(file)}
+		facts, err := readMKS(c, int64(len(file)), false)
+		if c.reads > 300000 || err == nil {
+			t.Errorf("%s: the file was read from %d times: %+v, %v", name, c.reads, facts, err)
+		}
+		// When the file must be whole it is gone through, as the files
+		// this package has ffmpeg write must be. It is whole.
+		if _, err := readMKS(bytes.NewReader(file), int64(len(file)), true); err != nil {
+			t.Errorf("%s, as a file that must be whole: %v", name, err)
+		}
+	}
+}
+
+// A file that must be whole is not if a group of captions, or a caption
+// in one, says it is longer than what it is in.
+func TestAMatroskaTrackWithAnOverlongPieceIsNotWhole(t *testing.T) {
+	whole := textMKS("S_VOBSUB", textCaption{2000, 1500, "a picture"}, textCaption{5000, 1500, "another"})
+	if facts, err := readMKS(bytes.NewReader(whole), int64(len(whole)), true); err != nil || facts.FirstMs != 2000 {
+		t.Fatalf("the whole file: %+v, %v", facts, err)
+	}
+	// Every element here gives its length in the eight bytes before its
+	// content; the last of them is raised, by more than there is room for
+	// in what the element is in.
+	block := bytes.Index(whole, []byte{0x81, 0, 0, 0, 'a', ' ', 'p'})
+	group := block - 9 - 8 // the block's name and length, and the group's length
+	for name, at := range map[string]int{"a caption": block - 1, "a group's caption and length together": group + 7} {
+		spoiled := append([]byte{}, whole...)
+		spoiled[at] += 64
+		if _, err := readMKS(bytes.NewReader(spoiled), int64(len(spoiled)), true); !errors.Is(err, errNotWhole) {
+			t.Errorf("%s said to be 64 bytes longer than it is: %v", name, err)
+		}
+		// Read for its facts alone, it does not stumble.
+		readMKS(bytes.NewReader(spoiled), int64(len(spoiled)), false)
+	}
+}
