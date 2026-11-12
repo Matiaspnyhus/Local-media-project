@@ -20,6 +20,12 @@ type Want struct {
 	// Audio is the sound track, counted from 0; -1 for the file's own main
 	// track (see BrowserAudio).
 	Audio int `json:"audio"`
+	// AudioAuto says the app picked Audio itself, from the viewer's
+	// language settings or from what they chose earlier in the show, and
+	// the viewer did not pick it for this play. It changes no decision,
+	// only the words of one reason, which must not say "you chose" to
+	// someone who did not.
+	AudioAuto bool `json:"audioAuto"`
 	// Subtitle counts into Media.Subtitles; -1 for none.
 	Subtitle int `json:"subtitle"`
 	// Styled says what to do with styled subtitles where the page cannot
@@ -29,7 +35,14 @@ type Want struct {
 	Styled Styling `json:"styled"`
 	// Lower asks for a lighter picture: the number of the best rung that
 	// may be used (see Ladder). 0 means no wish. It comes from the viewer
-	// ("lighter picture") or from StepDown, never from the planner.
+	// ("lighter picture", see Lighter) and from nobody else: a step after
+	// trouble asks through Limits.Lower.
+	//
+	// It is a wish, not a demand. A film that is converted anyway is made
+	// at that rung or a lighter one. A film that would play as it is gets
+	// converted for it where this PC can; where it cannot, the film plays
+	// as it would have without the wish. Asking for lighter than the
+	// lightest rung gives the lightest.
 	Lower int `json:"lower"`
 }
 
@@ -47,6 +60,12 @@ const (
 type Limits struct {
 	// Convert says this PC can convert pictures at all.
 	Convert bool `json:"convert"`
+	// NoConverter says this PC has no converter program at all, so it can
+	// neither repackage a film nor convert anything in it, whatever the
+	// device takes and whatever Convert says. It is told apart from a
+	// device that takes no repackaged video (Caps.HLS) so that the answer
+	// names the PC, not the browser.
+	NoConverter bool `json:"noConverter"`
 	// ToneMap says its converter can turn HDR into normal colour, and
 	// DoViTone that it can do so for Dolby Vision profile 5, which needs a
 	// filter of its own (tonemapx).
@@ -62,6 +81,13 @@ type Limits struct {
 	// Busy is how many pictures are being converted already, each of which
 	// takes its share of the PC.
 	Busy int `json:"busy"`
+	// Lower is the best rung a converted picture may use in this play; 0
+	// for any. A step after trouble sets it (this PC did not keep up with
+	// the rung before it, see StepDown). Unlike the viewer's own wish
+	// (Want.Lower) it never has a film converted that would play as it
+	// is, and it belongs to the play that took the step, not to later
+	// ones.
+	Lower int `json:"lower"`
 	// MaxHeight caps how large a converted picture may be, in lines; 0 for
 	// no cap. It comes from a lesson: this device had trouble showing the
 	// converted picture at a larger size.
@@ -75,6 +101,13 @@ type Limits struct {
 	// look wrong on this device, so HDR pictures are converted to normal
 	// colour for it where this PC can.
 	NoHDR bool `json:"noHdr"`
+	// Trouble lists the kinds of picture this device had trouble showing
+	// when it was sent a film's own picture (lessons, see StepDown). A film
+	// of the same format and bit depth, at that size or larger, is
+	// converted for the device where this PC can. What the device itself
+	// reports (Caps) is left as it reported it, so that the reason given
+	// can say which of the two it was.
+	Trouble []PictureKind `json:"trouble"`
 }
 
 // Class sorts films by how much work their picture is to convert. The
@@ -280,20 +313,31 @@ func blind(p Plan, sub *Subtitle, w Want) Plan {
 	return p
 }
 
-// advised converts a film that would play as it is (p) when a lesson says
-// that is the better way: the connection is too slow for the original, or
-// the device shows HDR wrongly. A lesson is advice. Where this PC cannot
-// follow it, the film plays as it would have without the lesson, which
-// beats not playing.
+// advised converts a film that would play as it is (p) when there is
+// advice to: a lesson (the device had trouble showing this kind of picture,
+// the connection is too slow for the original, the device shows HDR
+// wrongly) or the viewer's wish for a lighter picture. Advice is not law.
+// Where this PC cannot follow it, the film plays as it would have without
+// it, which beats not playing.
 func advised(p Plan, other []string, m Media, a *Track, c *Caps, w Want, l Limits) Plan {
+	v := m.Video[0]
 	var why []string
-	if l.MaxRate > 0 && (m.BitRate <= 0 || m.BitRate > l.MaxRate) {
+	if troubled(l.Trouble, v) {
+		why = append(why, "Its picture is "+named(v)+", which this device has had trouble showing.")
+	}
+	if l.MaxRate > 0 && rateOf(m) > l.MaxRate {
 		why = append(why, "Films have been reaching this device too slowly, so a lighter picture is made for it.")
 	}
-	if l.NoHDR && isHDR(m.Video[0]) {
+	if l.NoHDR && isHDR(v) {
 		why = append(why, "HDR colours were reported to look wrong on this device, so the picture is converted to normal colour.")
 	}
-	if len(why) == 0 || !l.Convert {
+	if w.Lower > 0 && len(why) == 0 {
+		// Said only where nothing else is: beside another reason the wish
+		// only picks the rung, and what the viewer sees of that is the
+		// smaller picture named among what is lost.
+		why = append(why, "You asked for a lighter picture.")
+	}
+	if len(why) == 0 || !l.Convert || l.NoConverter {
 		return p
 	}
 	if q := converted(p, append(why, other...), m, a, c, w, l); q.Playable != No {
@@ -302,14 +346,103 @@ func advised(p Plan, other []string, m Media, a *Track, c *Caps, w Want, l Limit
 	return p
 }
 
+// troubled says a device has had trouble showing a picture like v: a
+// lesson names the same format and bit depth at this size or a smaller
+// one. A device that could not show a format at 720p is not sent it at
+// 1080p either, while one that failed at 4K is still sent 1080p. A lesson
+// from a film whose size was not read speaks for every size.
+func troubled(kinds []PictureKind, v Track) bool {
+	own := pictureOf(v)
+	for _, k := range kinds {
+		if k.Codec == own.Codec && (k.BitDepth > 8) == (own.BitDepth > 8) && (k.Size == "" || sizeRank(own.Size) >= sizeRank(k.Size)) {
+			return true
+		}
+	}
+	return false
+}
+
+// sizeRank puts the sizes in order. A picture whose size was not read
+// counts as 1080p here, as it does everywhere else: never as larger.
+func sizeRank(s Size) int {
+	switch s {
+	case Size480:
+		return 1
+	case Size720:
+		return 2
+	case Size4K:
+		return 4
+	}
+	return 3
+}
+
+// named is a picture's size and format in the words people know them by,
+// such as "4K 10-bit HEVC (H.265)".
+func named(v Track) string {
+	if size := sizeWord(v.Width, v.Height); size != "" {
+		return size + " " + VideoName(v)
+	}
+	return VideoName(v)
+}
+
+// rateOf is how many bits a second a file spends, as far as is known.
+// Where the file does not say, the size of its picture stands in: it is
+// taken to spend what the ladder allows a picture of that size, and a
+// picture larger than 1080p, or one whose size is not known either, to
+// spend more than any cap. That keeps a slow connection from having a
+// small film converted that was light all along.
+func rateOf(m Media) int {
+	if m.BitRate > 0 {
+		return m.BitRate
+	}
+	v := m.Video[0]
+	switch sizeOf(v.Width, v.Height) {
+	case Size480:
+		return ladder[NumRungs-1].MaxRate
+	case Size720:
+		return ladder[2].MaxRate
+	case Size1080:
+		return ladder[0].MaxRate
+	}
+	return math.MaxInt
+}
+
+// Lighter is the rung to ask for (Want.Lower) when the viewer wants a
+// lighter picture than plan p of film m gives them: the next rung down
+// from a converted picture; for a film sent with its own picture, the best
+// rung that is really lighter than the film, which is one that makes the
+// picture smaller or may spend fewer bits a second than the file does. 0
+// means nothing lighter is made.
+//
+// Whether this PC keeps up with that rung is for DecideFor to say: the
+// plan that comes back may be the same as p, and the viewer is then told
+// that this is the lightest picture there is.
+func Lighter(m Media, p Plan) int {
+	if p.Method == Convert {
+		if p.Video.Rung >= 1 && p.Video.Rung < NumRungs {
+			return p.Video.Rung + 1
+		}
+		return 0
+	}
+	if p.Playable == No || len(m.Video) == 0 {
+		return 0
+	}
+	v := m.Video[0]
+	for n, r := range ladder {
+		if !fits(v.Width, v.Height, r.Height) || rateOf(m) > r.MaxRate {
+			return n + 1
+		}
+	}
+	return 0
+}
+
 // converted is the plan that converts the picture, for the reasons given,
 // or the answer that says why this PC cannot. p carries the sound track
 // and the subtitles already settled.
 //
 // What comes out is 8-bit H.264 in chunks. Whether the device plays H.264
-// is not asked: everything that takes chunks does, and a lesson that
-// switched "h264" off (see StepDown) is about a film's own H.264, which is
-// exactly what converting replaces.
+// is not asked: everything that takes chunks does, and a lesson about
+// H.264 (Limits.Trouble) is about a film's own H.264, which is exactly
+// what converting replaces.
 func converted(p Plan, why []string, m Media, a *Track, c *Caps, w Want, l Limits) Plan {
 	v := m.Video[0]
 	if !c.HLS {
@@ -318,9 +451,9 @@ func converted(p Plan, why []string, m Media, a *Track, c *Caps, w Want, l Limit
 	hdr := isHDR(v)
 	switch {
 	case v.DoVi == 5 && !l.DoViTone:
-		return refuse(p, append(why, "This PC's converter cannot turn Dolby Vision of this kind into normal colour, so it cannot convert this film."))
+		return cannot(p, append(why, "This PC's converter cannot turn Dolby Vision of this kind into normal colour, so it cannot convert this film."))
 	case v.DoVi != 5 && hdr && !l.ToneMap:
-		return refuse(p, append(why, "This PC's converter cannot turn HDR into normal colour, so it cannot convert this film."))
+		return cannot(p, append(why, "This PC's converter cannot turn HDR into normal colour, so it cannot convert this film."))
 	}
 	// Sound that the device plays is passed on beside the new picture, so
 	// surround survives. AAC is passed on only out of the files that store
@@ -329,15 +462,21 @@ func converted(p Plan, why []string, m Media, a *Track, c *Caps, w Want, l Limit
 	// converting it is the safe way.
 	keep := a == nil || (c.Audio[a.Codec] && (a.Codec == "ac3" || a.Codec == "eac3" ||
 		a.Codec == "aac" && (m.Container == "matroska" || m.Container == "mp4" || m.Container == "mov")))
-	if !keep && !c.Audio["aac"] {
-		return refuse(p, append(why, "This browser reports no sound format the sound could be converted to."))
-	}
 	class := classOf(v)
 	rung, best := pickRung(v, w, l)
-	if rung == 0 {
-		no := refuse(p, append(why, tooSlow(best, barFor(class), l.Busy)))
+	if rung == 0 && (keep || c.Audio["aac"]) {
+		no := cannot(p, append(why, tooSlow(best, barFor(class), l.Busy)))
 		no.TooSlow = true
 		return no
+	}
+	if !keep && c.Audio[a.Codec] {
+		// The device plays this sound, so nothing above says why it is
+		// converted all the same. (The list passed in is not written
+		// into.)
+		why = append(why[:len(why):len(why)], "Its sound is "+AudioName(a.Codec)+", which cannot be sent along with a converted picture as it is, so it is converted as well.")
+	}
+	if !keep && !c.Audio["aac"] {
+		return refuse(p, append(why, "This browser reports no sound format the sound could be converted to."))
 	}
 	r := ladder[rung-1]
 	width, height := fit(v.Width, v.Height, r.Height)
@@ -345,7 +484,7 @@ func converted(p Plan, why []string, m Media, a *Track, c *Caps, w Want, l Limit
 	p.Video = Video{Rung: rung, Height: height, Encoder: encoderName(l.Encoder), HDRToSDR: hdr, Class: class}
 	p.Picture = PictureKind{Codec: "h264", BitDepth: 8, Size: sizeOf(width, height)}
 	p.Lost = []string{}
-	if v.Height > 0 && height < v.Height {
+	if v.Height > 0 && !fits(v.Width, v.Height, r.Height) {
 		p.Lost = append(p.Lost, sizeWord(v.Width, v.Height)+" picture shown as "+strconv.Itoa(r.Height)+"p.")
 	}
 	switch {
@@ -363,78 +502,87 @@ func converted(p Plan, why []string, m Media, a *Track, c *Caps, w Want, l Limit
 	return p
 }
 
-// pickRung picks the setting a film's picture is converted at: the first
-// rung, best first, that is allowed (no better than Want.Lower, no larger
-// than Limits.MaxHeight, no more bits than Limits.MaxRate) and that this
-// PC keeps up with, sharing itself with what it is converting already.
+// pickRung picks the setting a film's picture is converted at.
 //
-// A rung that has not been measured is trusted from a safe starting point
-// down: rung 1 for a film up to 1080p in normal colour, rung 3 for 4K and
-// for HDR. A rung measured below its bar is never picked.
+// A rung keeps up when this PC converts at it fast enough, sharing itself
+// with what it is converting already. A lighter rung is never slower than
+// a heavier one, so a rung counts as no faster than any lighter rung was
+// measured: a film that showed a light rung to be slow speaks for the
+// heavier ones too, whether they were measured or not. A rung measured
+// below its bar is never picked.
 //
-// It returns 0 when no rung will do, with the best speed any allowed rung
-// was measured at (0 if none was measured), for the answer to quote.
+// A rung that was never measured, with nothing lighter speaking against
+// it, is trusted from a safe starting point down: rung 1 for a film up to
+// 1080p in normal colour, rung 3 for 4K and for HDR, and one rung further
+// down for each picture this PC is converting already.
+//
+// Of the rungs that keep up, the best is picked that is no better than
+// Want.Lower and Limits.Lower ask, no larger than Limits.MaxHeight and
+// spends no more bits than Limits.MaxRate. None of these rules out the
+// last rung: there is nothing lighter to fall back to, and a film that is
+// larger or heavier than was wished for beats no film.
+//
+// It returns 0 only when no rung keeps up at all, which is when the
+// lightest one was measured too slow, with that rung's speed for the
+// answer to quote.
 func pickRung(v Track, w Want, l Limits) (rung int, best float64) {
 	class := classOf(v)
 	need := barFor(class)
 	speeds := l.Speed[class]
 	share := 1.0
-	if l.Busy > 0 {
-		share = float64(l.Busy + 1)
-	}
 	start := 1
 	if class != ClassHD {
 		start = 3
 	}
-	for n := 1; n <= NumRungs; n++ {
-		r := ladder[n-1]
-		if n < w.Lower {
-			continue
-		}
-		// The caps do not rule out the last rung: there is nothing lighter
-		// to fall back to, and a film that is too large beats no film.
-		if n < NumRungs {
-			if l.MaxRate > 0 && r.MaxRate > l.MaxRate {
-				continue
-			}
-			if width, height := fit(v.Width, v.Height, r.Height); l.MaxHeight > 0 && !fits(width, height, l.MaxHeight) {
-				continue
-			}
-		}
+	if l.Busy > 0 {
+		share = float64(l.Busy + 1)
+		start = min(start+min(l.Busy, NumRungs), NumRungs)
+	}
+	var keeps [NumRungs + 1]bool
+	slowest := math.Inf(1) // the slowest speed measured at this rung or a lighter one
+	for n := NumRungs; n >= 1; n-- {
 		speed := speeds[n-1]
-		if !(speed > 0) {
-			// Not measured.
-			if n >= start {
-				return n, 0
-			}
+		measured := speed > 0
+		if measured {
+			slowest = math.Min(slowest, speed)
+		}
+		keeps[n] = (measured || n >= start) && slowest/share >= need
+	}
+	if !keeps[NumRungs] {
+		return 0, speeds[NumRungs-1] / share
+	}
+	for n := 1; n < NumRungs; n++ {
+		r := ladder[n-1]
+		if !keeps[n] || n < w.Lower || n < l.Lower {
 			continue
 		}
-		if speed /= share; speed >= need {
-			return n, 0
+		if l.MaxRate > 0 && r.MaxRate > l.MaxRate {
+			continue
 		}
-		best = math.Max(best, speed)
-	}
-	if w.Lower > NumRungs {
-		// Asked for lighter than the lightest. If that one was measured
-		// too slow, its figure is the one to quote.
-		if speed := speeds[NumRungs-1] / share; speed > 0 && speed < need {
-			best = speed
+		if width, height := fit(v.Width, v.Height, r.Height); l.MaxHeight > 0 && !fits(width, height, l.MaxHeight) {
+			continue
 		}
+		return n, 0
 	}
-	return 0, best
+	return NumRungs, 0
 }
 
-// tooSlow says that no setting keeps up, quoting what was measured.
+// tooSlow says that no setting keeps up, quoting what was measured. It
+// also says what the figure is held against: a reader who sees "1.4
+// seconds of film a second" would otherwise take that for fast enough.
 func tooSlow(best, need float64, busy int) string {
 	s := "This PC cannot convert this film fast enough to watch"
 	if best > 0 {
-		s += ": at best it manages " + figure(best) + " seconds of film a second, and it takes " + figure(need) + " to keep up"
+		s += ": at best it manages " + figure(best) + " seconds of film a second"
 	}
 	switch {
 	case busy == 1:
 		s += " while it is converting for another screen as well"
 	case busy > 1:
 		s += " while it is converting for " + strconv.Itoa(busy) + " other screens as well"
+	}
+	if best > 0 {
+		s += ", and the app asks for " + figure(need) + " so that the film does not stop when you jump or the PC has other work"
 	}
 	return s + "."
 }
@@ -520,8 +668,9 @@ func fits(width, height, lines int) bool {
 }
 
 // fit is the size a picture has once it is made to fit the frame that is
-// lines tall: shrunk if it has to be, never enlarged. A picture of unknown
-// size is taken to fill the frame.
+// lines tall: shrunk if it has to be, never enlarged, and with an even
+// number of pixels each way, as H.264 wants (a picture of 853x479 comes
+// out as 852x478). A picture of unknown size is taken to fill the frame.
 func fit(width, height, lines int) (int, int) {
 	if height <= 0 {
 		return 0, lines
@@ -529,6 +678,7 @@ func fit(width, height, lines int) (int, int) {
 	w, h, upright := lying(width, height)
 	switch {
 	case fits(w, h, lines):
+		w, h = w&^1, h&^1
 	case w*9 <= h*16:
 		// No wider than the frame's shape: the height decides.
 		w, h = (w*lines/h)&^1, lines
@@ -560,15 +710,41 @@ func sizeOf(width, height int) Size {
 	return Size480
 }
 
-// sizeWord names a picture's size the way people know it.
+// sizeWord names a picture's size the way people know it: "1080p" for a
+// picture that fills the 1080p frame from side to side or from top to
+// bottom (a wide film of 1920x800 is a 1080p film), "4K" for the large
+// ones. A picture that fills none of the frames is named by its own
+// numbers, "720x576" or "1920x1200", since any of the names would say
+// something untrue about it.
 func sizeWord(width, height int) string {
-	s := sizeOf(width, height)
-	width, height, _ = lying(width, height)
-	switch {
-	case s == Size4K && (height > 1440 || width > 2560):
-		return "4K"
-	case s == Size4K:
-		return "1440p"
+	w, h, _ := lying(width, height)
+	frame := 0
+	switch sizeOf(width, height) {
+	case "":
+		return ""
+	case Size4K:
+		if h > 1440 || w > 2560 {
+			return "4K"
+		}
+		// What lies between 1080p and 4K is called 1440p only by its
+		// lines: 2560x1080 is a wide screen's 1080p, not 1440p.
+		if h*20 >= 1440*19 {
+			return "1440p"
+		}
+	case Size1080:
+		frame = 1080
+	case Size720:
+		frame = 720
+	case Size480:
+		frame = 480
 	}
-	return string(s)
+	// A film with its black bars cut off is often a few pixels short of
+	// the frame; within a twentieth it still goes by the frame's name.
+	if frame > 0 && (h*20 >= frame*19 || w*20 >= wide(frame)*19) {
+		return strconv.Itoa(frame) + "p"
+	}
+	if w <= 0 {
+		return strconv.Itoa(h) + "p"
+	}
+	return strconv.Itoa(width) + "x" + strconv.Itoa(height)
 }
