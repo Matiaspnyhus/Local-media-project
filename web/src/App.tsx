@@ -647,7 +647,7 @@ function UpdateCard() {
           {st.available && st.waiting && !waiting && !interrupts && (
             <p className="note" data-testid="update-waiting">
               It is waiting for a quiet moment: it installs by itself as soon as nobody is watching.
-              {st.watching.length > 0 && ` Watching right now: ${st.watching.join(', ')}.`}
+              {(st.watching || []).length > 0 && ` Watching right now: ${st.watching.join(', ')}.`}
             </p>
           )}
           {interrupts && (
