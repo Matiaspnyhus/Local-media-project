@@ -170,11 +170,13 @@ func (a *app) run() (err error) {
 	}()
 	errc := make(chan error, 1)
 	go func() { errc <- httpSrv.Serve(ln) }()
-	close(a.ready)
 	// A note of which process is running, removed again on the way out.
+	// It is written before the program says it is ready, so that whoever
+	// waits for "ready" finds the data folder as it will stay.
 	pidFile := filepath.Join(o.dataDir, "localmedia.pid")
 	os.WriteFile(pidFile, []byte(fmt.Sprint(os.Getpid())), 0o600)
 	defer os.Remove(pidFile)
+	close(a.ready)
 	a.upd.started()
 	if !o.noBrowser && !o.after {
 		go openBrowser(a.localURL())
