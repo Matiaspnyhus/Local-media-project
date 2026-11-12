@@ -28,8 +28,11 @@ import (
 //	           at zero, and a jump in it does not land on a key frame.
 //	phone:     30 frames a second with every fifth frame missing, as a phone
 //	           records in poor light.
-//	frozen:    19 seconds in which nothing new is shown for nine: the file
-//	           holds no frame between 4 and 13 seconds.
+//	frozen:    19 seconds in which nothing new is shown for eleven: the file
+//	           holds no frame between 3.5 and 14.5 seconds. Its sound goes
+//	           on all the while, so the sound for the chunk after the cut at
+//	           3 seconds has been read long before the picture for it can be
+//	           made.
 //	longsound: 9.8 seconds of picture with 22 seconds of sound. The last
 //	           chunk has 0.8 seconds of picture in it and all the rest of
 //	           the sound.
@@ -77,7 +80,7 @@ func convertFilm(t *testing.T, ffmpeg, name string) string {
 		recipe = join(pic("30", "16"), snd("16"), []string{"-vf", `select=not(eq(mod(n\,5)\,3))`, "-fps_mode", "vfr"}, x264,
 			[]string{"-g", "120", "-c:a", "aac", "-b:a", "96k", p})
 	case "frozen":
-		recipe = join(pic("30", "19"), snd("19"), []string{"-vf", `select=not(between(t\,4.01\,13))`, "-fps_mode", "vfr"}, x264,
+		recipe = join(pic("30", "19"), snd("19"), []string{"-vf", `select=not(between(t\,3.51\,14.49))`, "-fps_mode", "vfr"}, x264,
 			[]string{"-g", "120", "-c:a", "aac", "-b:a", "96k", p})
 	case "longsound":
 		recipe = join(pic("24", "9.8"), snd("22"), x264, []string{"-g", "100", "-c:a", "aac", "-b:a", "96k", p})
