@@ -2,7 +2,6 @@ package server
 
 import (
 	"archive/zip"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -197,6 +196,7 @@ func (s *Server) handleLogout(w http.ResponseWriter, r *http.Request) {
 	if s.hls != nil {
 		s.hls.Drop(u.SessionID) // stop anything being converted for this sign-in
 	}
+	s.forgetCaps(u.SessionID)
 	http.SetCookie(w, &http.Cookie{Name: cookieName, Value: "", Path: "/", HttpOnly: true, MaxAge: -1, SameSite: http.SameSiteLaxMode})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -388,13 +388,12 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "This link is not valid any more.")
 		return
 	}
-	var revoked sql.NullInt64
-	if err := s.db.QueryRow(`SELECT revoked_at FROM sessions WHERE id=?`, sessionID).Scan(&revoked); err != nil || revoked.Valid {
+	if !s.signInAlive(sessionID) {
 		writeErr(w, http.StatusForbidden, "This link is not valid any more.")
 		return
 	}
-	var libPath, rel string
-	err = s.db.QueryRow(`SELECT l.path, f.rel_path FROM files f JOIN libraries l ON l.id=f.library_id WHERE f.id=?`, fileID).Scan(&libPath, &rel)
+	var libPath, rel, container string
+	err = s.db.QueryRow(`SELECT l.path, f.rel_path, f.container FROM files f JOIN libraries l ON l.id=f.library_id WHERE f.id=?`, fileID).Scan(&libPath, &rel, &container)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
@@ -406,7 +405,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 	s.lastStream.Store(time.Now().Unix())
-	if ct := mediaTypes[strings.ToLower(filepath.Ext(rel))]; ct != "" {
+	if ct := mediaType(rel, container); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	} else {
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -468,7 +467,13 @@ func (s *Server) handleSupportBundle(w http.ResponseWriter, r *http.Request) {
 	info["converter"] = map[string]any{"found": s.hls != nil, "inspectorFound": s.ffprobe != ""}
 	add("info.json", info)
 	add("not-found-online.json", unmatched)
-	add("playback-problems.json", s.events.all())
+	// What players and the converter reported is scrubbed like the log:
+	// either can quote an address or a link.
+	problems := s.events.all()
+	for i := range problems {
+		problems[i].Detail = string(redact([]byte(problems[i].Detail)))
+	}
+	add("playback-problems.json", problems)
 	add("devices.json", s.deviceReports())
 	if f, err := zw.Create("log.txt"); err == nil {
 		f.Write(s.log.tail(512 << 10))

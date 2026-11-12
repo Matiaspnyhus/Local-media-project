@@ -2,14 +2,14 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -47,15 +47,17 @@ type subtitleView struct {
 
 // fileTracks is everything a file offers a viewer.
 type fileTracks struct {
-	media    playback.Media
-	subs     []playback.Subtitle // text subtitles, inside the file and beside it
-	subKeys  []string            // "e2": the third subtitle track inside; "x<id>": a file beside it
-	pictures int                 // picture subtitles, which cannot be shown yet
+	media playback.Media
+	// subs are the text subtitles, inside the file and beside it. Each has
+	// a Key: "e2" is the third subtitle track inside the file, "x..." a
+	// file beside it (see sidecarKey).
+	subs     []playback.Subtitle
+	pictures int // picture subtitles, which cannot be shown yet
 }
 
 func (s *Server) loadTracks(fileID string, probed bool, container string) (fileTracks, error) {
 	ft := fileTracks{media: playback.Media{Probed: probed, Container: container}}
-	rows, err := s.db.Query(`SELECT kind, codec, bit_depth, channels, language, title, is_default, is_forced, is_commentary, is_hearing_impaired
+	rows, err := s.db.Query(`SELECT kind, codec, codec_tag, bit_depth, channels, language, title, is_default, is_forced, is_commentary, is_hearing_impaired
 		FROM streams WHERE file_id=? ORDER BY idx`, fileID)
 	if err != nil {
 		return ft, err
@@ -65,7 +67,7 @@ func (s *Server) loadTracks(fileID string, probed bool, container string) (fileT
 		var kind string
 		var t playback.Track
 		var def, forced, com, hi int
-		if err := rows.Scan(&kind, &t.Codec, &t.BitDepth, &t.Channels, &t.Language, &t.Title, &def, &forced, &com, &hi); err != nil {
+		if err := rows.Scan(&kind, &t.Codec, &t.Tag, &t.BitDepth, &t.Channels, &t.Language, &t.Title, &def, &forced, &com, &hi); err != nil {
 			rows.Close()
 			return ft, err
 		}
@@ -77,8 +79,8 @@ func (s *Server) loadTracks(fileID string, probed bool, container string) (fileT
 			ft.media.Audio = append(ft.media.Audio, t)
 		case "subtitle":
 			if textSubtitles[t.Codec] {
-				ft.subs = append(ft.subs, playback.Subtitle{Language: t.Language, Forced: t.Forced, HearingImpaired: t.HearingImpaired, Default: t.Default, Title: t.Title})
-				ft.subKeys = append(ft.subKeys, "e"+strconv.Itoa(nSub))
+				ft.subs = append(ft.subs, playback.Subtitle{Key: "e" + strconv.Itoa(nSub), Language: t.Language, Forced: t.Forced,
+					HearingImpaired: t.HearingImpaired, Default: t.Default, Title: t.Title})
 			} else {
 				ft.pictures++
 			}
@@ -89,23 +91,46 @@ func (s *Server) loadTracks(fileID string, probed bool, container string) (fileT
 	if err := rows.Err(); err != nil {
 		return ft, err
 	}
-	rows, err = s.db.Query(`SELECT id, format, language, is_forced FROM sidecars WHERE file_id=? ORDER BY rel_path`, fileID)
+	rows, err = s.db.Query(`SELECT rel_path, format, language, is_forced FROM sidecars WHERE file_id=? ORDER BY rel_path`, fileID)
 	if err != nil {
 		return ft, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var id, format, lang string
+		var rel, format, lang string
 		var forced int
-		if err := rows.Scan(&id, &format, &lang, &forced); err != nil {
+		if err := rows.Scan(&rel, &format, &lang, &forced); err != nil {
 			return ft, err
 		}
 		if textSubtitles[strings.ToLower(format)] {
-			ft.subs = append(ft.subs, playback.Subtitle{Language: lang, Forced: forced != 0})
-			ft.subKeys = append(ft.subKeys, "x"+id)
+			ft.subs = append(ft.subs, playback.Subtitle{Key: sidecarKey(rel), Language: lang, Forced: forced != 0})
 		}
 	}
 	return ft, rows.Err()
+}
+
+// sidecarKey names a subtitle file beside a film in addresses: "x" and a
+// fingerprint of the file's path. It is not made from the file's row in the
+// database, because every scan writes those rows afresh, and an address
+// handed to a player must keep working after the next scan.
+func sidecarKey(relPath string) string {
+	sum := sha256.Sum256([]byte(relPath))
+	return "x" + hex.EncodeToString(sum[:])[:32]
+}
+
+// sidecar finds the subtitle file beside a film that key names.
+func (s *Server) sidecar(fileID, key string) (relPath, format string, ok bool) {
+	rows, err := s.db.Query(`SELECT rel_path, format FROM sidecars WHERE file_id=?`, fileID)
+	if err != nil {
+		return "", "", false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if rows.Scan(&relPath, &format) == nil && sidecarKey(relPath) == key {
+			return relPath, format, true
+		}
+	}
+	return "", "", false
 }
 
 var languageNames = map[string]string{
@@ -205,20 +230,35 @@ func (s *Server) scopeOf(itemID string) (string, error) {
 	return itemID, nil
 }
 
+// playedFile is the tail of the query that finds the file an item plays
+// from. Playing and remembering a pick both use it, so a pick is always
+// read against the file it was made on.
+const playedFile = ` FROM items i JOIN versions v ON v.item_id=i.id JOIN files f ON f.version_id=v.id JOIN libraries l ON l.id=f.library_id
+		WHERE i.id=? AND f.missing=0 ORDER BY f.part_index LIMIT 1`
+
 // handleChoice remembers the sound and subtitles a viewer picked, so the
-// next episode starts the same way.
+// same film, and the next episode of a show, start the same way.
+//
+// The page says which tracks were picked (audioIndex and subKey). What is
+// kept of them, their language and kind, is read from the server's own
+// record of the file. A page loaded before those two were added sends only
+// two languages and whether subtitles were on, which is kept as it comes.
 func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 	itemID := chi.URLParam(r, "id")
 	var in struct {
-		AudioLang string `json:"audioLang"`
-		SubLang   string `json:"subLang"`
-		SubsOn    bool   `json:"subsOn"`
+		AudioLang  string  `json:"audioLang"`
+		SubLang    string  `json:"subLang"`
+		SubsOn     bool    `json:"subsOn"`
+		AudioIndex *int    `json:"audioIndex"` // counted from 0, -1 for none
+		SubKey     *string `json:"subKey"`     // "" for off
 	}
 	if !readJSON(w, r, &in) {
 		return
 	}
-	in.AudioLang, in.SubLang = playback.Lang(in.AudioLang), playback.Lang(in.SubLang)
-	if !ids.Valid(itemID) || !langCode.MatchString(in.AudioLang) || !langCode.MatchString(in.SubLang) {
+	// A language is whatever the file, or a subtitle file's name, called
+	// it: usually a short code, sometimes a word ("english"). It is only
+	// ever compared, so only its length is checked.
+	if !ids.Valid(itemID) || len(in.AudioLang) > 40 || len(in.SubLang) > 40 {
 		writeErr(w, http.StatusBadRequest, "That choice could not be read.")
 		return
 	}
@@ -227,18 +267,56 @@ func (s *Server) handleChoice(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
 	}
-	on := 0
-	if in.SubsOn {
+	mem := playback.Memory{AudioLang: playback.Lang(in.AudioLang), SubLang: playback.Lang(in.SubLang), SubsOn: in.SubsOn}
+	if in.AudioIndex != nil && in.SubKey != nil {
+		var fileID, container string
+		var probed int
+		if s.db.QueryRow(`SELECT f.id, f.probed, f.container`+playedFile, itemID).Scan(&fileID, &probed, &container) == nil {
+			if ft, err := s.loadTracks(fileID, probed == 1, container); err == nil {
+				// A pick the file does not have (it changed meanwhile) is
+				// not kept as one; the languages sent with it still are.
+				if m, ok := playback.Remember(ft.media.Audio, ft.subs, *in.AudioIndex, *in.SubKey); ok {
+					mem = m
+				}
+			}
+		}
+	}
+	on, audioKind, audioIndex, subKey := 0, "", -1, ""
+	if mem.SubsOn {
 		on = 1
 	}
-	_, err = s.db.Exec(`INSERT INTO track_memory(user_id,scope_id,audio_lang,sub_lang,subs_on,updated_at) VALUES(?,?,?,?,?,?)
-		ON CONFLICT(user_id,scope_id) DO UPDATE SET audio_lang=excluded.audio_lang, sub_lang=excluded.sub_lang,
-		subs_on=excluded.subs_on, updated_at=excluded.updated_at`, currentUser(r).ID, scope, in.AudioLang, in.SubLang, on, time.Now().Unix())
+	if mem.Commentary {
+		audioKind = "commentary"
+	}
+	if mem.Pick != nil {
+		audioIndex, subKey = mem.Pick.Audio, mem.Pick.Subtitle
+	}
+	_, err = s.db.Exec(`INSERT INTO track_memory(user_id,scope_id,audio_lang,sub_lang,subs_on,audio_index,audio_kind,sub_key,sub_kind,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)
+		ON CONFLICT(user_id,scope_id) DO UPDATE SET audio_lang=excluded.audio_lang, sub_lang=excluded.sub_lang, subs_on=excluded.subs_on,
+		audio_index=excluded.audio_index, audio_kind=excluded.audio_kind, sub_key=excluded.sub_key, sub_kind=excluded.sub_kind, updated_at=excluded.updated_at`,
+		currentUser(r).ID, scope, mem.AudioLang, mem.SubLang, on, audioIndex, audioKind, subKey, mem.SubKind, time.Now().Unix())
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "Could not save.")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// loadMemory reads what a viewer last picked for a show or a film, or nil
+// if nothing was.
+func (s *Server) loadMemory(userID, scope string) *playback.Memory {
+	var m playback.Memory
+	var on, audioIndex int
+	var audioKind, subKey string
+	if s.db.QueryRow(`SELECT audio_lang, sub_lang, subs_on, audio_index, audio_kind, sub_key, sub_kind FROM track_memory WHERE user_id=? AND scope_id=?`,
+		userID, scope).Scan(&m.AudioLang, &m.SubLang, &on, &audioIndex, &audioKind, &subKey, &m.SubKind) != nil {
+		return nil
+	}
+	m.SubsOn, m.Commentary = on != 0, audioKind == "commentary"
+	if m.SubKind != "" {
+		m.Pick = &playback.Pick{Audio: audioIndex, Subtitle: subKey}
+	}
+	return &m
 }
 
 // playCaps is what this device can do here and now: what it reported, less
@@ -251,30 +329,6 @@ func (s *Server) playCaps(u *User) *playback.Caps {
 	without := *c
 	without.HLS = false
 	return &without
-}
-
-// grid returns where a file is cut into chunks, working it out the first
-// time the file is played this way.
-func (s *Server) grid(ctx context.Context, fileID, path string, size, mtime, durationMs int64) hls.Grid {
-	stamp := fmt.Sprintf("%d-%d-%d", size, mtime, durationMs)
-	var have, text string
-	if err := s.db.QueryRow(`SELECT stamp, grid FROM cuts WHERE file_id=?`, fileID).Scan(&have, &text); err == nil && have == stamp {
-		var g hls.Grid
-		if json.Unmarshal([]byte(text), &g) == nil && g.Valid() {
-			return g
-		}
-	}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	g, err := hls.FindCuts(ctx, s.ffprobe, path, durationMs)
-	if err != nil || !g.Valid() {
-		s.log.Printf("could not find where to cut %s; jumping in it will be less exact: %v", filepath.Base(path), err)
-		return hls.Uniform(durationMs)
-	}
-	if b, err := json.Marshal(g); err == nil {
-		s.db.Exec(`INSERT INTO cuts(file_id,stamp,grid) VALUES(?,?,?) ON CONFLICT(file_id) DO UPDATE SET stamp=excluded.stamp, grid=excluded.grid`, fileID, stamp, string(b))
-	}
-	return g
 }
 
 // handlePlay decides how this device gets the file and hands the player an
@@ -301,9 +355,8 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	var fileID, rel, libPath, title, container string
 	var size, mtime, durationMs int64
 	var probed int
-	err := s.db.QueryRow(`SELECT f.id, f.rel_path, l.path, i.title, f.size, f.mtime, f.probed, f.container, f.duration_ms
-		FROM items i JOIN versions v ON v.item_id=i.id JOIN files f ON f.version_id=v.id JOIN libraries l ON l.id=f.library_id
-		WHERE i.id=? AND f.missing=0 ORDER BY f.part_index LIMIT 1`, itemID).Scan(&fileID, &rel, &libPath, &title, &size, &mtime, &probed, &container, &durationMs)
+	err := s.db.QueryRow(`SELECT f.id, f.rel_path, l.path, i.title, f.size, f.mtime, f.probed, f.container, f.duration_ms`+playedFile,
+		itemID).Scan(&fileID, &rel, &libPath, &title, &size, &mtime, &probed, &container, &durationMs)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "That file is not available right now.")
 		return
@@ -326,12 +379,7 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	// Which sound and subtitles to start with.
 	var mem *playback.Memory
 	if scope, err := s.scopeOf(itemID); err == nil {
-		var m playback.Memory
-		var on int
-		if s.db.QueryRow(`SELECT audio_lang, sub_lang, subs_on FROM track_memory WHERE user_id=? AND scope_id=?`, u.ID, scope).Scan(&m.AudioLang, &m.SubLang, &on) == nil {
-			m.SubsOn = on != 0
-			mem = &m
-		}
+		mem = s.loadMemory(u.ID, scope)
 	}
 	choice := playback.Choose(ft.media.Audio, ft.subs, s.loadPrefs(u.ID), mem)
 	if in.Audio != nil && *in.Audio >= 0 && *in.Audio < len(ft.media.Audio) {
@@ -368,6 +416,7 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 			Path: path, Grid: s.grid(r.Context(), fileID, path, size, mtime, durationMs),
 			VideoCodec: ft.media.Video[0].Codec, AudioTrack: plan.AudioTrack, AudioCopy: plan.AudioCopy, Owner: u.SessionID,
 		})
+		s.noteConversion(token, path)
 		out["url"] = "/hls/" + token + "/index.m3u8"
 		out["mimeType"] = "application/vnd.apple.mpegurl"
 		out["hls"] = token
@@ -375,9 +424,10 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		exp := time.Now().Add(linkLife).Unix()
 		sig := auth.SignLink(s.linkKey, fileID, exp, u.SessionID)
 		out["url"] = "/stream/" + fileID + "?e=" + strconv.FormatInt(exp, 10) + "&s=" + u.SessionID + "&g=" + sig
-		out["mimeType"] = mediaTypes[ext]
+		out["mimeType"] = mediaType(rel, container)
 	}
-	planOut := map[string]any{"playable": plan.Playable, "method": plan.Method, "reasons": plan.Reasons, "audioTrack": plan.AudioTrack, "audioCopy": plan.AudioCopy, "hasAudio": nil}
+	planOut := map[string]any{"playable": plan.Playable, "method": plan.Method, "reasons": plan.Reasons, "audioTrack": plan.AudioTrack, "audioCopy": plan.AudioCopy, "hasAudio": nil,
+		"deviceUnknown": plan.DeviceUnknown}
 	if ft.media.Probed {
 		planOut["hasAudio"] = plan.HasAudio
 	}
@@ -389,15 +439,17 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	}
 	subs := []subtitleView{}
 	for i, t := range ft.subs {
-		subs = append(subs, subtitleView{Key: ft.subKeys[i], Label: subtitleLabel(t, strings.HasPrefix(ft.subKeys[i], "x")), Language: playback.Lang(t.Language),
-			Forced: t.Forced, Selected: i == choice.Subtitle, URL: "/api/files/" + fileID + "/subtitles/" + ft.subKeys[i]})
+		subs = append(subs, subtitleView{Key: t.Key, Label: subtitleLabel(t, strings.HasPrefix(t.Key, "x")), Language: playback.Lang(t.Language),
+			Forced: t.Forced, Selected: i == choice.Subtitle, URL: "/api/files/" + fileID + "/subtitles/" + t.Key})
 	}
 	out["audio"], out["subtitles"], out["pictureSubtitles"] = audio, subs, ft.pictures
 	writeJSON(w, http.StatusOK, out)
 }
 
 // hlsOwner checks a chunk address: the token must be a live session's, and
-// the sign-in it belongs to must still be signed in.
+// the sign-in it belongs to must still be signed in and not have run out
+// (the same test as for the cookie, see signInAlive). When it is not,
+// everything being converted for that sign-in is stopped.
 func (s *Server) hlsOwner(w http.ResponseWriter, r *http.Request) (token string, ok bool) {
 	token = chi.URLParam(r, "token")
 	owner := ""
@@ -408,8 +460,7 @@ func (s *Server) hlsOwner(w http.ResponseWriter, r *http.Request) (token string,
 		writeErr(w, http.StatusForbidden, "This link is not valid any more.")
 		return "", false
 	}
-	var revoked sql.NullInt64
-	if err := s.db.QueryRow(`SELECT revoked_at FROM sessions WHERE id=?`, owner).Scan(&revoked); err != nil || revoked.Valid {
+	if !s.signInAlive(owner) {
 		s.hls.Drop(owner)
 		writeErr(w, http.StatusForbidden, "This link is not valid any more.")
 		return "", false
@@ -421,7 +472,15 @@ func hlsError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, hls.ErrNoSession), errors.Is(err, hls.ErrPastEnd):
 		writeErr(w, http.StatusNotFound, "Not found.")
-	case errors.Is(err, hls.ErrSuperseded), errors.Is(err, context.Canceled):
+	case errors.Is(err, hls.ErrSuperseded):
+		// A newer request moved the converter while this one waited. Most
+		// often this request's player has moved on too and is not even
+		// listening. If it does still want the chunk, it must ask again:
+		// the app's player (hls.js) does that after an answer in the 500s
+		// and gives up for good after one in the 400s.
+		w.Header().Set("Retry-After", "1")
+		writeErr(w, http.StatusServiceUnavailable, "The film was moved to another place while this part was being prepared. Ask for it again.")
+	case errors.Is(err, context.Canceled):
 		writeErr(w, http.StatusConflict, "The player moved elsewhere in the film.")
 	default:
 		writeErr(w, http.StatusInternalServerError, "This part could not be prepared.")
@@ -485,10 +544,57 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) hlsFailed(w http.ResponseWriter, what string, err error) {
 	if !errors.Is(err, hls.ErrNoSession) && !errors.Is(err, hls.ErrPastEnd) && !errors.Is(err, hls.ErrSuperseded) && !errors.Is(err, context.Canceled) {
-		s.log.Printf("converting: %s failed: %v", what, err)
-		s.events.add(clientEvent{Time: time.Now().UTC().Format(time.RFC3339), Kind: "convert-failed", Detail: what + ": " + err.Error()})
+		// The error quotes ffmpeg, which names files by their full path.
+		why := s.pathless(err.Error())
+		s.log.Printf("converting: %s failed: %s", what, why)
+		s.events.add(clientEvent{Time: time.Now().UTC().Format(time.RFC3339), Kind: "convert-failed", Detail: what + ": " + why})
 	}
 	hlsError(w, err)
+}
+
+// noteConversion remembers which file an open conversion reads (see
+// pathless), and forgets the ones whose conversion is over.
+func (s *Server) noteConversion(token, path string) {
+	s.convMu.Lock()
+	var known []string
+	for t := range s.converting {
+		known = append(known, t)
+	}
+	s.convMu.Unlock()
+	var over []string
+	for _, t := range known {
+		if s.hls.Owner(t) == "" { // asked without convMu held: the converter has a lock of its own
+			over = append(over, t)
+		}
+	}
+	s.convMu.Lock()
+	defer s.convMu.Unlock()
+	for _, t := range over {
+		delete(s.converting, t)
+	}
+	if s.converting == nil {
+		s.converting = map[string]string{}
+	}
+	s.converting[token] = path
+}
+
+// pathless takes folder names out of text that quotes the converter or the
+// operating system, before the text is logged or kept for the support
+// bundle. ffmpeg names a file it cannot open by its full path, and on the
+// owner's PC that path holds their account name, or the name or address of
+// their network drive. The file's own name stays, because it says which
+// film had the problem. The data folder, which is under the account's name
+// too, becomes a placeholder.
+func (s *Server) pathless(text string) string {
+	s.convMu.Lock()
+	for _, p := range s.converting {
+		text = strings.ReplaceAll(text, p, filepath.Base(p))
+	}
+	s.convMu.Unlock()
+	if dir := filepath.Clean(s.dataDir); len(dir) > 1 {
+		text = strings.ReplaceAll(text, dir, "[data folder]")
+	}
+	return text
 }
 
 // handleHLSStop ends a conversion at once when its viewer closes the player.
@@ -526,8 +632,8 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, max-age=3600")
 	if key[0] == 'x' {
-		var subRel, format string
-		if err := s.db.QueryRow(`SELECT rel_path, format FROM sidecars WHERE id=? AND file_id=?`, key[1:], fileID).Scan(&subRel, &format); err != nil {
+		subRel, format, ok := s.sidecar(fileID, key)
+		if !ok {
 			writeErr(w, http.StatusNotFound, "Not found.")
 			return
 		}
@@ -566,71 +672,6 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(rel)), n, fmt.Sprintf("%s-%s-%d-%d", fileID, key, size, mtime))
-}
-
-// subtitleByFFmpeg converts subtitle track n of path to WebVTT. The result
-// is sent while it is being made, since reading a long film through takes
-// a while, and kept under name for next time.
-func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path string, n int, name string) {
-	dir := filepath.Join(s.dataDir, "cache", "subtitles")
-	cached := filepath.Join(dir, name+".vtt")
-	if b, err := os.ReadFile(cached); err == nil {
-		w.Write(b)
-		return
-	}
-	if s.ffmpeg == "" {
-		writeErr(w, http.StatusNotFound, "This subtitle needs the converter, which is not installed.")
-		return
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not prepare the subtitle.")
-		return
-	}
-	cmd := exec.CommandContext(r.Context(), s.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", path,
-		"-map", "0:s:"+strconv.Itoa(n), "-f", "webvtt", "pipe:1")
-	hideWindow(cmd)
-	out, err := cmd.StdoutPipe()
-	if err != nil || cmd.Start() != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not prepare the subtitle.")
-		return
-	}
-	tmp, err := os.CreateTemp(dir, "making-*.tmp")
-	if err != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
-		writeErr(w, http.StatusInternalServerError, "Could not prepare the subtitle.")
-		return
-	}
-	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, 32<<10)
-	var copyErr error
-	for {
-		k, err := out.Read(buf)
-		if k > 0 {
-			tmp.Write(buf[:k])
-			if _, werr := w.Write(buf[:k]); werr != nil {
-				copyErr = werr
-				break
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		if err != nil {
-			break
-		}
-	}
-	if copyErr != nil {
-		cmd.Process.Kill()
-	}
-	waitErr := cmd.Wait()
-	tmp.Close()
-	if copyErr == nil && waitErr == nil {
-		if os.Rename(tmp.Name(), cached) == nil {
-			return
-		}
-	}
-	os.Remove(tmp.Name())
 }
 
 // handleDiagnostics says what this device reported it can play and what the

@@ -2,12 +2,14 @@ package server
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -57,15 +59,43 @@ func (v itemView) Display() string {
 	return v.Title
 }
 
+// capsFor is what this sign-in's device said it can play, or nil if it has
+// not said. The report is kept in the database as well as in memory: the
+// page sends it once per visit, and a page left open across a restart of
+// the program (the PC restarting, an update installing itself) is still
+// signed in and will not send it again.
 func (s *Server) capsFor(u *User) *playback.Caps {
 	s.capsMu.Lock()
 	defer s.capsMu.Unlock()
-	return s.caps[u.SessionID]
+	if c := s.caps[u.SessionID]; c != nil {
+		return c
+	}
+	var raw, userAgent string
+	if s.db.QueryRow(`SELECT caps, user_agent FROM device_reports WHERE session_id=?`, u.SessionID).Scan(&raw, &userAgent) != nil {
+		return nil
+	}
+	var c playback.Caps
+	if json.Unmarshal([]byte(raw), &c) != nil {
+		return nil
+	}
+	applyOverrides(&c, userAgent)
+	s.rememberCaps(u.SessionID, &c)
+	return &c
+}
+
+// rememberCaps keeps a report in memory. The caller holds capsMu.
+func (s *Server) rememberCaps(sessionID string, c *playback.Caps) {
+	if len(s.caps) > 5000 {
+		s.caps = map[string]*playback.Caps{} // each is read back from the database when next needed
+	}
+	s.caps[sessionID] = c
 }
 
 // handleCapabilities stores what this device says it can play. The page
 // measures it once per visit; nothing is guessed from the browser's name
-// except the corrections below.
+// except the corrections below. What is kept is the report as it came: the
+// corrections are applied each time it is read, so a later version of the
+// program can correct differently.
 func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 	var c playback.Caps
 	if !readJSON(w, r, &c) {
@@ -75,30 +105,52 @@ func (s *Server) handleCapabilities(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "That report is too large.")
 		return
 	}
-	applyOverrides(&c, r.UserAgent())
 	u := currentUser(r)
+	userAgent := clip(r.UserAgent(), 300)
+	raw, err := json.Marshal(c)
+	if err == nil {
+		_, err = s.db.Exec(`INSERT INTO device_reports(session_id,caps,user_agent,updated_at) VALUES(?,?,?,?)
+			ON CONFLICT(session_id) DO UPDATE SET caps=excluded.caps, user_agent=excluded.user_agent, updated_at=excluded.updated_at`,
+			u.SessionID, string(raw), userAgent, time.Now().Unix())
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "Could not save what this device can play.")
+		return
+	}
+	applyOverrides(&c, userAgent)
 	s.capsMu.Lock()
-	if len(s.caps) > 5000 {
-		s.caps = map[string]*playback.Caps{}
-	}
-	s.caps[u.SessionID] = &c
-	if s.capsUA == nil || len(s.capsUA) > 5000 {
-		s.capsUA = map[string]string{}
-	}
-	s.capsUA[u.SessionID] = r.UserAgent()
+	s.rememberCaps(u.SessionID, &c)
 	s.capsMu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// forgetCaps drops a sign-in's report when it signs out.
+func (s *Server) forgetCaps(sessionID string) {
+	s.capsMu.Lock()
+	delete(s.caps, sessionID)
+	s.capsMu.Unlock()
+	s.db.Exec(`DELETE FROM device_reports WHERE session_id=?`, sessionID)
 }
 
 // deviceReports lists, for the support bundle, what each signed-in device
 // said it can play, with the browser's own description of itself. No
 // names, addresses or sign-in details.
 func (s *Server) deviceReports() []map[string]any {
-	s.capsMu.Lock()
-	defer s.capsMu.Unlock()
 	out := []map[string]any{}
-	for id, c := range s.caps {
-		out = append(out, map[string]any{"browser": s.capsUA[id], "canPlay": c})
+	rows, err := s.db.Query(`SELECT d.caps, d.user_agent FROM device_reports d JOIN sessions s ON s.id = d.session_id
+		WHERE s.revoked_at IS NULL ORDER BY d.updated_at DESC LIMIT 200`)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw, userAgent string
+		var c playback.Caps
+		if rows.Scan(&raw, &userAgent) != nil || json.Unmarshal([]byte(raw), &c) != nil {
+			continue
+		}
+		applyOverrides(&c, userAgent)
+		out = append(out, map[string]any{"browser": userAgent, "canPlay": c})
 	}
 	return out
 }
@@ -181,7 +233,7 @@ func (s *Server) decide(u *User, items []itemView) error {
 	}
 	for start := 0; start < len(fileIDs); start += 400 {
 		end := min(start+400, len(fileIDs))
-		q := `SELECT s.file_id, s.kind, s.codec, s.bit_depth, s.is_default, s.is_commentary, s.language, f.container FROM streams s
+		q := `SELECT s.file_id, s.kind, s.codec, s.codec_tag, s.bit_depth, s.is_default, s.is_commentary, s.language, f.container FROM streams s
 			JOIN files f ON f.id = s.file_id WHERE s.kind IN ('video','audio') AND s.file_id IN (?` + strings.Repeat(",?", end-start-1) + `) ORDER BY s.file_id, s.idx`
 		rows, err := s.db.Query(q, fileIDs[start:end]...)
 		if err != nil {
@@ -191,7 +243,7 @@ func (s *Server) decide(u *User, items []itemView) error {
 			var fileID, kind, container string
 			var t playback.Track
 			var def, com int
-			rows.Scan(&fileID, &kind, &t.Codec, &t.BitDepth, &def, &com, &t.Language, &container)
+			rows.Scan(&fileID, &kind, &t.Codec, &t.Tag, &t.BitDepth, &def, &com, &t.Language, &container)
 			t.Default, t.Commentary = def != 0, com != 0
 			m := tracks[fileID]
 			m.Container = container

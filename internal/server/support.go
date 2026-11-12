@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -163,6 +164,17 @@ var mediaTypes = map[string]string{
 	".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
 	".mkv": "video/x-matroska", ".avi": "video/x-msvideo", ".ts": "video/mp2t", ".m2ts": "video/mp2t",
 	".wmv": "video/x-ms-wmv", ".mpg": "video/mpeg", ".mpeg": "video/mpeg",
+}
+
+// mediaType is what kind of file a browser is told it is getting: by the
+// file's name, except that a file found to be WebM inside (see package
+// probe) is called WebM whatever its name. Browsers that play WebM and not
+// MKV go by this, not by what is in the file.
+func mediaType(relPath, container string) string {
+	if container == "webm" {
+		return "video/webm"
+	}
+	return mediaTypes[strings.ToLower(filepath.Ext(relPath))]
 }
 
 func noStore(w http.ResponseWriter) { w.Header().Set("Cache-Control", "private, no-store") }

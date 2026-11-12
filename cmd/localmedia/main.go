@@ -105,6 +105,17 @@ func (a *app) localURL() string { return fmt.Sprintf("http://localhost:%d", a.op
 func (a *app) run() (err error) {
 	defer func() { a.err = err }()
 	o := a.opts
+	// The port is taken before anything else. If it is in use, a copy of
+	// the program is most likely running already (it starts with Windows
+	// and hides among the icons, and the Start-menu entry starts another).
+	// This copy must then stop before it touches the data folder: starting
+	// up empties the folder the running copy keeps its converted chunks
+	// in, and may upgrade the database under it.
+	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", o.port))
+	if err != nil {
+		return fmt.Errorf("port %d is in use. Is Local Media already running? Look for its icon beside the clock. (%w)", o.port, err)
+	}
+	defer ln.Close() // for the ways out before the server takes it over
 	d, err := db.Open(o.dataDir)
 	if err != nil {
 		return err
@@ -123,10 +134,6 @@ func (a *app) run() (err error) {
 	defer srv.Close()
 	a.srv = srv
 
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", o.port))
-	if err != nil {
-		return fmt.Errorf("port %d is in use. Is Local Media already running? Look for its icon beside the clock. (%w)", o.port, err)
-	}
 	httpSrv := &http.Server{Handler: srv, ReadHeaderTimeout: 10 * time.Second}
 
 	fmt.Printf("\nLocal Media %s is running.\n\n  On this PC:        %s\n", version, a.localURL())

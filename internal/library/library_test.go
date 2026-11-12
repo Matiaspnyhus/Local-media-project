@@ -283,6 +283,16 @@ func TestProbePendingStoresTracksOnce(t *testing.T) {
 	if codec != "ac3" {
 		t.Errorf("audio codec %q, want ac3", codec)
 	}
+	// The label the MP4 gives its picture is kept; an MKV has none.
+	labels := map[string]string{}
+	for _, name := range []string{"Test Clip.mp4", "Dolby.Sound.Test.mkv"} {
+		var label string
+		d.QueryRow(`SELECT s.codec_tag FROM streams s JOIN files f ON f.id=s.file_id WHERE f.rel_path=? AND s.kind='video'`, name).Scan(&label)
+		labels[name] = label
+	}
+	if labels["Test Clip.mp4"] != "avc1" || labels["Dolby.Sound.Test.mkv"] != "" {
+		t.Errorf("picture labels %q, want avc1 for the MP4 and none for the MKV", labels)
+	}
 	if n := count(t, d, `SELECT duration_ms FROM files WHERE rel_path='Test Clip.mp4'`); n < 19000 || n > 21000 {
 		t.Errorf("duration %d ms", n)
 	}
@@ -290,6 +300,51 @@ func TestProbePendingStoresTracksOnce(t *testing.T) {
 	res, _ = ProbePending(context.Background(), d, ff)
 	if res.Inspected != 0 || res.Failed != 0 {
 		t.Fatalf("second round inspected again: %+v", res)
+	}
+}
+
+// A file named .webm is stored as WebM, not as MKV (ffprobe has one name
+// for both). And a file an earlier version stored as MKV, which the
+// upgrade marked with a size that cannot match, is inspected again.
+func TestWebMIsStoredAsWebMAndMarkedFilesAreInspectedAgain(t *testing.T) {
+	ff := probe.Find()
+	if ff == "" {
+		if os.Getenv("LM_REQUIRE_FFMPEG") != "" {
+			t.Fatal("ffprobe was not found, and LM_REQUIRE_FFMPEG says it must be")
+		}
+		t.Skip("ffprobe is not installed here")
+	}
+	media := t.TempDir()
+	// Any Matroska file will do: what makes this one WebM is its name.
+	src, err := os.ReadFile(filepath.Join("..", "..", "e2e", "fixtures", "Dolby.Sound.Test.mkv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(media, "Web Clip.webm"), src, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := open(t)
+	lib, _ := Add(d, media)
+	Scan(d, lib)
+	stored := func() (container string) {
+		d.QueryRow(`SELECT container FROM files`).Scan(&container)
+		return container
+	}
+	if res, err := ProbePending(context.Background(), d, ff); err != nil || res.Inspected != 1 || stored() != "webm" {
+		t.Fatalf("inspected %+v %v, stored as %q; want webm", res, err, stored())
+	}
+	// As an earlier version left it. Nothing looks at the file again...
+	d.Exec(`UPDATE files SET container='matroska'`)
+	if res, _ := ProbePending(context.Background(), d, ff); res.Inspected != 0 || stored() != "matroska" {
+		t.Fatalf("an unmarked file was inspected again: %+v", res)
+	}
+	// ...until the upgrade marks it.
+	d.Exec(`UPDATE files SET probed_size=-1`)
+	if res, err := ProbePending(context.Background(), d, ff); err != nil || res.Inspected != 1 || stored() != "webm" {
+		t.Fatalf("a marked file: inspected %+v %v, stored as %q; want webm", res, err, stored())
+	}
+	if res, _ := ProbePending(context.Background(), d, ff); res.Inspected != 0 {
+		t.Fatalf("it was inspected a third time: %+v", res)
 	}
 }
 

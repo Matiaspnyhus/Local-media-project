@@ -105,12 +105,17 @@ type Server struct {
 	// newTMDB builds the lookup client; tests replace it.
 	newTMDB func(key string) *metadata.Client
 	capsMu  sync.Mutex
-	caps    map[string]*playback.Caps // by session
-	capsUA  map[string]string         // by session: how the browser describes itself
-	ctx     context.Context
-	stop    context.CancelFunc
-	handler http.Handler
-	routes  []Route
+	caps    map[string]*playback.Caps // by session; the database holds them too (see capsFor)
+	// converting is the file each open conversion reads, by chunk token.
+	// It is how the file's folder is taken out of anything the converter
+	// says about it before that is logged (see pathless).
+	convMu     sync.Mutex
+	converting map[string]string
+	helpers    *helpers // shared and limited runs of ffmpeg and ffprobe, see helpers.go
+	ctx        context.Context
+	stop       context.CancelFunc
+	handler    http.Handler
+	routes     []Route
 }
 
 type ctxKey int
@@ -136,6 +141,7 @@ func New(cfg Config) (*Server, error) {
 	s := &Server{
 		db: cfg.DB, dataDir: cfg.DataDir, version: cfg.Version, port: cfg.Port, assets: cfg.Assets,
 		limiter: newLoginLimiter(), events: &eventLog{}, update: cfg.Update, ffprobe: cfg.FFprobe, caps: map[string]*playback.Caps{},
+		helpers: newHelpers(),
 	}
 	s.ctx, s.stop = context.WithCancel(context.Background())
 	s.newTMDB = metadata.New
@@ -152,7 +158,9 @@ func New(cfg Config) (*Server, error) {
 		if s.hls, err = hls.New(cfg.FFmpeg, filepath.Join(cfg.DataDir, "cache", "chunks")); err != nil {
 			return nil, err
 		}
-		s.hls.Log = s.log.Printf
+		// The converter's own lines quote ffmpeg, which names files by
+		// their full path.
+		s.hls.Log = func(format string, args ...any) { s.log.Printf("%s", s.pathless(fmt.Sprintf(format, args...))) }
 	}
 	var users int
 	if err := s.db.QueryRow(`SELECT count(*) FROM users`).Scan(&users); err != nil {
@@ -368,10 +376,30 @@ func (s *Server) userFromRequest(r *http.Request) *User {
 	if err != nil {
 		return nil
 	}
-	if time.Since(time.Unix(created, 0)) > sessionLife {
+	if signInExpired(created) {
 		return nil
 	}
 	return &u
+}
+
+// signInExpired reports whether a sign-in made at created (in Unix
+// seconds) has run out.
+func signInExpired(created int64) bool {
+	return time.Since(time.Unix(created, 0)) > sessionLife
+}
+
+// signInAlive reports whether the sign-in with this id may still be used:
+// it exists, has not been signed out and has not run out. Everything
+// handed out under a sign-in ends with it, by this one test: links to
+// original files and the addresses of chunks, which work without the
+// cookie, as much as the cookie itself.
+func (s *Server) signInAlive(sessionID string) bool {
+	var created int64
+	var revoked sql.NullInt64
+	if err := s.db.QueryRow(`SELECT created_at, revoked_at FROM sessions WHERE id=?`, sessionID).Scan(&created, &revoked); err != nil || revoked.Valid {
+		return false
+	}
+	return !signInExpired(created)
 }
 
 func (s *Server) startSession(w http.ResponseWriter, r *http.Request, userID string) error {

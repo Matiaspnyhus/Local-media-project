@@ -18,7 +18,9 @@ import "strings"
 
 // Caps is what a device reports it can play. Keys are ffprobe's names:
 // containers "mp4", "matroska", "webm", "mov"; codecs "h264", "hevc", "ac3".
-// "hevc10" stands for 10-bit HEVC, which many devices that play HEVC cannot.
+// "hevc10" stands for 10-bit HEVC, which many devices that play HEVC cannot,
+// and "h264-10" for 10-bit H.264. "hevc-hev1" says the device plays HEVC
+// under the label "hev1" as well as "hvc1" (see Decide).
 type Caps struct {
 	Containers map[string]bool `json:"containers"`
 	Video      map[string]bool `json:"video"`
@@ -30,7 +32,10 @@ type Caps struct {
 
 // Track is one video, audio or subtitle track of a file.
 type Track struct {
-	Codec           string
+	Codec string
+	// Tag is the four-letter label the file gives the codec, as ffprobe
+	// reports it ("hvc1", "hev1"); "" where there is none or it was not read.
+	Tag             string
 	BitDepth        int
 	Channels        int
 	Default         bool
@@ -81,6 +86,9 @@ type Plan struct {
 	AudioTrack int `json:"audioTrack"`
 	// AudioCopy says the sound is passed through untouched.
 	AudioCopy bool `json:"audioCopy"`
+	// DeviceUnknown says the answer is "unknown" because the device has not
+	// said what it can play, not because the file has not been inspected.
+	DeviceUnknown bool `json:"deviceUnknown"`
 }
 
 // packaged lists what the repackaged format can carry. Anything else in a
@@ -91,7 +99,8 @@ var (
 )
 
 // Decide chooses how to play a file. audioTrack is the sound track the
-// viewer wants, counted from 0, or -1 to let BrowserAudio's choice stand.
+// viewer wants, counted from 0, or -1 for the file's own main track (see
+// BrowserAudio).
 func Decide(m Media, c *Caps, audioTrack int) Plan {
 	if !m.Probed {
 		// Nothing is known: send the file and let the player find out.
@@ -102,7 +111,7 @@ func Decide(m Media, c *Caps, audioTrack int) Plan {
 		return Plan{Playable: No, Method: None, HasAudio: p.HasAudio, AudioTrack: -1, Reasons: []string{"This file has no picture track."}}
 	}
 	if c == nil || c.Containers == nil {
-		p.Playable = Unknown
+		p.Playable, p.DeviceUnknown = Unknown, true
 		return p
 	}
 	natural := BrowserAudio(m.Audio)
@@ -133,7 +142,28 @@ func Decide(m Media, c *Caps, audioTrack int) Plan {
 	if a != nil && !c.Audio[a.Codec] {
 		p.Reasons = append(p.Reasons, "Its sound is "+AudioName(a.Codec)+", which this browser cannot play.")
 	}
-	if a != nil && audioTrack != natural {
+	// HEVC in an MP4 or MOV carries one of two labels. Apple devices play
+	// "hvc1" and refuse "hev1", which ffmpeg and many encoders write. The
+	// repackaged stream is always labelled "hvc1" (see package hls), so
+	// unless the device says it plays "hev1" too, that is the way to go.
+	if v.Codec == "hevc" && v.Tag == "hev1" && (m.Container == "mp4" || m.Container == "mov") && !c.Video["hevc-hev1"] {
+		p.Reasons = append(p.Reasons, `Its HEVC picture carries the label "hev1", which this device does not say it plays (Apple devices want "hvc1"). Repackaging puts the other label on it and leaves the picture itself untouched.`)
+	}
+	copyable := a == nil || (c.Audio[a.Codec] && packagedAudio[a.Codec])
+	// Which sound track a browser plays when simply handed a file is only
+	// certain when the file has one, or when the wanted one comes first and
+	// no other is marked as the main one (see BrowserAudio). Repackaging
+	// names the track, so in any other case that is the way to be sure.
+	inDoubt := len(m.Audio) > 1 && (audioTrack != 0 || natural != 0)
+	if inDoubt && audioTrack == natural && len(p.Reasons) == 0 && !(c.HLS && packagedVideo[v.Codec] && (copyable || c.Audio["aac"])) {
+		// Nothing else is wrong and repackaging is not possible here: the
+		// file plays as it is, with whichever track the browser picks.
+		inDoubt = false
+	}
+	switch {
+	case inDoubt && natural != 0:
+		p.Reasons = append(p.Reasons, "The sound track this file marks as its main one is not its first, and browsers differ in which of the two they play by themselves.")
+	case inDoubt:
 		p.Reasons = append(p.Reasons, "You chose a sound track other than the one a browser plays by itself.")
 	}
 	if len(p.Reasons) == 0 {
@@ -151,7 +181,7 @@ func Decide(m Media, c *Caps, audioTrack int) Plan {
 			Reasons: append(p.Reasons, "Its picture ("+VideoName(v)+") cannot be repackaged without converting it, which arrives in a later version.")}
 	}
 	p.Method = Remux
-	p.AudioCopy = a == nil || (c.Audio[a.Codec] && packagedAudio[a.Codec])
+	p.AudioCopy = copyable
 	if !p.AudioCopy {
 		if !c.Audio["aac"] {
 			p.Playable, p.Method = No, None
@@ -163,9 +193,13 @@ func Decide(m Media, c *Caps, audioTrack int) Plan {
 	return p
 }
 
-// BrowserAudio is the sound track a browser plays when simply handed the
-// file: the first one flagged as default, else the first. It returns -1
-// for a file with no sound.
+// BrowserAudio is the file's own main sound track: the first one flagged
+// as default, else the first. It returns -1 for a file with no sound.
+//
+// It is also the best guess at what a browser plays when simply handed the
+// file, but only a guess: Chrome plays the flagged track of an MP4 and the
+// first track of an MKV whatever is flagged. Decide therefore sends a file
+// with several sound tracks as it is only when this is the first track.
 func BrowserAudio(tracks []Track) int {
 	for i := range tracks {
 		if tracks[i].Default {
@@ -265,6 +299,9 @@ func AudioName(codec string) string {
 func (p Plan) Explain() string {
 	switch p.Method {
 	case Direct:
+		if p.DeviceUnknown {
+			return "Sending the original file. This device has not told the app what it can play yet, so the app cannot say in advance whether it will play. Reloading the page makes the device say it again."
+		}
 		if p.Playable == Unknown {
 			return "Sending the original file. It has not been inspected yet, so the app cannot say in advance whether this browser can play it."
 		}

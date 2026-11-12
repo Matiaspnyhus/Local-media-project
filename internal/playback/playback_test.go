@@ -19,8 +19,8 @@ func caps(hls bool, containers, video, audio string) *Caps {
 
 // What the browsers this project targets report, as measured or documented.
 var devices = map[string]*Caps{
-	"chrome":      caps(true, "mp4 mov webm matroska", "h264 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
-	"chrome+hevc": caps(true, "mp4 mov webm matroska", "h264 hevc hevc10 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
+	"chrome":      caps(true, "mp4 mov webm matroska", "h264 h264-10 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
+	"chrome+hevc": caps(true, "mp4 mov webm matroska", "h264 h264-10 hevc hevc10 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
 	"safari":      caps(true, "mp4 mov", "h264 hevc hevc10", "aac mp3 ac3 eac3 flac"),
 	"firefox":     caps(true, "mp4 mov webm", "h264 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
 	"old-tv":      caps(false, "mp4", "h264", "aac mp3"),
@@ -87,7 +87,19 @@ func TestDecide(t *testing.T) {
 		{"mkv h264 flac", "chrome", media("matroska", "h264", 8, "flac"), Direct, ""},
 		// FLAC plays in Safari but cannot be passed through when repackaging.
 		{"mkv h264 flac", "safari", media("matroska", "h264", 8, "flac"), Audio, "MKV"},
-		{"10-bit h264", "chrome", media("matroska", "h264", 10, "aac"), None, "10-bit H.264"},
+		// 10-bit H.264 (common in anime) plays in Chrome, which says so
+		// under the key "h264-10"; Safari and Firefox do not say so. This
+		// case used to demand that Chrome refuse it, which was the bug: the
+		// page never reported that key.
+		{"10-bit h264", "chrome", media("matroska", "h264", 10, "aac"), Direct, ""},
+		{"10-bit h264 with Dolby sound", "chrome", media("matroska", "h264", 10, "ac3"), Audio, "Dolby Digital"},
+		{"10-bit h264", "safari", media("mp4", "h264", 10, "aac"), None, "10-bit H.264"},
+		{"10-bit h264", "firefox", media("mp4", "h264", 10, "aac"), None, "10-bit H.264"},
+		// WebM is not MKV: Firefox plays it although it does not open MKV.
+		{"webm vp9 opus", "firefox", media("webm", "vp9", 8, "opus"), Direct, ""},
+		{"webm av1 opus", "firefox", media("webm", "av1", 8, "opus"), Direct, ""},
+		// And where it cannot be opened, it is called by its own name.
+		{"a .webm on a device without WebM", "safari", media("webm", "h264", 8, "aac"), Remux, "packaged as WebM"},
 	}
 	for _, c := range cases {
 		dev := devices[c.device]
@@ -191,8 +203,19 @@ func TestUnknownWhenFactsAreMissing(t *testing.T) {
 	if p := Decide(Media{}, devices["chrome"], -1); p.Playable != Unknown || p.Method != Direct {
 		t.Errorf("an uninspected file got %+v", p)
 	}
-	if p := Decide(media("mp4", "h264", 8, "aac"), nil, -1); p.Playable != Unknown {
-		t.Errorf("a device that reported nothing got %s", p.Playable)
+	if p := Decide(Media{}, devices["chrome"], -1); p.DeviceUnknown || !strings.Contains(p.Explain(), "not been inspected") {
+		t.Errorf("an uninspected file is explained with %q", p.Explain())
+	}
+	// The file is known and the device is not: say that, not that the file
+	// has not been inspected.
+	for _, dev := range []*Caps{nil, {}} {
+		p := Decide(media("mp4", "h264", 8, "aac"), dev, -1)
+		if p.Playable != Unknown || p.Method != Direct || !p.DeviceUnknown {
+			t.Errorf("a device that reported nothing got %+v", p)
+		}
+		if e := p.Explain(); strings.Contains(e, "inspected") || !strings.Contains(e, "This device has not told the app what it can play") {
+			t.Errorf("a device that reported nothing is explained with %q", e)
+		}
 	}
 	if p := Decide(media("mp4", "h264", 8), devices["chrome"], -1); p.HasAudio || p.AudioTrack != -1 {
 		t.Errorf("a silent file: %+v", p)
@@ -212,8 +235,9 @@ func TestChoosingAnotherSoundTrack(t *testing.T) {
 	if p := Decide(m, devices["chrome"], -1); p.Method != Direct || p.AudioTrack != 0 {
 		t.Fatalf("by default: %+v", p)
 	}
-	// A browser handed the file plays its first track, so another track
-	// means repackaging, which costs nothing.
+	// A browser handed this file plays its first track, which is also the
+	// one marked as main. Another track means repackaging, which costs
+	// nothing.
 	if p := Decide(m, devices["chrome"], 1); p.Method != Remux || p.AudioTrack != 1 || !strings.Contains(strings.Join(p.Reasons, " "), "sound track") {
 		t.Fatalf("second track: %+v", p)
 	}
@@ -225,5 +249,102 @@ func TestChoosingAnotherSoundTrack(t *testing.T) {
 	}
 	if p := Decide(m, devices["old-tv"], 1); p.Method != None {
 		t.Fatalf("another track on a device that cannot take repackaged video: %+v", p)
+	}
+}
+
+// HEVC in an MP4 or MOV carries one of two labels. Apple devices play
+// "hvc1" and refuse "hev1", which is what ffmpeg and many encoders write.
+// Repackaging writes "hvc1", so a file labelled "hev1" goes that way unless
+// the device says it plays that label too (key "hevc-hev1").
+func TestHEVCLabelledHev1IsRepackaged(t *testing.T) {
+	file := func(container, label string, depth int) Media {
+		m := media(container, "hevc", depth, "aac")
+		m.Video[0].Tag = label
+		return m
+	}
+	both := caps(true, "mp4 mov matroska", "h264 hevc hevc10 hevc-hev1", "aac")
+	for _, c := range []struct {
+		name string
+		m    Media
+		dev  *Caps
+		want Method
+	}{
+		{"hev1 on an iPhone", file("mp4", "hev1", 8), devices["safari"], Remux},
+		{"10-bit hev1 on an iPhone", file("mp4", "hev1", 10), devices["safari"], Remux},
+		{"hev1 in a .mov", file("mov", "hev1", 8), devices["safari"], Remux},
+		{"hvc1 on an iPhone", file("mp4", "hvc1", 8), devices["safari"], Direct},
+		{"a label not yet read (inspected by an earlier version)", file("mp4", "", 8), devices["safari"], Direct},
+		{"hev1 on a device that says it plays it", file("mp4", "hev1", 8), both, Direct},
+		{"hev1 on a device that has not said", file("mp4", "hev1", 8), devices["chrome+hevc"], Remux},
+		{"hev1 where repackaging is not possible", file("mp4", "hev1", 8), caps(false, "mp4", "hevc", "aac"), None},
+		{"an MKV has no such label; only its packaging is in the way", file("matroska", "", 8), devices["safari"], Remux},
+	} {
+		p := Decide(c.m, c.dev, -1)
+		reasons := strings.Join(p.Reasons, " ")
+		if p.Method != c.want {
+			t.Errorf("%s: %s %v, want %s", c.name, p.Method, p.Reasons, c.want)
+			continue
+		}
+		if labelled := strings.Contains(reasons, "hev1"); labelled != (c.m.Video[0].Tag == "hev1" && c.want != Direct) {
+			t.Errorf("%s: reasons %v", c.name, p.Reasons)
+		}
+		if c.want == Remux && !p.AudioCopy {
+			t.Errorf("%s: relabelling converted the sound", c.name)
+		}
+	}
+}
+
+// Browsers do not agree on which sound track of a file they play by
+// themselves: Chrome plays the track an MP4 marks as main, but the first
+// track of an MKV whatever it marks. So the original is only sent when
+// there is no doubt: the wanted track is the first one and the file does
+// not mark another as main, or there is only one.
+func TestTheMainSoundTrackIsNotTheFirst(t *testing.T) {
+	// What MKVToolNix makes when someone sets the default language without
+	// reordering: Japanese first, English marked as the main track.
+	m := Media{Probed: true, Container: "matroska", Video: []Track{{Codec: "h264", BitDepth: 8}},
+		Audio: []Track{{Codec: "aac", Language: "jpn"}, {Codec: "aac", Language: "eng", Default: true}}}
+	for _, track := range []int{-1, 0, 1} {
+		want := track
+		if track < 0 {
+			want = 1 // the one the file marks as main
+		}
+		p := Decide(m, devices["chrome"], track)
+		if p.Method != Remux || !p.AudioCopy || p.AudioTrack != want || !strings.Contains(strings.Join(p.Reasons, " "), "sound track") {
+			t.Errorf("asking for track %d: %+v; want it repackaged with track %d and a reason that names the sound tracks", track, p, want)
+		}
+	}
+	// Where the file cannot be repackaged, it is still sent rather than
+	// refused: it plays, with the track the browser picks.
+	if p := Decide(m, devices["old-tv"], -1); p.Method != None {
+		t.Errorf("an MKV on a device that opens only MP4: %+v", p)
+	}
+	mp4 := m
+	mp4.Container = "mp4"
+	if p := Decide(mp4, devices["old-tv"], -1); p.Method != Direct || p.Playable != Yes || len(p.Reasons) != 0 || p.AudioTrack != 1 {
+		t.Errorf("a device that cannot take repackaged video: %+v; want the original sent", p)
+	}
+	webm := Media{Probed: true, Container: "webm", Video: []Track{{Codec: "vp9", BitDepth: 8}},
+		Audio: []Track{{Codec: "opus"}, {Codec: "opus", Default: true}}}
+	if p := Decide(webm, devices["chrome"], -1); p.Method != Direct || p.Playable != Yes || len(p.Reasons) != 0 {
+		t.Errorf("a picture that cannot be repackaged: %+v; want the original sent", p)
+	}
+	// But a track the viewer asked for by hand is not quietly swapped.
+	if p := Decide(webm, devices["chrome"], 0); p.Method != None {
+		t.Errorf("asking for the other track of a file that cannot be repackaged: %+v", p)
+	}
+
+	// No doubt, no repackaging: one track, whatever it is marked as; and
+	// several with the first as the main one or none marked at all.
+	for name, audio := range map[string][]Track{
+		"one track, not marked":         {{Codec: "aac"}},
+		"two tracks, the first is main": {{Codec: "aac", Default: true}, {Codec: "aac"}},
+		"two tracks, none marked":       {{Codec: "aac"}, {Codec: "aac"}},
+		"two tracks, both marked":       {{Codec: "aac", Default: true}, {Codec: "aac", Default: true}},
+	} {
+		m.Audio = audio
+		if p := Decide(m, devices["chrome"], -1); p.Method != Direct || p.AudioTrack != 0 || len(p.Reasons) != 0 {
+			t.Errorf("%s: %+v; want the original sent with its first track", name, p)
+		}
 	}
 }
