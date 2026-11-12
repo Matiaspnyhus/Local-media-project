@@ -91,6 +91,86 @@ async function playsBeyond(page, beyond, why) {
   })
 }
 
+// Keeps a record of what the player goes through and what is asked of the
+// PC, from now until the function it returns is called; that function gives
+// the record back, ready to print. It is for a step that took far longer in
+// one run than in another, with nothing to say where the time went. Every
+// time in it is in milliseconds since the record was started.
+//
+// The player's part reads "seeking+12 seeked+40": the events of the video
+// element and when they came. The PC's part reads "new2/seg-10.m4s+659..1155":
+// what was asked for, when, and when the answer was complete ("..?" if it
+// never was, "(given up)" if the player dropped the request, "(409)" for an
+// answer other than a plain yes). "open" is the request a pick of sound
+// sends. "stop" is the request to stop converting a film, with only the
+// time it was sent: it is sent so as to outlive the page, and a test is not
+// told when such a request is answered. "old" is the film that was already
+// playing, "new1" and "new2" the films the PC opened for the first and the
+// second "open".
+async function record(page) {
+  const t0 = Date.now()
+  const asked = []
+  const answers = []
+  const onRequest = (r) => {
+    const m = /\/hls\/([0-9a-f]+)\/([^/]+)$/.exec(r.url())
+    if (m) asked.push({ r, at: Date.now() - t0, film: m[1], what: m[2] })
+    else if (/\/api\/items\/[^/]+\/play$/.test(r.url())) asked.push({ r, at: Date.now() - t0, film: '', what: 'open' })
+  }
+  const answered = async (r, givenUp) => {
+    const e = asked.find((x) => x.r === r)
+    if (!e) return
+    e.ms = Date.now() - t0 - e.at
+    e.givenUp = givenUp
+    const res = givenUp ? null : await r.response().catch(() => null)
+    e.status = res ? res.status() : 0
+    if (e.what === 'open' && res) e.opened = (await res.json().catch(() => null))?.hls
+  }
+  const onFinished = (r) => answers.push(answered(r, false))
+  const onFailed = (r) => answers.push(answered(r, true))
+  page.on('request', onRequest)
+  page.on('requestfinished', onFinished)
+  page.on('requestfailed', onFailed)
+  await page.evaluate(() => {
+    const from = performance.now()
+    const went = []
+    const stop = new AbortController()
+    for (const name of ['emptied', 'loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'seeking', 'seeked', 'waiting', 'stalled', 'playing', 'pause', 'error'])
+      document.querySelector('video').addEventListener(name, () => went.push(`${name}+${Math.round(performance.now() - from)}`), { signal: stop.signal })
+    window.playerRecord = () => {
+      stop.abort()
+      return went
+    }
+  })
+  return async () => {
+    page.off('request', onRequest)
+    page.off('requestfinished', onFinished)
+    page.off('requestfailed', onFailed)
+    await Promise.all(answers)
+    const went = await page.evaluate(() => window.playerRecord()).catch(() => ['(the page did not answer)'])
+    const opens = asked.filter((e) => e.what === 'open')
+    const film = (e) => {
+      const n = opens.findIndex((o) => o.opened === e.film)
+      return n < 0 ? 'old' : `new${n + 1}`
+    }
+    const one = (e) => {
+      if (e.what === 'stop') return `stop:${film(e)}+${e.at}`
+      const what = e.what === 'open' ? 'open' : `${film(e)}/${e.what}`
+      const until = e.ms === undefined ? '..?' : `..${e.at + e.ms}`
+      return `${what}+${e.at}${until}${e.givenUp ? '(given up)' : e.status && e.status !== 200 ? `(${e.status})` : ''}`
+    }
+    const lists = asked.filter((e) => e.what === 'index.m3u8')
+    return {
+      // Whether the PC's answer to the first pick was back before the
+      // second pick went out. The page takes a different path for each.
+      firstAnswerFirst: opens.length > 1 && opens[0].ms !== undefined && opens[0].at + opens[0].ms <= opens[1].at,
+      lists: lists.length,
+      films: new Set(lists.map((e) => e.film)).size,
+      player: went.slice(0, 60).join(' ') || '(nothing)',
+      asked: asked.slice(0, 60).map(one).join(' ') || '(nothing)',
+    }
+  }
+}
+
 assert.ok(existsSync(bin), `program not found at ${bin}; build it first`)
 const data = mkdtempSync(join(tmpdir(), 'lm-data-'))
 const media = mkdtempSync(join(tmpdir(), 'lm-media-'))
@@ -417,29 +497,54 @@ try {
 
   await step('changing the sound twice in a row keeps the place in the film, and the subtitles', async () => {
     const subtitles = await page.inputValue('[data-testid=pick-subtitles]')
-    await page.evaluate(() => (document.querySelector('video').currentTime = 60))
-    await playsBeyond(page, 60.5, 'a jump to one minute')
-    const place = await page.evaluate(() => document.querySelector('video').currentTime)
-    // Not with the keyboard for once: until the PC answers, the list goes
-    // back to the track that is playing, so two key presses cannot be aimed
-    // at the third track. The second pick is made before the first has
-    // taken effect.
-    await page.selectOption('[data-testid=pick-sound]', '1')
-    await page.selectOption('[data-testid=pick-sound]', '2')
-    await playsBeyond(page, place + 0.5, 'after two changes of sound')
-    const v = await page.evaluate(() => {
-      const el = document.querySelector('video')
-      return { at: el.currentTime, sound: document.querySelector('[data-testid=pick-sound]').value, method: el.dataset.method }
-    })
-    assert.ok(v.at < place + 15, `the film was at ${place} s and is now at ${v.at} s`)
-    assert.equal(v.sound, '2', 'the list shows the sound track picked last')
-    // The PC opened the film once for each pick. The one that was not used
-    // must be closed again, leaving the one that is playing.
-    for (let i = 0; (await converters()) !== 1; i++) {
-      assert.ok(i < 50, `${await converters()} films are held open for conversion 5 seconds after changing the sound; one is playing`)
-      await new Promise((r) => setTimeout(r, 100))
+    // In Safari's engine this step once took 15 seconds where 4 are usual,
+    // and nothing said which of its three waits that was, or why. Until
+    // that is known a record is kept and printed, whether the step passes
+    // or fails: how long each wait took, which way round the PC's first
+    // answer and the second pick fell, what the player went through and
+    // what it fetched.
+    const waits = []
+    let since = Date.now()
+    const waited = (what) => {
+      waits.push(`${what} ${Date.now() - since} ms`)
+      since = Date.now()
     }
-    console.log(`      (was at ${place.toFixed(2)} s, plays on at ${v.at.toFixed(2)} s by method ${v.method})`)
+    const recorded = await record(page)
+    try {
+      await page.evaluate(() => (document.querySelector('video').currentTime = 60))
+      await playsBeyond(page, 60.5, 'a jump to one minute')
+      waited('for the jump')
+      const place = await page.evaluate(() => document.querySelector('video').currentTime)
+      // Not with the keyboard for once: until the PC answers, the list goes
+      // back to the track that is playing, so two key presses cannot be aimed
+      // at the third track. The second pick follows the first at once; the
+      // PC's answer to the first may or may not be back by then.
+      since = Date.now()
+      await page.selectOption('[data-testid=pick-sound]', '1')
+      await page.selectOption('[data-testid=pick-sound]', '2')
+      await playsBeyond(page, place + 0.5, 'after two changes of sound')
+      waited('to play on after the two picks')
+      const v = await page.evaluate(() => {
+        const el = document.querySelector('video')
+        return { at: el.currentTime, sound: document.querySelector('[data-testid=pick-sound]').value, method: el.dataset.method }
+      })
+      assert.ok(v.at < place + 15, `the film was at ${place} s and is now at ${v.at} s`)
+      assert.equal(v.sound, '2', 'the list shows the sound track picked last')
+      // The PC opened the film once for each pick. The one that was not used
+      // must be closed again, leaving the one that is playing.
+      since = Date.now()
+      for (let i = 0; (await converters()) !== 1; i++) {
+        assert.ok(i < 50, `${await converters()} films are held open for conversion 5 seconds after changing the sound; one is playing`)
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      waited('for the film not used to be closed')
+      console.log(`      (was at ${place.toFixed(2)} s, plays on at ${v.at.toFixed(2)} s by method ${v.method})`)
+    } finally {
+      const r = await recorded()
+      console.log(`      (waited ${waits.join(', ') || 'for nothing yet'}; the PC's first answer was back before the second pick: ${r.firstAnswerFirst ? 'yes' : 'no'}; lists of chunks asked for: ${r.lists}, for ${r.films} ${r.films === 1 ? 'film' : 'films'})`)
+      console.log(`      (the player, with milliseconds since the step began: ${r.player})`)
+      console.log(`      (asked of the PC, from when to when: ${r.asked})`)
+    }
     // Changing the sound hands the film to the player afresh. The subtitles
     // are switched back on once it plays.
     assert.equal(await page.inputValue('[data-testid=pick-subtitles]'), subtitles, 'the same subtitles are still chosen')
