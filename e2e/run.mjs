@@ -211,6 +211,7 @@ try {
     await waitPlaying(page, 1)
     const w = await page.evaluate(() => document.querySelector('video').videoWidth)
     assert.equal(w, 320, 'the picture is decoded')
+    assert.equal(await page.locator('[data-testid=play-problem]').count(), 0, `nothing is wrong, yet the page says: ${await page.locator('[data-testid=play-problem]').allTextContents()}`)
   })
 
   await step('seek, then leave', async () => {
@@ -256,6 +257,9 @@ try {
     const why = await page.textContent('[data-testid=how-text]')
     assert.match(why, /Repackaging the file/)
     assert.equal(await converters(), 1, 'the PC holds one film open for conversion')
+    // Safari's engine learns the size of a repackaged film's picture a
+    // moment after the film opens, which the page once took for "no picture".
+    assert.equal(await page.locator('[data-testid=play-problem]').count(), 0, `nothing is wrong, yet the page says: ${await page.locator('[data-testid=play-problem]').allTextContents()}`)
   })
 
   await step('subtitles show, and are still in step after a jump far ahead', async () => {
@@ -391,6 +395,51 @@ try {
     // Back to how it was, so that the next film's subtitles are down to
     // what was chosen for that film.
     await showSubtitles('auto')
+  })
+
+  await step('a picture whose size is only known once the film plays raises no false alarm', async () => {
+    // Safari's own chunk player does not know the size of the picture when
+    // it first describes the film; the size follows a moment later. The
+    // other engines know it at once, so the wait is imitated in all of
+    // them: the size reads as nothing until the test says otherwise.
+    const sizeUnknown = () => page.evaluate(() => {
+      const real = Object.getOwnPropertyDescriptor(HTMLVideoElement.prototype, 'videoWidth')
+      Object.defineProperty(HTMLVideoElement.prototype, 'videoWidth', { configurable: true, get: () => 0 })
+      window.sizeBecomesKnown = () => {
+        Object.defineProperty(HTMLVideoElement.prototype, 'videoWidth', real)
+        document.querySelector('video').dispatchEvent(new Event('resize'))
+      }
+    })
+    const alarm = () => page.evaluate(() => document.querySelector('[data-testid=play-problem]')?.textContent || '')
+    await sizeUnknown()
+    await focusByText(page, 'Three Sounds Test')
+    await page.keyboard.press('Enter')
+    await waitPlaying(page, 0.1)
+    const from = await page.evaluate(() => document.querySelector('video').currentTime)
+    await playsBeyond(page, from + 0.5, 'the film whose picture size is not known yet')
+    assert.equal(await alarm(), '', 'no alarm while the film has only just begun to play')
+    // If the size never comes, there really is no picture this browser can
+    // show, and the viewer is told after a few seconds of playing.
+    await page.waitForSelector('[data-testid=play-problem]', { timeout: 15000 }).catch(() => assert.fail('a film that plays on with no picture must be reported'))
+    assert.match(await alarm(), /sound but not its picture/)
+    await page.evaluate(() => window.sizeBecomesKnown())
+    await page.waitForSelector('[data-testid=play-problem]', { state: 'detached', timeout: 5000 }).catch(() => assert.fail('the alarm must go once the size of the picture is known'))
+    await page.evaluate(() => document.querySelector('video').pause())
+    await focusByText(page, '← Back')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('text=Continue watching')
+    // An ordinary file knows the size of its picture from the start. For
+    // those, no size still means no picture, and is said at once.
+    await sizeUnknown()
+    await focusByText(page, 'Test Clip')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('[data-testid=play-problem]', { timeout: 15000 }).catch(() => assert.fail('an ordinary file with no picture must be reported as soon as it opens'))
+    assert.match(await alarm(), /sound but not its picture/)
+    await page.evaluate(() => window.sizeBecomesKnown())
+    await page.evaluate(() => document.querySelector('video').pause())
+    await focusByText(page, '← Back')
+    await page.keyboard.press('Enter')
+    await page.waitForSelector('text=Continue watching')
   })
 
   await step('a repackaged film resumes where it stopped, with its subtitles', async () => {

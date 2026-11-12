@@ -738,6 +738,17 @@ const mediaErrors: Record<number, string> = {
   4: 'MEDIA_ERR_SRC_NOT_SUPPORTED',
 }
 
+const NO_PICTURE =
+  "This browser can play this file's sound but not its picture. Converting the picture of such files arrives in a later version (M4)."
+
+// playedSeconds is how much of the film has really been played since it was
+// handed to the player.
+function playedSeconds(v: HTMLVideoElement): number {
+  let total = 0
+  for (let i = 0; i < v.played.length; i++) total += v.played.end(i) - v.played.start(i)
+  return total
+}
+
 function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; onSignedOut: () => void }) {
   const [info, setInfo] = useState<PlayInfo | null>(null)
   const [error, setError] = useState('')
@@ -945,18 +956,29 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     remember(info ? info.plan.audioTrack : -1, key)
   }
 
+  const noPicture = () => {
+    setProblem(NO_PICTURE)
+    report('no-picture', `${info?.container} videoWidth=0`)
+  }
+
   const onLoaded = () => {
     const v = videoRef.current
     if (!v || !info) return
     // hls.js was told where to start; everything else is told here.
     if (!chunkPlayer.current && info.positionMs > 0 && info.positionMs / 1000 < v.duration - 5) v.currentTime = info.positionMs / 1000
     applySubs() // a track the browser switched on by itself goes off again, like the rest
-    if (v.videoWidth === 0) {
-      setProblem(
-        "This browser can play this file's sound but not its picture. Converting the picture of such files arrives in a later version (M4).",
-      )
-      report('no-picture', `${info.container} videoWidth=0`)
-    }
+    // An ordinary file knows the size of its picture by now, so no size
+    // means no picture. A film that arrives as chunks may not know it yet:
+    // Safari's own chunk player learns it a moment later. That case is
+    // judged in onTime, once the film has really been playing.
+    if (!info.hls && v.videoWidth === 0) noPicture()
+  }
+
+  // The size of the picture has become known, so there is a picture after
+  // all.
+  const onResize = () => {
+    const v = videoRef.current
+    if (v && v.videoWidth > 0) setProblem((p) => (p === NO_PICTURE ? '' : p))
   }
 
   const onTime = () => {
@@ -971,6 +993,9 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       )
       report('no-sound', `${info?.container} webkitAudioDecodedByteCount=0`)
     }
+    // After a few seconds of playing every browser knows the size of the
+    // picture, if there is one.
+    if (v && info?.hls && v.videoWidth === 0 && playedSeconds(v) > 3) noPicture()
   }
 
   const onError = () => {
@@ -1014,6 +1039,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
             data-method={info.plan.method}
             onLoadedMetadata={onLoaded}
             onPlaying={onPlaying}
+            onResize={onResize}
             onTimeUpdate={onTime}
             onPause={() => save(true)}
             onEnded={() => save(true)}
