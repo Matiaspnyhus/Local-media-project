@@ -551,9 +551,13 @@ func TestStoppingEndsTheConverterAndKeepsNothing(t *testing.T) {
 	case <-time.After(time.Minute):
 		t.Fatal("the stand-in never reported")
 	}
-	if _, err := Extract(context.Background(), tl, "any.mkv", dir, nil); !errors.Is(err, ErrBusy) {
+	// (Were it not refused it would hang like the first, so it is given an
+	// end of its own.)
+	second, enough := context.WithTimeout(context.Background(), 20*time.Second)
+	if _, err := Extract(second, tl, "any.mkv", dir, nil); !errors.Is(err, ErrBusy) {
 		t.Errorf("a second run for the same folder: %v", err)
 	}
+	enough()
 	if _, err := os.Stat(filepath.Join(dir, workName, "p2.sup")); err != nil {
 		t.Errorf("the stand-in should have written into the working folder by now: %v", err)
 	}
