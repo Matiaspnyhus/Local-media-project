@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"math"
 	"os/exec"
 	"sort"
 	"strconv"
@@ -24,32 +26,54 @@ type Grid struct {
 	EndMs   int64   `json:"end"`
 	Cuts    []int64 `json:"cuts"` // Cuts[0] == StartMs
 	// From says how the cuts were found: "index" (the file's own list of
-	// key frames), "probe" (ffprobe visited the film) or "uniform".
+	// key frames), "probe" (ffprobe visited the film every few seconds),
+	// "read" (ffprobe read the film through) or "uniform".
 	From string `json:"from,omitempty"`
+	// LeadMs is how long before StartMs the file's first frame lies. It is
+	// 0 for nearly every file. A clip cut out of a longer film without
+	// re-encoding keeps the frames from the key frame before the cut,
+	// marked as not to be shown, because the first frames that are shown
+	// cannot be decoded without them. They are sent on for the same
+	// reason: the first chunk carries them and is this much longer, and
+	// every time the player is told is this much later than the film's own.
+	LeadMs int64 `json:"lead,omitempty"`
 }
+
+// maxChunkMs is the longest a chunk may be. A chunk is made, sent and held
+// by the player in one piece, so one of several minutes is never ready in
+// time and is too big to handle. A list with such a chunk in it is a sign
+// that the key frames were not found, not a list to play from.
+const maxChunkMs = 10 * SegmentSeconds * 1000
 
 // Uniform is the grid used when the key frames could not be found: a cut
 // every few seconds. Chunks then begin at the first key frame after each
 // cut, so the timeline can be off by a few seconds after a jump.
 func Uniform(durationMs int64) Grid {
-	g := Grid{EndMs: max(durationMs, 1000), From: "uniform"}
-	for t := int64(0); t < g.EndMs; t += SegmentSeconds * 1000 {
+	return uniform(0, durationMs)
+}
+
+// uniform is Uniform for a film whose clock starts at startMs.
+func uniform(startMs, durationMs int64) Grid {
+	g := Grid{StartMs: startMs, EndMs: startMs + max(durationMs, 1000), From: "uniform"}
+	for t := g.StartMs; t < g.EndMs; t += SegmentSeconds * 1000 {
 		g.Cuts = append(g.Cuts, t)
 	}
 	return g
 }
 
-// Valid reports whether a grid read back from storage can be used.
+// Valid reports whether a grid, read back from storage or just worked out,
+// can be used: its cuts are in order and inside the film, and no chunk is
+// longer than a chunk can be.
 func (g Grid) Valid() bool {
-	if len(g.Cuts) == 0 || g.Cuts[0] != g.StartMs || g.EndMs <= g.StartMs {
+	if len(g.Cuts) == 0 || g.Cuts[0] != g.StartMs || g.EndMs <= g.StartMs || g.LeadMs < 0 || g.LeadMs > maxChunkMs {
 		return false
 	}
 	for i := 1; i < len(g.Cuts); i++ {
-		if g.Cuts[i] <= g.Cuts[i-1] || g.Cuts[i] >= g.EndMs {
+		if g.Cuts[i] <= g.Cuts[i-1] || g.Cuts[i] >= g.EndMs || g.Cuts[i]-g.Cuts[i-1] > maxChunkMs {
 			return false
 		}
 	}
-	return true
+	return g.EndMs-g.Cuts[len(g.Cuts)-1] <= maxChunkMs
 }
 
 // index is the chunk a fragment starting at ms belongs to.
@@ -59,11 +83,20 @@ func (g Grid) index(ms float64) int {
 	return max(k, 0)
 }
 
+// shift is how much later than the film's own every time in the chunks is,
+// in milliseconds: enough that none falls below zero.
+func (g Grid) shift() int64 {
+	return clockShiftMs + g.LeadMs
+}
+
 // seconds is how long chunk k lasts.
 func (g Grid) seconds(k int) float64 {
 	end := g.EndMs
 	if k+1 < len(g.Cuts) {
 		end = g.Cuts[k+1]
+	}
+	if k == 0 {
+		end += g.LeadMs // the frames before the start are in the first chunk
 	}
 	return max(float64(end-g.Cuts[k])/1000, 0.1)
 }
@@ -82,12 +115,27 @@ func (g *Grid) addCuts(keys []int64, gap int64) {
 	}
 }
 
-// FindCuts works out where to cut a film. An MKV file's own list of key
-// frames is used when it has a good one, which takes one small read.
-// Otherwise ffprobe is asked for a key frame near every few seconds of the
-// film; it jumps from place to place rather than reading the file through,
-// so that takes a moment, not minutes. Either way the result is worth
-// keeping.
+// ErrKeyFramesTooFar means a film's key frames are so far apart that it
+// cannot be cut into chunks of a usable length.
+var ErrKeyFramesTooFar = errors.New("the film's key frames are too far apart to cut it into chunks")
+
+// FindCuts works out where to cut a film, the quickest way that works:
+//
+//   - An MKV file's own list of key frames is used when it has a good one,
+//     which takes one small read.
+//   - Otherwise ffprobe is asked for a key frame near every few seconds of
+//     the film; it jumps from place to place rather than reading the file
+//     through, so that takes a moment, not minutes.
+//   - In some files a jump does not land on a key frame (MPEG-TS, the form
+//     of TV recordings and disc streams, has no list to jump by). Then
+//     ffprobe reads the film through once and reports every key frame. That
+//     is as slow as the disk: a second for a small file, a minute or more
+//     for a long recording on a hard disk.
+//
+// The result is worth keeping. When no good cuts can be found the error
+// says why, and the grid returned with it is the one to fall back on: a cut
+// every few seconds on the film's own clock (see Uniform), which plays but
+// is not worth keeping.
 func FindCuts(ctx context.Context, ffprobe, path string, durationMs int64) (Grid, error) {
 	if ffprobe == "" {
 		return Grid{}, fmt.Errorf("ffprobe is not available")
@@ -95,16 +143,13 @@ func FindCuts(ctx context.Context, ffprobe, path string, durationMs int64) (Grid
 	if durationMs <= 0 {
 		return Grid{}, fmt.Errorf("the film's length is not known")
 	}
-	start := int64(0)
-	// Where the picture's own clock starts: usually 0, but not always.
-	cmd := exec.CommandContext(ctx, ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=start_time", "-of", "csv=p=0", path)
-	hideWindow(cmd)
-	if out, err := cmd.Output(); err == nil {
-		if v, err := strconv.ParseFloat(strings.Trim(strings.TrimSpace(string(out)), ","), 64); err == nil {
-			start = int64(v*1000 + 0.5)
-		}
+	start, lead, format := clockStart(ctx, ffprobe, path)
+	g := Grid{StartMs: start, EndMs: start + durationMs, Cuts: []int64{start}, From: "probe", LeadMs: lead}
+	even := func() Grid {
+		u := uniform(start, durationMs)
+		u.LeadMs = lead
+		return u
 	}
-	g := Grid{StartMs: start, EndMs: start + durationMs, Cuts: []int64{start}, From: "probe"}
 	if isMatroska(path) {
 		if keys, err := matroskaKeyFrames(path); err == nil && denseEnough(keys, g.StartMs, g.EndMs) {
 			g.From = "index"
@@ -112,45 +157,123 @@ func FindCuts(ctx context.Context, ffprobe, path string, durationMs int64) (Grid
 			return g, nil
 		}
 	}
-	step := int64(SegmentSeconds * 1000)
-	if durationMs/step > maxProbes {
-		step = (durationMs/maxProbes/1000 + 1) * 1000
-	}
-	var iv strings.Builder
-	for t := start + step; t < g.EndMs; t += step {
-		if iv.Len() > 0 {
-			iv.WriteByte(',')
+	// Jumping is not tried on MPEG-TS, where it cannot work and each jump is
+	// itself a search through the file.
+	if !strings.Contains(format, "mpegts") {
+		step := int64(SegmentSeconds * 1000)
+		if durationMs/step > maxProbes {
+			step = (durationMs/maxProbes/1000 + 1) * 1000
 		}
-		// "Go to this time and show one packet": ffprobe lands on the key
-		// frame at or before it, as ffmpeg will when it starts there.
-		fmt.Fprintf(&iv, "%d.%03d%%+#1", t/1000, t%1000)
+		var iv strings.Builder
+		for t := start + step; t < g.EndMs; t += step {
+			if iv.Len() > 0 {
+				iv.WriteByte(',')
+			}
+			// "Go to this time and show one packet": ffprobe lands on the key
+			// frame at or before it, as ffmpeg will when it starts there.
+			fmt.Fprintf(&iv, "%d.%03d%%+#1", t/1000, t%1000)
+		}
+		if iv.Len() == 0 {
+			return g, nil
+		}
+		keys, missed, err := keyFrames(ctx, ffprobe, path, iv.String())
+		if err != nil {
+			return even(), fmt.Errorf("ffprobe could not find the key frames: %w", err)
+		}
+		// Skip repeats (two places that share a key frame) and cuts that would
+		// make a chunk too short to be worth a request.
+		g.addCuts(keys, 2000)
+		// Good enough if no chunk is too long to use, and if either every
+		// jump landed on a key frame (then the long stretches there are
+		// have no key frame in them) or there are no long stretches.
+		if g.Valid() && (missed == 0 || denseEnough(g.Cuts, g.StartMs, g.EndMs)) {
+			return g, nil
+		}
+		// Otherwise jumps in this file do not land on key frames, or its
+		// own list of them is thin. Reading it through tells.
 	}
-	if iv.Len() == 0 {
-		return g, nil
+	keys, _, err := keyFrames(ctx, ffprobe, path, "")
+	if err != nil {
+		return even(), fmt.Errorf("ffprobe could not read the film through for its key frames: %w", err)
 	}
-	cmd = exec.CommandContext(ctx, ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", iv.String(),
-		"-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", path)
+	g = Grid{StartMs: start, EndMs: start + durationMs, Cuts: []int64{start}, From: "read", LeadMs: lead}
+	g.addCuts(keys, SegmentSeconds*1000)
+	if !g.Valid() {
+		return even(), fmt.Errorf("%w (%d found in %d seconds)", ErrKeyFramesTooFar, len(keys), durationMs/1000)
+	}
+	return g, nil
+}
+
+// clockStart asks where the picture's own clock starts, in milliseconds
+// (usually 0, but hours in for some TV recordings), how long before that
+// the file's first frame lies (see Grid.LeadMs), and how ffprobe names the
+// kind of file.
+func clockStart(ctx context.Context, ffprobe, path string) (startMs, leadMs int64, format string) {
+	// The start as the file states it, and the first frame stored in it.
+	cmd := exec.CommandContext(ctx, ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+		"-show_entries", "packet=pts_time:stream=start_time:format=format_name", "-of", "default=noprint_wrappers=1", path)
+	hideWindow(cmd)
+	out, _ := cmd.Output()
+	started, first := false, math.NaN()
+	sc := bufio.NewScanner(bytes.NewReader(out))
+	for sc.Scan() {
+		name, value, _ := strings.Cut(strings.TrimSpace(sc.Text()), "=")
+		switch name {
+		case "pts_time":
+			if v, err := strconv.ParseFloat(value, 64); err == nil && math.IsNaN(first) {
+				first = v * 1000
+			}
+		case "start_time":
+			// For MPEG-TS the line is printed twice (once for the programme
+			// the picture belongs to); the first is as good as the second.
+			if v, err := strconv.ParseFloat(value, 64); err == nil && !started {
+				startMs, started = int64(math.Round(v*1000)), true
+			}
+		case "format_name":
+			format = value
+		}
+	}
+	if started && !math.IsNaN(first) {
+		// A lead longer than a chunk may be is some other oddity: leave it.
+		if lead := startMs - int64(math.Round(first)); lead > 0 && lead <= maxChunkMs {
+			leadMs = lead
+		}
+	}
+	return startMs, leadMs, format
+}
+
+// keyFrames asks ffprobe when the picture's key frames are shown, in
+// milliseconds, in order. With intervals it looks only where they say (see
+// ffprobe's -read_intervals); without, it reads the whole film. others is
+// how many of the frames it was shown were not key frames: when jumping,
+// how many jumps did not land on one.
+func keyFrames(ctx context.Context, ffprobe, path, intervals string) (keys []int64, others int, err error) {
+	a := []string{"-v", "error", "-select_streams", "v:0"}
+	if intervals != "" {
+		a = append(a, "-read_intervals", intervals)
+	}
+	cmd := exec.CommandContext(ctx, ffprobe, append(a, "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", path)...)
 	hideWindow(cmd)
 	out, err := cmd.Output()
 	if err != nil {
-		return Grid{}, fmt.Errorf("ffprobe could not find the key frames: %w", err)
+		return nil, 0, err
 	}
-	var keys []int64
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
 		f := strings.Split(sc.Text(), ",")
-		if len(f) < 2 || !strings.HasPrefix(f[1], "K") {
+		if len(f) < 2 {
+			continue
+		}
+		if !strings.HasPrefix(f[1], "K") {
+			others++
 			continue
 		}
 		if v, err := strconv.ParseFloat(f[0], 64); err == nil {
-			keys = append(keys, int64(v*1000+0.5))
+			keys = append(keys, int64(math.Round(v*1000)))
 		}
 	}
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
-	// Skip repeats (two places that share a key frame) and cuts that would
-	// make a chunk too short to be worth a request.
-	g.addCuts(keys, 2000)
-	return g, nil
+	return keys, others, nil
 }
 
 // denseEnough says whether a file's own list of key frames is fit to cut

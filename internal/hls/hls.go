@@ -18,6 +18,7 @@ package hls
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -39,8 +40,10 @@ const SegmentSeconds = 6
 
 // clockShiftMs is added to every time ffmpeg writes. Sound often starts a
 // few hundredths of a second "before zero", which the chunk format cannot
-// express; shifting everything by one second keeps all times positive.
-// Players only look at the differences, so nobody sees it.
+// express; shifting everything by one second keeps those times positive.
+// Players only look at the differences, so nobody sees it. A film that
+// keeps frames from before its start is shifted by their length as well
+// (see Grid.LeadMs and Grid.shift).
 const clockShiftMs = 1000
 
 // maxPerOwner is how many films one sign-in may hold open at once.
@@ -54,6 +57,7 @@ type Spec struct {
 	VideoCodec string // as ffprobe names it; "hevc" needs a tag Apple devices insist on
 	AudioTrack int    // which sound track, counted from 0; -1 for none
 	AudioCopy  bool   // pass the sound through untouched, or convert it to stereo AAC
+	AudioCodec string // the chosen sound track's codec, as ffprobe names it; matters when it is passed through
 	Owner      string // the sign-in this session belongs to
 }
 
@@ -75,11 +79,29 @@ type Manager struct {
 
 	mu       sync.Mutex
 	sessions map[string]*session
-	stop     chan struct{}
-	closing  sync.Once
-	done     sync.WaitGroup
+	// live holds every run whose ffmpeg has been started and is not yet
+	// gone, whatever became of its session, so that closing the manager
+	// can be sure to leave nothing running.
+	live    map[*run]struct{}
+	closed  bool
+	stop    chan struct{}
+	closing sync.Once
+	done    sync.WaitGroup
+	// inGap, when set, is called by halt at the moment it has let go of the
+	// lock to wait for ffmpeg to stop. Only tests set it: it lets them make
+	// something else happen at exactly that moment.
+	inGap func()
 }
 
+// A session's ffmpeg takes a few thousandths of a second to stop, and the
+// lock is let go of meanwhile (see halt). Two rules keep that gap safe:
+//
+//   - Only one stop is in progress for a session at a time, and nothing is
+//     started for it until that stop is done. halting says so.
+//   - A session that has been closed is marked gone before its ffmpeg is
+//     stopped, and nothing is ever started for a session that is gone. A
+//     request that was in the gap when the session was closed finds the
+//     mark when it gets the lock back.
 type session struct {
 	spec    Spec
 	dir     string
@@ -88,20 +110,36 @@ type session struct {
 	lastReq time.Time
 	lastSeg int
 	starts  int
+	halting chan struct{} // not nil while a stop is in progress; closed when it is done
+	gone    bool          // closed for good
+	// quietFrom is the earliest chunk at which ffmpeg, started with the
+	// sound, found no sound left in the film (0 if that has not happened).
+	// Runs started there or later carry the picture alone. header is the
+	// header of the first run that carried the sound, which is the one a
+	// player must be given whatever is running: see wait.
+	quietFrom int
+	header    []byte
+	// edit is what the first run's header gave as the tick of the picture's
+	// clock that is shown first; edited says that there has been a first
+	// run. Later runs are made to agree with it: see slice.
+	edit   int64
+	edited bool
 }
 
 // run is one ffmpeg process and the chunks cut from its output.
 type run struct {
-	cmd    *exec.Cmd
-	dir    string
-	first  int           // the chunk this run was started for
-	low    int           // the lowest chunk still on disk
-	next   int           // chunks low..next-1 are complete
-	header bool          // the header is complete
-	ended  bool          // ffmpeg reached the end of the film
-	stop   chan struct{} // closed to make the reader give up
-	exited chan struct{} // closed when ffmpeg is gone and its output read
-	stderr *tail
+	cmd     *exec.Cmd
+	dir     string
+	first   int           // the chunk this run was started for
+	low     int           // the lowest chunk still on disk
+	next    int           // chunks low..next-1 are complete
+	header  bool          // the header is complete
+	quiet   bool          // the film has sound but this run leaves it out
+	ended   bool          // ffmpeg reached the end of the film
+	stop    chan struct{} // closed to make the reader give up
+	stopped sync.Once
+	exited  chan struct{} // closed when ffmpeg is gone and its output read
+	stderr  *tail
 }
 
 func (r *run) alive() bool {
@@ -111,6 +149,13 @@ func (r *run) alive() bool {
 	default:
 		return true
 	}
+}
+
+// kill tells the run to end: the reader to give up and ffmpeg to die. It
+// does not wait for either; exited says when both have happened.
+func (r *run) kill() {
+	r.stopped.Do(func() { close(r.stop) })
+	r.cmd.Process.Kill()
 }
 
 func (r *run) file(n int) string {
@@ -134,32 +179,60 @@ func New(ffmpeg, root string) (*Manager, error) {
 	}
 	m := &Manager{ffmpeg: ffmpeg, root: root, IdleStop: 75 * time.Second, Forget: 12 * time.Hour,
 		Ahead: 50, Behind: 20, ReadRate: 8, Burst: 60,
-		Log: func(string, ...any) {}, sessions: map[string]*session{}, stop: make(chan struct{})}
+		Log: func(string, ...any) {}, sessions: map[string]*session{}, live: map[*run]struct{}{}, stop: make(chan struct{})}
 	m.done.Add(1)
 	go m.janitor()
 	return m, nil
 }
 
-// Close stops every conversion and removes every chunk.
+// Close stops every conversion and removes every chunk. When it returns no
+// ffmpeg started by this manager is running, and none will be started.
 func (m *Manager) Close() {
 	m.closing.Do(func() {
 		close(m.stop)
 		m.done.Wait()
 		m.mu.Lock()
-		defer m.mu.Unlock()
-		for _, s := range m.sessions {
-			m.halt(s)
+		m.closed = true
+		for token, s := range m.sessions {
+			s.gone = true
+			delete(m.sessions, token)
 		}
-		m.sessions = map[string]*session{}
+		// Every run, not only those the sessions hold: whatever is running
+		// is stopped, however it came to be.
+		var running []*run
+		for r := range m.live {
+			r.kill()
+			running = append(running, r)
+		}
+		m.mu.Unlock()
+		for _, r := range running {
+			<-r.exited
+		}
 		os.RemoveAll(m.root)
 	})
+}
+
+// end closes a session for good: no request can reach it any more, its
+// ffmpeg is stopped and its chunks are removed. The caller holds the lock;
+// it is released while ffmpeg stops.
+func (m *Manager) end(token string, s *session) {
+	s.gone = true
+	delete(m.sessions, token)
+	m.halt(s)
+	os.RemoveAll(s.dir)
 }
 
 // Open registers a session and returns its token: a random value that is
 // the only way to reach the session's chunks.
 func (m *Manager) Open(spec Spec) string {
 	if !spec.Grid.Valid() {
-		spec.Grid = Uniform(spec.Grid.EndMs - spec.Grid.StartMs)
+		// Nothing to cut by, or cuts so far apart that a chunk could never
+		// be made in time: cut evenly instead, on the same clock.
+		lead := spec.Grid.LeadMs
+		spec.Grid = uniform(spec.Grid.StartMs, spec.Grid.EndMs-spec.Grid.StartMs)
+		if lead > 0 && lead <= maxChunkMs {
+			spec.Grid.LeadMs = lead
+		}
 	}
 	b := make([]byte, 16)
 	rand.Read(b)
@@ -168,7 +241,7 @@ func (m *Manager) Open(spec Spec) string {
 	defer m.mu.Unlock()
 	// One sign-in watches one film at a time, give or take a tab or two.
 	// Beyond a handful, the one left alone longest is closed.
-	for {
+	for !m.closed {
 		var oldest string
 		n := 0
 		for t, s := range m.sessions {
@@ -182,10 +255,11 @@ func (m *Manager) Open(spec Spec) string {
 		if n < maxPerOwner {
 			break
 		}
-		s := m.sessions[oldest]
-		m.halt(s)
-		os.RemoveAll(s.dir)
-		delete(m.sessions, oldest)
+		m.end(oldest, m.sessions[oldest])
+	}
+	if m.closed {
+		// Too late: the token is as good as any other unknown one.
+		return token
 	}
 	m.sessions[token] = &session{spec: spec, dir: filepath.Join(m.root, token), lastReq: time.Now()}
 	return token
@@ -226,11 +300,16 @@ func (m *Manager) Sessions() int {
 func (m *Manager) Drop(owner string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for token, s := range m.sessions {
-		if s.spec.Owner == owner {
-			m.halt(s)
-			os.RemoveAll(s.dir)
-			delete(m.sessions, token)
+	// The lock is let go of while each one's ffmpeg stops, and a session of
+	// this owner's may be opened meanwhile, so look until none is left.
+	for again := true; again; {
+		again = false
+		for token, s := range m.sessions {
+			if s.spec.Owner == owner {
+				m.end(token, s)
+				again = true
+				break
+			}
 		}
 	}
 }
@@ -240,9 +319,7 @@ func (m *Manager) Stop(token string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if s := m.sessions[token]; s != nil {
-		m.halt(s)
-		os.RemoveAll(s.dir)
-		delete(m.sessions, token)
+		m.end(token, s)
 	}
 }
 
@@ -273,7 +350,13 @@ func (m *Manager) Playlist(token string) ([]byte, error) {
 		longest = max(longest, g.seconds(k))
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n#EXT-X-MAP:URI=\"init.mp4\"\n", int(longest+0.999))
+	fmt.Fprintf(&b, "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:%d\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-INDEPENDENT-SEGMENTS\n", int(longest+0.999))
+	if g.LeadMs > 0 {
+		// The film proper begins after the frames it keeps from before its
+		// start: a player is asked to begin there and not to show them.
+		fmt.Fprintf(&b, "#EXT-X-START:TIME-OFFSET=%.3f,PRECISE=YES\n", float64(g.LeadMs)/1000)
+	}
+	b.WriteString("#EXT-X-MAP:URI=\"init.mp4\"\n")
 	for k := range g.Cuts {
 		fmt.Fprintf(&b, "#EXTINF:%.3f,\nseg-%d.m4s\n", g.seconds(k), k)
 	}
@@ -304,6 +387,7 @@ func (m *Manager) reach() int {
 func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error) {
 	deadline := time.Now().Add(30 * time.Second)
 	launched := false
+	var unreadable *run // the run whose file for this request could not be read
 	for {
 		m.mu.Lock()
 		s := m.sessions[token]
@@ -319,24 +403,79 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 		if n >= 0 {
 			s.lastSeg = n
 		}
+		if stopping := s.halting; stopping != nil {
+			// Its ffmpeg is being stopped at this moment, for another
+			// request or because nobody was watching. Look again when that
+			// is done; what this request needs depends on what comes next.
+			m.mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-stopping:
+			}
+			continue
+		}
 		r := s.run
 		alive := r != nil && r.alive()
-		if r != nil && (n < 0 && r.header || n >= r.low && n < r.next) {
-			p := r.file(n)
+		if n < 0 && r != nil && r.quiet && s.header != nil {
+			// What is running leaves the sound out, and its header says the
+			// film has none. A player goes by the header it is given, so it
+			// gets the one an earlier run made, with the sound in it.
+			b := s.header
 			m.mu.Unlock()
-			// Read outside the lock. If a restart removed the file in the
-			// meantime, go round again.
-			if b, err := os.ReadFile(p); err == nil {
-				return b, nil
-			}
-			m.mu.Lock()
+			return b, nil
 		}
+		lost := false
+		if r != nil && (n < 0 && r.header && !r.quiet || n >= r.low && n < r.next) {
+			if r != unreadable {
+				p := r.file(n)
+				m.mu.Unlock()
+				// Read outside the lock. If the file is not there, go round
+				// again: a restart may have removed it in the meantime, and
+				// then there is a new run to look at.
+				if b, err := os.ReadFile(p); err == nil {
+					return b, nil
+				}
+				unreadable = r
+				continue
+			}
+			// The same run still says it has the file, and the disk says
+			// otherwise. Something outside this program removed it (a second
+			// copy of the program clearing the folder as it starts, a
+			// cleaning tool), and waiting will not bring it back.
+			lost = true
+		}
+		// ffmpeg sends nothing until it has the first piece of every track.
+		// Started with the sound at a point where the sound track has
+		// already ended (in many films it stops a little before the picture
+		// does), it reads to the end of the film and has sent nothing: it
+		// ends having made no chunk, or says it cannot write the header.
+		dry := r != nil && !alive && !r.quiet && s.spec.AudioTrack >= 0 && r.first > 0 && r.next == r.first &&
+			n >= r.first && n < r.first+m.reach() &&
+			(r.ended || strings.Contains(r.stderr.String(), "Cannot write moov atom before"))
 		startAt := -1
 		switch {
+		case lost:
+			// Make it again from here; the run's other files are likely
+			// gone as well.
+			startAt = n
+			if n < 0 {
+				startAt = r.first
+			}
+		case dry:
+			// Start again here with the picture alone, which is what a
+			// viewer who plays through to this point gets too, and remember
+			// it for the next jump. This request may start ffmpeg twice.
+			if s.quietFrom == 0 || r.first < s.quietFrom {
+				s.quietFrom = r.first
+			}
+			startAt, launched = n, false
 		case n < 0:
 			// The header was asked for and nothing is running: start at the
-			// top, or where the stopped run began.
-			if r == nil {
+			// top, or where the stopped run began. The same when what is
+			// running leaves the sound out and no run has yet made a header
+			// with the sound in it.
+			if r == nil || r.quiet {
 				startAt = 0
 			} else if !alive && !r.header {
 				startAt = r.first
@@ -356,14 +495,24 @@ func (m *Manager) wait(ctx context.Context, token string, n int) ([]byte, error)
 				// This request already started ffmpeg once. Either it failed,
 				// or another request has since moved it.
 				var err error = ErrSuperseded
-				if r != nil && !alive && r.first == startAt {
-					err = fmt.Errorf("the converter stopped: %s", r.stderr.String())
+				switch {
+				case lost:
+					err = errors.New("the converter's files are removed from the disk as fast as it makes them")
+				case r != nil && !alive && r.first == startAt:
+					err = fmt.Errorf("the converter stopped: %s", s.spec.said(r.stderr))
 				}
 				m.mu.Unlock()
 				return nil, err
 			}
+			if err := ctx.Err(); err != nil {
+				// Whoever asked has stopped waiting (a player that jumps
+				// about drops one request for the next), so the converter
+				// is left where it is for the request that is wanted.
+				m.mu.Unlock()
+				return nil, err
+			}
 			launched = true
-			if err := m.launch(s, startAt); err != nil {
+			if err := m.launch(ctx, s, startAt); err != nil {
 				m.mu.Unlock()
 				return nil, err
 			}
@@ -393,7 +542,14 @@ func args(spec Spec, startSeg int, readRate, burst int) []string {
 		// Start a little before the chunk, which lands ffmpeg one key frame
 		// early: the sound around the cut is then complete, and what comes
 		// before the chunk is thrown away as it is read.
-		if at := spec.Grid.Cuts[startSeg] - spec.Grid.StartMs - 100; at > 0 {
+		from := startSeg
+		if spec.Grid.From == "read" {
+			// In these files ffmpeg does not land on a key frame but wherever
+			// the time falls, and starts with whatever sound it finds there.
+			// One chunk earlier, it has passed a key frame before the chunk.
+			from--
+		}
+		if at := spec.Grid.Cuts[from] - spec.Grid.StartMs - 100; at > 0 {
 			a = append(a, "-ss", fmt.Sprintf("%d.%03d", at/1000, at%1000), "-noaccurate_seek")
 		}
 	}
@@ -408,6 +564,15 @@ func args(spec Spec, startSeg int, readRate, burst int) []string {
 		a = append(a, "-map", "0:a:"+strconv.Itoa(spec.AudioTrack))
 		if spec.AudioCopy {
 			a = append(a, "-c:a", "copy")
+			if spec.AudioCodec == "aac" {
+				// AAC is stored one way in MPEG-TS and another in the chunks.
+				// ffmpeg rewraps it by itself for most outputs but not for
+				// this one, and stops at the first sound if not told to. For
+				// AAC that is already in the right form this does nothing.
+				// It must not be asked for with any other codec: ffmpeg
+				// would refuse to start.
+				a = append(a, "-bsf:a", "aac_adtstoasc")
+			}
 		} else {
 			a = append(a, "-c:a", "aac", "-ac", "2", "-b:a", "192k")
 		}
@@ -416,22 +581,36 @@ func args(spec Spec, startSeg int, readRate, burst int) []string {
 	// fragment at every key frame, and send it all to this program.
 	return append(a,
 		"-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1",
-		"-copyts", "-avoid_negative_ts", "disabled", "-output_ts_offset", fmt.Sprintf("%d.%03d", clockShiftMs/1000, clockShiftMs%1000),
+		"-copyts", "-avoid_negative_ts", "disabled", "-output_ts_offset", fmt.Sprintf("%d.%03d", spec.Grid.shift()/1000, spec.Grid.shift()%1000),
 		"-max_muxing_queue_size", "2048",
 		"-f", "mp4", "-movflags", "+frag_keyframe+delay_moov+default_base_moof+frag_discont", "pipe:1")
 }
 
-// launch starts a fresh run at startSeg. The caller holds the lock.
-func (m *Manager) launch(s *session, startSeg int) error {
+// launch starts a fresh run at startSeg for the request ctx belongs to. The
+// caller holds the lock; it is released while the old run stops.
+func (m *Manager) launch(ctx context.Context, s *session, startSeg int) error {
 	m.halt(s)
+	// The lock was let go of. From here to the end it is held, so what is
+	// true now stays true until the new run is in place.
+	if s.gone {
+		return ErrNoSession // closed meanwhile: nothing may be started for it
+	}
+	if err := ctx.Err(); err != nil {
+		return err // given up meanwhile: the next request starts what it needs
+	}
 	os.RemoveAll(s.dir) // one run's chunks are never mixed with another's
 	s.gen++
-	r := &run{dir: filepath.Join(s.dir, "run-"+strconv.Itoa(s.gen)), first: startSeg, low: startSeg, next: startSeg,
+	spec := s.spec
+	quiet := spec.AudioTrack >= 0 && s.quietFrom > 0 && startSeg >= s.quietFrom
+	if quiet {
+		spec.AudioTrack = -1 // no sound is left from here on: see wait
+	}
+	r := &run{dir: filepath.Join(s.dir, "run-"+strconv.Itoa(s.gen)), first: startSeg, low: startSeg, next: startSeg, quiet: quiet,
 		stop: make(chan struct{}), exited: make(chan struct{}), stderr: &tail{}}
 	if err := os.MkdirAll(r.dir, 0o700); err != nil {
 		return err
 	}
-	cmd := exec.Command(m.ffmpeg, args(s.spec, startSeg, m.ReadRate, m.Burst)...)
+	cmd := exec.Command(m.ffmpeg, args(spec, startSeg, m.ReadRate, m.Burst)...)
 	hideWindow(cmd)
 	cmd.Stderr = r.stderr
 	out, err := cmd.StdoutPipe()
@@ -444,6 +623,7 @@ func (m *Manager) launch(s *session, startSeg int) error {
 	r.cmd = cmd
 	s.run = r
 	s.starts++
+	m.live[r] = struct{}{}
 	go m.pump(s, r, out)
 	return nil
 }
@@ -458,10 +638,17 @@ func (m *Manager) pump(s *session, r *run, out io.Reader) {
 	werr := r.cmd.Wait()
 	m.mu.Lock()
 	r.ended = err == nil && werr == nil
-	stopped := s.run != r
+	delete(m.live, r)
 	m.mu.Unlock()
-	if !r.ended && !stopped {
-		m.Log("the converter stopped: %v %v %s", err, werr, r.stderr.String())
+	select {
+	case <-r.stop: // stopped on purpose: nothing to report
+	default:
+		if !r.ended {
+			// Nor does the log need to say where on this PC the chunks are
+			// kept, which is under the name of whoever uses it.
+			why := strings.ReplaceAll(fmt.Sprint(err), m.root, "chunks")
+			m.Log("the converter stopped: %s %v %s", why, werr, s.spec.said(r.stderr))
+		}
 	}
 	close(r.exited)
 }
@@ -470,12 +657,14 @@ var errStopped = errors.New("stopped")
 
 // slice does the cutting. ffmpeg's output is a header followed by
 // fragments, each a short index (moof) and its data (mdat), one per key
-// frame. A fragment goes into the chunk its start time falls in.
+// frame. A fragment goes into the chunk that the moment its key frame is
+// shown falls in.
 func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 	br := bufio.NewReaderSize(out, 256<<10)
 	grid := s.spec.Grid
 	var header []byte
 	var video videoTrack
+	var move int64 // added to the time each fragment's picture is stamped with: see below
 	var f *os.File
 	cur, skip := -1, false
 	finish := func() error {
@@ -519,9 +708,30 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 			if _, err := io.ReadFull(br, body); err != nil {
 				return err
 			}
-			header = append(append(header, raw...), body...)
 			if typ == "moov" {
 				video = findVideo(body)
+				// A player keeps the header it was given first and reads
+				// every later chunk by it. One number in the header can
+				// differ from run to run: the tick of the picture's clock
+				// that is shown first (see videoTrack.edit), which depends on
+				// the frame a run happens to begin with. So every run is made
+				// to agree with the session's first: its header is given the
+				// first run's number, and the time each of its fragments is
+				// stamped with is moved by the difference, which leaves every
+				// frame shown exactly when it was going to be.
+				m.mu.Lock()
+				if !s.edited {
+					s.edit, s.edited = video.edit, true
+				}
+				first := s.edit
+				m.mu.Unlock()
+				if video.editAt != nil && first != video.edit {
+					setNumber(video.editAt, first)
+					move = first - video.edit
+				}
+			}
+			header = append(append(header, raw...), body...)
+			if typ == "moov" {
 				if err := os.WriteFile(r.file(-1)+".tmp", header, 0o600); err != nil {
 					return err
 				}
@@ -530,6 +740,9 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 				}
 				m.mu.Lock()
 				r.header = true
+				if !r.quiet && s.header == nil {
+					s.header = header
+				}
 				m.mu.Unlock()
 			}
 		case "moof":
@@ -541,8 +754,11 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 				return err
 			}
 			seg := max(cur, r.first)
-			if ms, ok := fragmentStart(body, video); ok {
-				seg = grid.index(ms - clockShiftMs)
+			if ms, stamp, ok := fragmentStart(body, video); ok {
+				seg = grid.index(ms - float64(grid.shift()))
+				if move != 0 {
+					setNumber(stamp, number(stamp)+move)
+				}
 			}
 			if cur < 0 && seg < r.first {
 				skip = true // the lead-in before the chunk that was asked for
@@ -612,18 +828,34 @@ func (m *Manager) hold(s *session, r *run, seg int) error {
 }
 
 // halt stops the session's ffmpeg, if any, and waits for it to be gone.
-// The caller holds the lock; it is released while waiting.
+// The caller holds the lock; it is released while waiting. When halt
+// returns the lock is held again, the session has no run, and no other
+// stop is in progress for it.
 func (m *Manager) halt(s *session) {
+	for s.halting != nil {
+		// Someone else is stopping it: wait for them, then look again.
+		stopping := s.halting
+		m.mu.Unlock()
+		<-stopping
+		m.mu.Lock()
+	}
 	r := s.run
 	if r == nil {
 		return
 	}
 	s.run = nil
-	close(r.stop)
-	r.cmd.Process.Kill()
+	done := make(chan struct{})
+	s.halting = done
+	r.kill()
+	inGap := m.inGap
 	m.mu.Unlock()
+	if inGap != nil {
+		inGap()
+	}
 	<-r.exited
 	m.mu.Lock()
+	s.halting = nil
+	close(done)
 }
 
 func (m *Manager) janitor() {
@@ -642,13 +874,15 @@ func (m *Manager) janitor() {
 			idle := now.Sub(s.lastReq)
 			switch {
 			case idle > m.Forget:
-				m.halt(s)
-				os.RemoveAll(s.dir)
-				delete(m.sessions, token)
+				m.end(token, s)
 			case idle > m.IdleStop && s.run != nil:
-				// Nobody is watching: stop, and give the disk space back.
+				// Nobody is watching: stop, and give the disk space back. A
+				// request that arrives while ffmpeg stops waits for that, so
+				// what it then starts is not swept away here.
 				m.halt(s)
-				os.RemoveAll(s.dir)
+				if !s.gone {
+					os.RemoveAll(s.dir)
+				}
 			}
 		}
 		m.mu.Unlock()
@@ -657,8 +891,9 @@ func (m *Manager) janitor() {
 
 // tail keeps the last part of what ffmpeg wrote to its error output.
 type tail struct {
-	mu sync.Mutex
-	b  []byte
+	mu  sync.Mutex
+	b   []byte
+	cut bool // the beginning has been dropped
 }
 
 func (t *tail) Write(p []byte) (int, error) {
@@ -666,7 +901,7 @@ func (t *tail) Write(p []byte) (int, error) {
 	defer t.mu.Unlock()
 	t.b = append(t.b, p...)
 	if len(t.b) > 4096 {
-		t.b = t.b[len(t.b)-4096:]
+		t.b, t.cut = t.b[len(t.b)-4096:], true
 	}
 	return len(p), nil
 }
@@ -674,5 +909,26 @@ func (t *tail) Write(p []byte) (int, error) {
 func (t *tail) String() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return strings.TrimSpace(string(t.b))
+	b := t.b
+	if t.cut {
+		// Only whole lines: the first is likely cut off at its beginning,
+		// and half a line says little (and half a path cannot be told from
+		// a whole one by what removes paths, see Spec.said).
+		_, rest, _ := bytes.Cut(b, []byte("\n"))
+		b = rest
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// said returns what ffmpeg wrote when a run of this film failed, with the
+// folder the film is in taken out. ffmpeg names the file it was given in
+// full; only the file's own name is let out of this package, into errors
+// and the log, from where it may travel in a support bundle.
+func (spec Spec) said(t *tail) string {
+	text := strings.ReplaceAll(t.String(), spec.Path, filepath.Base(spec.Path))
+	if dir := filepath.Dir(spec.Path); len(dir) > 1 {
+		// And anything else it names in the same folder.
+		text = strings.ReplaceAll(text, dir+string(filepath.Separator), "")
+	}
+	return text
 }
