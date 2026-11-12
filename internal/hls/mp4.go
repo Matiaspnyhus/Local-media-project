@@ -56,8 +56,10 @@ type videoTrack struct {
 	// edit is the tick of the track's clock that the header says is shown
 	// first (its "edit list"). A frame is stored with the time it is decoded
 	// at and how long after that it is shown; taking edit away from their
-	// sum gives the time it is shown at.
-	edit int64
+	// sum gives the time it is shown at. editAt is where in the header the
+	// number is written, so that it can be changed there.
+	edit   int64
+	editAt []byte
 }
 
 // findVideo reads the header (the body of a moov box) for the picture track.
@@ -69,6 +71,7 @@ func findVideo(moov []byte) videoTrack {
 		}
 		var id, scale uint32
 		var edit int64
+		var editAt []byte
 		var handler string
 		children(trak, func(typ string, b []byte) {
 			switch typ {
@@ -81,7 +84,7 @@ func findVideo(moov []byte) videoTrack {
 			case "edts":
 				children(b, func(typ string, b []byte) {
 					if typ == "elst" {
-						edit = editStart(b)
+						edit, editAt = editStart(b)
 					}
 				})
 			case "mdia":
@@ -102,7 +105,7 @@ func findVideo(moov []byte) videoTrack {
 			}
 		})
 		if handler == "vide" && scale > 0 {
-			v = videoTrack{id: id, scale: scale, edit: edit}
+			v = videoTrack{id: id, scale: scale, edit: edit, editAt: editAt}
 		}
 	})
 	if v.scale == 0 {
@@ -112,10 +115,10 @@ func findVideo(moov []byte) videoTrack {
 }
 
 // editStart reads an edit list (the body of an elst box) for the tick of
-// the track's clock that is shown first.
-func editStart(b []byte) int64 {
+// the track's clock that is shown first, and where in the list it stands.
+func editStart(b []byte) (tick int64, at []byte) {
 	if len(b) < 8 {
-		return 0
+		return 0, nil
 	}
 	// Each entry is a length and a starting tick, in 32 or 64 bits, and a
 	// speed. A starting tick of -1 marks a pause, not a place in the track.
@@ -125,15 +128,32 @@ func editStart(b []byte) int64 {
 	}
 	n := binary.BigEndian.Uint32(b[4:8])
 	for e := b[8:]; n > 0 && len(e) >= size; n, e = n-1, e[size:] {
-		t := int64(int32(binary.BigEndian.Uint32(e[4:8])))
+		at = e[4:8]
 		if b[0] == 1 {
-			t = int64(binary.BigEndian.Uint64(e[8:16]))
+			at = e[8:16]
 		}
-		if t >= 0 {
-			return t
+		if t := number(at); t >= 0 {
+			return t, at
 		}
 	}
-	return 0
+	return 0, nil
+}
+
+// number reads a whole number written in 4 or 8 bytes, and setNumber
+// writes one in its place.
+func number(b []byte) int64 {
+	if len(b) == 4 {
+		return int64(int32(binary.BigEndian.Uint32(b)))
+	}
+	return int64(binary.BigEndian.Uint64(b))
+}
+
+func setNumber(b []byte, v int64) {
+	if len(b) == 4 {
+		binary.BigEndian.PutUint32(b, uint32(v))
+		return
+	}
+	binary.BigEndian.PutUint64(b, uint64(v))
 }
 
 // fragmentStart returns when the key frame that opens a fragment (the body
@@ -145,14 +165,16 @@ func editStart(b []byte) int64 {
 // next in films whose key frames are followed by frames shown before them,
 // and in films with an uneven frame rate. The cuts are times a key frame is
 // shown at, so that is the time a fragment is filed by.
-func fragmentStart(moof []byte, v videoTrack) (ms float64, ok bool) {
+//
+// stamp is where in the fragment the time it is stamped with is written.
+func fragmentStart(moof []byte, v videoTrack) (ms float64, stamp []byte, ok bool) {
 	children(moof, func(typ string, traf []byte) {
 		if typ != "traf" || ok {
 			return
 		}
 		var id uint32
-		var t uint64
-		var have, run bool
+		var at []byte
+		var run bool
 		var later int64
 		children(traf, func(typ string, b []byte) {
 			switch typ {
@@ -162,9 +184,9 @@ func fragmentStart(moof []byte, v videoTrack) (ms float64, ok bool) {
 				}
 			case "tfdt":
 				if len(b) >= 12 && b[0] == 1 {
-					t, have = binary.BigEndian.Uint64(b[4:12]), true
+					at = b[4:12]
 				} else if len(b) >= 8 {
-					t, have = uint64(binary.BigEndian.Uint32(b[4:8])), true
+					at = b[4:8]
 				}
 			case "trun":
 				if !run {
@@ -172,8 +194,12 @@ func fragmentStart(moof []byte, v videoTrack) (ms float64, ok bool) {
 				}
 			}
 		})
-		if have && id == v.id {
-			ms, ok = float64(int64(t)+later-v.edit)*1000/float64(v.scale), true
+		if at != nil && id == v.id {
+			t := number(at)
+			if len(at) == 4 {
+				t = int64(binary.BigEndian.Uint32(at)) // the short form has no sign
+			}
+			ms, stamp, ok = float64(t+later-v.edit)*1000/float64(v.scale), at, true
 		}
 	})
 	return

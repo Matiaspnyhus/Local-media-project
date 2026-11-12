@@ -30,6 +30,7 @@ import (
 //	        ("open GOP"), as on most discs and in most HEVC films.
 //	uneven: 60 seconds with every fifth frame missing, so the time from one
 //	        frame to the next varies (a "variable frame rate").
+//	open-mp4, uneven-mp4: those two repackaged as MP4.
 //	recording: the rough film as a TV recording keeps it: MPEG-TS, which has
 //	        no list of key frames, with a clock that starts ten hours in.
 //	capture: 20 seconds of MPEG-TS with AAC sound, as programs that record
@@ -75,7 +76,7 @@ func source(t *testing.T, ffmpeg, name string) string {
 	switch name {
 	case "recording", "capture":
 		p = filepath.Join(filmDir, name+".ts")
-	case "sparse", "trimmed", "wide":
+	case "sparse", "trimmed", "wide", "open-mp4", "uneven-mp4":
 		p = filepath.Join(filmDir, name+".mp4")
 	}
 	picture := func(seconds string) []string {
@@ -130,6 +131,8 @@ func source(t *testing.T, ffmpeg, name string) string {
 			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
 	case "trimmed":
 		recipes = [][]string{{"-ss", "17", "-i", source(t, ffmpeg, "sparse"), "-c", "copy", p}}
+	case "open-mp4", "uneven-mp4":
+		recipes = [][]string{{"-i", source(t, ffmpeg, strings.TrimSuffix(name, "-mp4")), "-c", "copy", p}}
 	case "wide":
 		recipes = [][]string{append(picture("60"),
 			"-c:v", "libx264", "-preset", "ultrafast", "-g", "600", "-keyint_min", "600", "-sc_threshold", "0",
@@ -526,7 +529,10 @@ func TestAFilmThatCannotBeCutIsNotGivenAListAsIfItCould(t *testing.T) {
 // where the list said it would, and holds exactly the same frames.
 func TestEveryChunkBeginsWhereTheListSays(t *testing.T) {
 	ffmpeg, ffprobe := tools(t)
-	for _, film := range []string{"rough", "open", "uneven", "recording"} {
+	// Two of the films are also tried as MP4. An MP4 file says when each
+	// frame is decoded, where for MKV ffmpeg works that out by a fixed rule,
+	// so in MP4 the frame a run begins with shows in the header it writes.
+	for _, film := range []string{"rough", "open", "uneven", "recording", "open-mp4", "uneven-mp4"} {
 		src := source(t, ffmpeg, film)
 		t.Run(film, func(t *testing.T) {
 			t.Parallel() // the films are checked side by side to save time
@@ -535,7 +541,14 @@ func TestEveryChunkBeginsWhereTheListSays(t *testing.T) {
 				t.Errorf("a film with nothing before its start was found to keep %d ms there", g.LeadMs)
 			}
 			codec := inspect(t, ffprobe, src)["video"].Codec
-			for _, copySound := range []bool{true, false} {
+			sounds := []bool{true, false}
+			if strings.HasSuffix(film, "-mp4") {
+				sounds = []bool{true} // the sound is not what differs here
+				if film == "open-mp4" && codec != "hevc" {
+					t.Skip("without x265 the open film is made by x264, whose MP4 form differs by one piece of sound after a jump")
+				}
+			}
+			for _, copySound := range sounds {
 				everyChunk(t, ffmpeg, ffprobe, Spec{Path: src, Grid: g, VideoCodec: codec, AudioTrack: 0, AudioCopy: copySound}, film != "rough")
 			}
 		})
@@ -585,6 +598,13 @@ func everyChunk(t *testing.T, ffmpeg, ffprobe string, spec Spec, byKeyFrame bool
 		// A fresh session asked for chunk k first: ffmpeg starts there.
 		jumped := m.Open(spec)
 		direct := fetch(t, m, jumped, k, k)
+		// A player keeps the header it was given first: here one made by a
+		// run from the top of the film, while the chunk is from a run that
+		// began at the chunk. Every run must write the same header.
+		kept, _ := os.ReadFile(direct)
+		if again, err := m.Init(context.Background(), jumped); err != nil || !bytes.HasPrefix(kept, again) {
+			t.Errorf("copy sound %v: the header of the run that began at chunk %d differs from the first (%v)", copySound, k, err)
+		}
 		m.Stop(jumped)
 		a, b := inspect(t, ffprobe, through), inspect(t, ffprobe, direct)
 		wantStart := float64(g.Cuts[k])/1000 + shift
@@ -663,7 +683,7 @@ func TestAFragmentIsFiledByWhenItsKeyFrameIsShown(t *testing.T) {
 			box("tfdt", u32(0x01000000, 0, 500000)),
 			box("trun", u32(0x000201, 1, 0, 300))),
 	}, nil)
-	ms, ok := fragmentStart(moof, v)
+	ms, stamp, ok := fragmentStart(moof, v)
 	if !ok || math.Abs(ms-clockShiftMs-10417) > 0.5 {
 		t.Fatalf("the fragment's key frame is shown at %.1f ms (%v), want 10417", ms-clockShiftMs, ok)
 	}
@@ -671,11 +691,22 @@ func TestAFragmentIsFiledByWhenItsKeyFrameIsShown(t *testing.T) {
 	if k := g.index(ms - clockShiftMs); k != 1 {
 		t.Errorf("the fragment was filed in chunk %d, want 1", k)
 	}
+	// Where the two numbers stand is known, so that they can be changed:
+	// a header that says 2000 where it said 1328, and a stamp moved along
+	// by the same 672, show the key frame at the same moment.
+	if number(stamp) != stamped || number(v.editAt) != 1328 {
+		t.Fatalf("the stamp was found as %d and the header's number as %d", number(stamp), number(v.editAt))
+	}
+	setNumber(v.editAt, 2000)
+	setNumber(stamp, stamped+672)
+	if again, _, _ := fragmentStart(moof, findVideo(moov)); again != ms {
+		t.Errorf("with both numbers moved along the key frame is shown at %.1f ms, not %.1f as before", again, ms)
+	}
 	// A header with no edit list and a fragment whose frames are all shown
 	// when they are decoded: the stamp is the time.
 	plain := findVideo(box("trak", box("tkhd", u32(0, 0, 0, 7), zeros(68)),
 		box("mdia", box("mdhd", u32(0, 0, 0, 1000, 0)), box("hdlr", u32(0, 0), []byte("vide"), zeros(13)))))
-	ms, ok = fragmentStart(box("traf", box("tfhd", u32(0, 7)), box("tfdt", u32(0, 4500)), box("trun", u32(0x000201, 1, 0, 300))), plain)
+	ms, _, ok = fragmentStart(box("traf", box("tfhd", u32(0, 7)), box("tfdt", u32(0, 4500)), box("trun", u32(0x000201, 1, 0, 300))), plain)
 	if !ok || ms != 4500 {
 		t.Errorf("a plain fragment: %.1f ms (%v), want 4500", ms, ok)
 	}
@@ -684,7 +715,7 @@ func TestAFragmentIsFiledByWhenItsKeyFrameIsShown(t *testing.T) {
 		if d := firstShownAfter(junk); d != 0 {
 			t.Errorf("junk %x was read as %d", junk, d)
 		}
-		if d := editStart(junk); d != 0 {
+		if d, at := editStart(junk); d != 0 || at != nil {
 			t.Errorf("junk %x was read as an edit at %d", junk, d)
 		}
 	}

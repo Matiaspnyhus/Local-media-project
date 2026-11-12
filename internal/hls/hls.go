@@ -119,6 +119,11 @@ type session struct {
 	// player must be given whatever is running: see wait.
 	quietFrom int
 	header    []byte
+	// edit is what the first run's header gave as the tick of the picture's
+	// clock that is shown first; edited says that there has been a first
+	// run. Later runs are made to agree with it: see slice.
+	edit   int64
+	edited bool
 }
 
 // run is one ffmpeg process and the chunks cut from its output.
@@ -659,6 +664,7 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 	grid := s.spec.Grid
 	var header []byte
 	var video videoTrack
+	var move int64 // added to the time each fragment's picture is stamped with: see below
 	var f *os.File
 	cur, skip := -1, false
 	finish := func() error {
@@ -702,9 +708,30 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 			if _, err := io.ReadFull(br, body); err != nil {
 				return err
 			}
-			header = append(append(header, raw...), body...)
 			if typ == "moov" {
 				video = findVideo(body)
+				// A player keeps the header it was given first and reads
+				// every later chunk by it. One number in the header can
+				// differ from run to run: the tick of the picture's clock
+				// that is shown first (see videoTrack.edit), which depends on
+				// the frame a run happens to begin with. So every run is made
+				// to agree with the session's first: its header is given the
+				// first run's number, and the time each of its fragments is
+				// stamped with is moved by the difference, which leaves every
+				// frame shown exactly when it was going to be.
+				m.mu.Lock()
+				if !s.edited {
+					s.edit, s.edited = video.edit, true
+				}
+				first := s.edit
+				m.mu.Unlock()
+				if video.editAt != nil && first != video.edit {
+					setNumber(video.editAt, first)
+					move = first - video.edit
+				}
+			}
+			header = append(append(header, raw...), body...)
+			if typ == "moov" {
 				if err := os.WriteFile(r.file(-1)+".tmp", header, 0o600); err != nil {
 					return err
 				}
@@ -727,8 +754,11 @@ func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 				return err
 			}
 			seg := max(cur, r.first)
-			if ms, ok := fragmentStart(body, video); ok {
+			if ms, stamp, ok := fragmentStart(body, video); ok {
 				seg = grid.index(ms - float64(grid.shift()))
+				if move != 0 {
+					setNumber(stamp, number(stamp)+move)
+				}
 			}
 			if cur < 0 && seg < r.first {
 				skip = true // the lead-in before the chunk that was asked for
