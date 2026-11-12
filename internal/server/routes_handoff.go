@@ -150,6 +150,11 @@ func (s *Server) handleOpenLocal(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "This PC could not open the film in a video player. It may have no program set up for this kind of file. VLC is a free player that plays almost anything.")
 		return
 	}
+	if os.Getenv(openRecordEnv) != "" {
+		// The page is about to say "opened". If the switch was ever left
+		// on outside a test, the log says why no player appeared.
+		s.log.Printf("%s is set, so the film was written down for a test and not opened", openRecordEnv)
+	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

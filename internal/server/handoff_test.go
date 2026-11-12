@@ -278,6 +278,10 @@ func TestTheSwitchThatOnlyRecords(t *testing.T) {
 	if err != nil || string(got) != line+line {
 		t.Fatalf("recorded %q (%v), want the film's path on a line, twice", got, err)
 	}
+	// A switch nobody can see leaves a trace where it acts.
+	if log, _ := os.ReadFile(e.s.log.path); !strings.Contains(string(log), openRecordEnv+" is set") || strings.Contains(string(log), e.media) {
+		t.Errorf("the log should say the switch was on, without the film's folder: %s", log)
+	}
 }
 
 type handoffAnswer struct {
