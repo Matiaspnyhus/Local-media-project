@@ -290,7 +290,8 @@ func xspf(title, link string, durationMs, startSeconds int64) []byte {
 	return b.Bytes()
 }
 
-// reservedNames cannot be file names on Windows, whatever follows the dot.
+// reservedNames cannot begin a file name on Windows, whatever follows the
+// first dot: "nul.xspf" and "nul.2019.xspf" both mean a device, not a file.
 var reservedNames = map[string]bool{"con": true, "prn": true, "aux": true, "nul": true,
 	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true, "com6": true, "com7": true, "com8": true, "com9": true,
 	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true, "lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true}
@@ -318,7 +319,8 @@ func downloadName(title string) string {
 		b.WriteRune(c)
 	}
 	name := strings.Trim(b.String(), " .")
-	if name == "" || reservedNames[strings.ToLower(name)] {
+	first, _, _ := strings.Cut(name, ".")
+	if name == "" || reservedNames[strings.ToLower(strings.TrimSpace(first))] {
 		return "film"
 	}
 	return name

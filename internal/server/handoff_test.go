@@ -582,6 +582,32 @@ func TestThePlaylistForVLC(t *testing.T) {
 	}
 }
 
+// Whatever a title or a link holds, the playlist stays one well-formed
+// document that says the same thing.
+func TestThePlaylistStaysWellFormed(t *testing.T) {
+	for _, title := range []string{
+		"", "plain", "<", ">", "&", `"`, "'", "</title></track></trackList></playlist>", "<![CDATA[", "]]>", "<?xml ?>", "&#0;", "&lt;",
+		"<vlc:option>stop-time=1</vlc:option>", "line\nbreak\r\n\ttab", "Blåbærsyltetøy 日本語 🎬",
+	} {
+		link := "http://192.168.1.10:8177/stream/x?e=1&s=" + title + "&g=<>\"'"
+		p := readXSPF(t, xspf(title, link, 1000, 5))
+		if p.Title != title || len(p.Tracks) != 1 || p.Tracks[0].Title != title || p.Tracks[0].Location != link {
+			t.Errorf("title %q read back as %+v", title, p)
+		}
+		if x := p.Tracks[0].Extension; len(x) != 1 || len(x[0].Options) != 1 || x[0].Options[0] != "start-time=5" {
+			t.Errorf("title %q: options %+v", title, x)
+		}
+	}
+	// What XML cannot hold at all (a NUL, half a letter) is replaced, never
+	// passed on.
+	for _, title := range []string{"nul\x00here", "bell\x07", "bad \xff\xfe bytes", "\x1b[31mred"} {
+		p := readXSPF(t, xspf(title, "http://192.168.1.10:8177/stream/x", 0, 0))
+		if len(p.Tracks) != 1 || !strings.ContainsRune(p.Title, utf8.RuneError) {
+			t.Errorf("title %q read back as %q", title, p.Title)
+		}
+	}
+}
+
 func TestDownloadNamesAreSafeOnEverySystem(t *testing.T) {
 	long := strings.Repeat("Å", 200)
 	for title, want := range map[string]string{
@@ -599,6 +625,10 @@ func TestDownloadNamesAreSafeOnEverySystem(t *testing.T) {
 		"CON":                              "film",
 		"nul":                              "film",
 		"Lpt1":                             "film",
+		"Nul.2019":                         "film",
+		"aux .cut":                         "film",
+		"Con Air (1997)":                   "Con Air (1997)",
+		"Console.Wars":                     "Console.Wars",
 		"":                                 "film",
 		`<>:"/\|?*`:                        "film",
 		" . ":                              "film",
