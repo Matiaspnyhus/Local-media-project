@@ -41,6 +41,7 @@ import (
 //	           every real recording begins: the first frames in the file
 //	           cannot be decoded, for want of the key frame before them.
 //	shortsound: 22 seconds of picture whose sound stops after 4.
+//	longquiet: the same with a minute of picture.
 func convertFilm(t *testing.T, ffmpeg, name string) string {
 	t.Helper()
 	key := "to convert: " + name
@@ -103,6 +104,8 @@ func convertFilm(t *testing.T, ffmpeg, name string) string {
 			"-c:a", "aac", "-b:a", "96k", "-f", "mpegts", p})
 	case "shortsound":
 		recipe = join(pic("24", "22"), snd("4"), x264, []string{"-g", "48", "-c:a", "ac3", "-b:a", "96k", p})
+	case "longquiet":
+		recipe = join(pic("24", "60"), snd("4"), x264, []string{"-g", "48", "-c:a", "ac3", "-b:a", "96k", p})
 	default:
 		t.Fatalf("no recipe for a film called %q", name)
 	}
@@ -930,40 +933,60 @@ func TestJumpingToWhereTheSoundHasEndedInAConvertedFilm(t *testing.T) {
 	}
 }
 
-// The same film played through. Once the sound has stopped, ffmpeg holds
+// A film like that played through. Once the sound has stopped, ffmpeg holds
 // the picture back until it is ten seconds of film ahead, and then sends it
 // on as it is made. It must not hold it back until the film is done: a
 // viewer near the end of a long film would wait minutes for the next chunk,
-// which is what telling ffmpeg to wait for ever (as it is told for a film
-// whose sound runs on) does to this one.
+// which is what telling ffmpeg to wait for ever (as it is told beside sound
+// that lasts) does to this one.
+//
+// "Before the film is done" is told from "when it is done" by the share of
+// the converter's work that was still to do when the chunk arrived, not by
+// slowing the converter down: how fast a film is read cannot be relied on
+// for that. The ffmpeg that ships stops keeping to the speed it is given as
+// soon as one track has run out, which is this very film.
 func TestAFilmWhoseSoundStopsEarlyStillArrivesAsItIsMade(t *testing.T) {
 	ffmpeg, ffprobe := tools(t)
-	spec, _ := convertSpec(t, ffprobe, convertFilm(t, ffmpeg, "shortsound"))
+	spec, _ := convertSpec(t, ffprobe, convertFilm(t, ffmpeg, "longquiet"))
 	if spec.Convert.SoundLasts != 0 || strings.Contains(strings.Join(args(spec, 0, 8, 60), " "), "interleave") {
-		t.Fatal("a sound track that stops 18 seconds before the picture is taken for one that lasts")
+		t.Fatal("a sound track that stops 56 seconds before the picture is taken for one that lasts")
 	}
 	for _, sound := range []string{"ac3", ""} {
 		spec.AudioCopy, spec.AudioCodec = sound != "", sound
 		m := manager(t, ffmpeg)
-		// Read at four times the speed it plays, with no head start: the 22
-		// seconds take five and a half, so that "before the film is done"
-		// is a moment that can be told from "when it is done".
-		m.ReadRate, m.Burst = 4, 1
 		ctx := context.Background()
 		token := m.Open(spec)
+		began := time.Now()
 		// The sound stops at 4 seconds, inside the second chunk. That chunk
 		// is whole once the picture has been made up to 16 seconds or so.
-		for k := 0; k < 2; k++ {
+		var at [2]time.Duration
+		for k := range at {
 			if _, err := m.Segment(ctx, token, k); err != nil {
 				t.Fatalf("sound %q: chunk %d: %v", sound, k, err)
 			}
+			at[k] = time.Since(began)
 		}
+		// Nobody is holding the converter back (the whole film is within
+		// what it may make ahead), so it goes on to the end of the film.
 		m.mu.Lock()
 		r := m.sessions[token].run
-		alive, next := r.alive(), r.next
 		m.mu.Unlock()
-		if !alive || next > 6 {
-			t.Errorf("sound %q: the chunk in which the sound stops arrived when the converter was done with the film (still running: %v, chunks made: %d of 8)", sound, alive, next)
+		select {
+		case <-r.exited:
+		case <-time.After(3 * time.Minute):
+			t.Fatalf("sound %q: the converter is still not done with a film of one minute", sound)
+		}
+		done := time.Since(began)
+		// The first chunk arrives with the picture made up to 4 seconds or
+		// so, the second up to 16, and the film is 60 seconds long: between
+		// the two lies about a quarter of the work that was left after the
+		// first. Had ffmpeg waited for the sound, the second would have
+		// arrived with the last of it.
+		share := float64(at[1]-at[0]) / float64(done-at[0])
+		t.Logf("sound %q: chunk 0 after %v, chunk 1 after %v, the film done after %v: %.0f%% of the work between them",
+			sound, at[0].Round(10*time.Millisecond), at[1].Round(10*time.Millisecond), done.Round(10*time.Millisecond), 100*share)
+		if share > 0.6 {
+			t.Errorf("sound %q: the chunk in which the sound stops arrived only when the converter was done with the film, or nearly: %.0f%% of its work lay between the first chunk and this one, want about 25%%", sound, 100*share)
 		}
 		m.Close()
 	}
