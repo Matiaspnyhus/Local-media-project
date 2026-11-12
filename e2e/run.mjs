@@ -218,15 +218,40 @@ try {
         h264in10bit: can('video/mp4; codecs="avc1.6E0033"'),
         hevc: can('video/mp4; codecs="hvc1.1.6.L120.90"', 'video/mp4; codecs="hev1.1.6.L120.90"'),
         hev1: can('video/mp4; codecs="hev1.1.6.L120.90"', 'video/mp4; codecs="hev1.2.4.L120.90"'),
+        apple: /Apple/.test(navigator.vendor || ''),
       }
     })
     console.log(`      (told the PC: ${Object.keys(r.told).filter((k) => r.told[k]).join(', ')})`)
     // The PC looks these up by name when it decides how to play a file. A
     // name the page never sends counts as "cannot play".
-    assert.equal(r.told['h264-10'], r.h264in10bit, '10-bit H.264: what the page told the PC against what the browser says')
     assert.equal(r.told['hevc-hev1'], r.hev1, 'HEVC labelled hev1: what the page told the PC against what the browser says')
     assert.equal(r.told.hevc, r.hevc, 'HEVC is still reported when either labelling plays')
+    // Apple's browsers say they play 10-bit H.264 but are not known to show
+    // its picture, so from them the page must not pass that answer on.
+    if (r.apple) {
+      assert.equal(r.told['h264-10'], false, `10-bit H.264 in an Apple browser (which itself says: ${r.h264in10bit}) must be reported as not playing`)
+      return
+    }
+    assert.equal(r.told['h264-10'], r.h264in10bit, '10-bit H.264: what the page told the PC against what the browser says')
     if (browserName === 'chromium') assert.equal(r.told['h264-10'], true, 'Chromium plays 10-bit H.264, and must not be told it cannot')
+    // The same rule where this test runs in another engine: a device that
+    // differs from this one only in calling itself Apple's.
+    const apple = await browser.newContext()
+    await apple.addInitScript(() => Object.defineProperty(Navigator.prototype, 'vendor', { configurable: true, get: () => 'Apple Computer, Inc.' }))
+    const iphone = await apple.newPage()
+    await iphone.goto(base)
+    await iphone.fill('#name', 'owner')
+    await iphone.fill('#password', 'a good password')
+    const reported = iphone.waitForResponse((res) => /\/api\/capabilities$/.test(res.url()))
+    await iphone.press('#password', 'Enter')
+    assert.equal((await reported).status(), 200, 'the device calling itself Apple\'s reported what it plays')
+    const a = await iphone.evaluate(async () => ({
+      told: (await (await fetch('/api/diagnostics')).json()).device.video,
+      itself: document.createElement('video').canPlayType('video/mp4; codecs="avc1.6E0033"') !== '',
+    }))
+    await apple.close()
+    assert.equal(a.told['h264-10'], false, `10-bit H.264 on a device calling itself Apple's (its browser itself says: ${a.itself}) must be reported as not playing`)
+    assert.equal(a.told.h264, true, 'ordinary H.264 is still reported from that device')
   })
 
   await step('play a file, keyboard only', async () => {
