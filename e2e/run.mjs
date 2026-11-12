@@ -125,8 +125,8 @@ async function record(page) {
     e.status = res ? res.status() : 0
     if (e.what === 'open' && res) e.opened = (await res.json().catch(() => null))?.hls
   }
-  const onFinished = (r) => answers.push(answered(r, false))
-  const onFailed = (r) => answers.push(answered(r, true))
+  const onFinished = (r) => answers.push(answered(r, false).catch(() => {}))
+  const onFailed = (r) => answers.push(answered(r, true).catch(() => {}))
   page.on('request', onRequest)
   page.on('requestfinished', onFinished)
   page.on('requestfailed', onFailed)
@@ -145,8 +145,12 @@ async function record(page) {
     page.off('request', onRequest)
     page.off('requestfinished', onFinished)
     page.off('requestfailed', onFailed)
-    await Promise.all(answers)
-    const went = await page.evaluate(() => window.playerRecord()).catch(() => ['(the page did not answer)'])
+    // The record is asked for when a step has failed, too, and the page may
+    // then be past answering: nothing here may wait for it without end, or
+    // fail in the place of what really went wrong.
+    const within = (ms, promise, otherwise) => Promise.race([promise.catch(() => otherwise), new Promise((r) => setTimeout(() => r(otherwise), ms))])
+    await within(3000, Promise.all(answers))
+    const went = await within(5000, page.evaluate(() => window.playerRecord()), ['(the page did not answer)'])
     const opens = asked.filter((e) => e.what === 'open')
     const film = (e) => {
       const n = opens.findIndex((o) => o.opened === e.film)
