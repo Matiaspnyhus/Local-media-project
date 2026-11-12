@@ -187,6 +187,50 @@ func TestUpgradeToSchema6MarksFilesToInspectAgain(t *testing.T) {
 	}
 }
 
+// Schema 7 adds devices and what is learned about them. Whoever is signed
+// in when the program is updated must stay signed in (their sign-in has no
+// device until it is next used), and a viewer's preferences must stay as
+// they were, with the new one at its default.
+func TestUpgradeToSchema7KeepsSignInsAndPreferences(t *testing.T) {
+	dir := t.TempDir()
+	orig := migrations
+	defer func() { migrations = orig }()
+	migrations = orig[:6]
+	d, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	must := func(q string, args ...any) {
+		t.Helper()
+		if _, err := d.Exec(q, args...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	must(`INSERT INTO users(id,name,password_hash,role,created_at) VALUES('u','owner','x','owner',0)`)
+	must(`INSERT INTO sessions(id,token_hash,user_id,device_name,created_at,last_seen_at) VALUES('s','h','u','Mozilla/5.0',5,6)`)
+	must(`INSERT INTO prefs(user_id,audio_lang,sub_lang,subs) VALUES('u','no','en','always')`)
+	d.Close()
+
+	migrations = orig[:7]
+	if d, err = Open(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	var hash string
+	var device sql.NullString
+	if err := d.QueryRow(`SELECT token_hash, device_id FROM sessions WHERE id='s' AND revoked_at IS NULL`).Scan(&hash, &device); err != nil || hash != "h" || device.Valid {
+		t.Errorf("the sign-in after the upgrade: %q on device %v, %v", hash, device, err)
+	}
+	var audio, subs, styled string
+	if err := d.QueryRow(`SELECT audio_lang, subs, styled FROM prefs WHERE user_id='u'`).Scan(&audio, &subs, &styled); err != nil || audio != "no" || subs != "always" || styled != "designed" {
+		t.Errorf("the preferences after the upgrade: %q %q %q %v", audio, subs, styled, err)
+	}
+	var n int
+	if err := d.QueryRow(`SELECT (SELECT count(*) FROM devices) + (SELECT count(*) FROM lessons) + (SELECT count(*) FROM picture_facts)`).Scan(&n); err != nil || n != 0 {
+		t.Errorf("the new tables after the upgrade hold %d rows, %v", n, err)
+	}
+}
+
 func TestNewerDatabaseIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	d, err := Open(dir)

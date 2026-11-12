@@ -240,6 +240,56 @@ UPDATE files SET probed_size = -1 WHERE probed = 1 AND (
     OR id IN (SELECT file_id FROM streams WHERE kind = 'video' AND codec IN ('vp8','vp9','av1'))))
   OR (container IN ('mp4','mov') AND id IN (SELECT file_id FROM streams WHERE kind = 'video' AND codec = 'hevc')));
 `,
+	// 7: converting the picture. A device is a browser on a phone, a PC or a
+	// TV, told apart by a cookie that outlives signing out. What trouble
+	// while playing has taught about a device is kept as lessons, so the
+	// next film does not run into the same trouble.
+	`
+CREATE TABLE devices (
+  id TEXT PRIMARY KEY,
+  label TEXT NOT NULL DEFAULT '',   -- a kind of device ("iPhone", "Windows PC, Chrome"), never a name
+  created_at INTEGER NOT NULL,
+  last_seen_at INTEGER NOT NULL
+);
+
+-- The device a sign-in was made on. Sign-ins from before this have none
+-- until they are next used.
+ALTER TABLE sessions ADD COLUMN device_id TEXT REFERENCES devices(id) ON DELETE SET NULL;
+CREATE INDEX sessions_device ON sessions(device_id);
+
+-- One row for each thing learned about a device: a kind of picture it had
+-- trouble showing, a cap on what it is sent, and so on. A lesson names a
+-- kind of film, never a title. While file_id is set it holds for that one
+-- file only (the first failure may have been the file's fault); a second
+-- file makes it hold for the kind, and file_id is then NULL. A lesson
+-- about one file goes when the file's row does.
+CREATE TABLE lessons (
+  id TEXT PRIMARY KEY,
+  device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,               -- 'picture', 'height', 'rate', 'hdr', 'draw'
+  value TEXT NOT NULL DEFAULT '',   -- which picture, how many lines, how many bits a second, which drawing
+  file_id TEXT REFERENCES files(id) ON DELETE CASCADE,
+  hits INTEGER NOT NULL DEFAULT 1,  -- how many times this trouble was reported
+  learned_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,      -- kept for a while after this, so that a lesson learned again lasts longer
+  UNIQUE (device_id, kind, value)
+);
+CREATE INDEX lessons_file ON lessons(file_id);
+
+-- What converting a film's picture starts from (where its clock stands,
+-- how fast its frames come, their shape), found by a short look at the
+-- file and kept for as long as the file stays the same.
+CREATE TABLE picture_facts (
+  file_id TEXT PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  stamp TEXT NOT NULL,   -- the file's size and date when it was looked at
+  facts TEXT NOT NULL
+);
+
+-- What to do with subtitles that have their own design where the page
+-- cannot draw them: 'designed' puts them into the picture, 'plain' shows
+-- their words as plain text.
+ALTER TABLE prefs ADD COLUMN styled TEXT NOT NULL DEFAULT 'designed';
+`,
 }
 
 // SchemaVersion is the version this build expects.
