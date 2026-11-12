@@ -762,6 +762,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
   const carryOn = useRef<number | null>(null) // where to pick up after switching sound, in seconds
   const first = useRef(true)
   const chunkPlayer = useRef(false)
+  const pictureJudged = useRef(false) // a film that arrives as chunks has been checked for a picture
   const asked = useRef(0) // how many times the film has been asked for
 
   // Each request for the film is numbered and only the newest one's answer
@@ -857,7 +858,11 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     started.current = false
     applySubs()
   }, [applySubs])
+  // Only the first time the film plays after being handed over: later (the
+  // film plays again after every jump) whatever is showing is left alone,
+  // which may be subtitles the viewer switched on in the browser's own menu.
   const onPlaying = () => {
+    if (started.current) return
     started.current = true
     applySubs()
   }
@@ -883,6 +888,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     }
     window.addEventListener('pagehide', onHide)
     chunkPlayer.current = false
+    pictureJudged.current = false
     subsOff()
     if (!token || builtInChunks()) {
       v.src = info.url
@@ -930,8 +936,8 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     }
   }, [info, showPlayer, report, subsOff])
 
-  // A choice of subtitles takes effect at once when the film is playing,
-  // and is kept for when it does otherwise.
+  // A choice of subtitles takes effect at once if the film is playing. If
+  // it is not yet, the choice is kept and takes effect when it is.
   useEffect(() => {
     subWanted.current = subKey
     applySubs()
@@ -995,9 +1001,13 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       )
       report('no-sound', `${info?.container} webkitAudioDecodedByteCount=0`)
     }
-    // After a few seconds of playing every browser knows the size of the
-    // picture, if there is one.
-    if (v && info?.hls && v.videoWidth === 0 && playedSeconds(v) > 3) noPicture()
+    // A film that arrives as chunks is judged here, and like an ordinary
+    // file only once: after three seconds of playing every browser knows
+    // the size of the picture, if there is one.
+    if (v && info?.hls && !pictureJudged.current && playedSeconds(v) > 3) {
+      pictureJudged.current = true
+      if (v.videoWidth === 0) noPicture()
+    }
   }
 
   const onError = () => {

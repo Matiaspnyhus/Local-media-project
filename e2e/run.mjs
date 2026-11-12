@@ -371,6 +371,23 @@ try {
     release()
     await subtitleShows('Said in the first half')
     await page.unroute('**/subtitles/**')
+    // Subtitles can also be switched in the browser's own menu, which the
+    // page does not hear about. What was set there must be left alone when
+    // the film stops and plays again, as it does after every jump: here
+    // they are switched off that way, and must still be off afterwards.
+    const after = await page.evaluate(() => new Promise((done) => {
+      const v = document.querySelector('video')
+      const t = Array.from(v.textTracks).find((x) => x.mode === 'showing')
+      t.mode = 'disabled'
+      v.addEventListener('playing', () => {
+        const mode = t.mode
+        t.mode = 'showing'
+        done(mode)
+      }, { once: true })
+      setTimeout(() => done('the film did not play again within 15 seconds'), 15000)
+      v.currentTime = 50
+    }))
+    assert.equal(after, 'disabled', 'subtitles switched off in the browser\'s own menu, after a jump')
   })
 
   await step('changing the sound twice in a row keeps the place in the film, and the subtitles', async () => {
