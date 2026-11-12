@@ -292,6 +292,13 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+      - name: Refuse a commit that is marked as not for release
+        run: |
+          if [ -f packaging/NOT-FOR-RELEASE.txt ]; then
+            cat packaging/NOT-FOR-RELEASE.txt
+            exit 1
+          fi
+          test -f "docs/release-notes/$GITHUB_REF_NAME.md" || { echo "docs/release-notes/$GITHUB_REF_NAME.md is missing: write the release notes first"; exit 1; }
       - uses: actions/download-artifact@v4
         with:
           name: localmedia-builds
@@ -321,6 +328,13 @@ jobs:
           rm -f localmedia-windows-amd64.zip
           (cd ../package && zip -q -r ../release/LocalMedia-Windows.zip LocalMedia)
           sha256sum *.zip LocalMedia-Setup.exe > SHA256SUMS.txt
-          gh release create "$GITHUB_REF_NAME" *.zip LocalMedia-Setup.exe SHA256SUMS.txt \
-            --repo "$GITHUB_REPOSITORY" --title "Local Media $GITHUB_REF_NAME" \
-            --notes-file ../docs/release-notes/"$GITHUB_REF_NAME".md
+          notes=../docs/release-notes/"$GITHUB_REF_NAME".md
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # The release was made by hand on GitHub's page, which also made
+            # the tag that started this run: give it its files and its notes.
+            gh release upload "$GITHUB_REF_NAME" *.zip LocalMedia-Setup.exe SHA256SUMS.txt --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "Local Media $GITHUB_REF_NAME" --notes-file "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" *.zip LocalMedia-Setup.exe SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" --title "Local Media $GITHUB_REF_NAME" --notes-file "$notes"
+          fi
