@@ -1140,12 +1140,56 @@ func TestSoundBesideAConvertedPicture(t *testing.T) {
 		t.Fatalf("without conversion: %+v", p)
 	}
 	p := DecideFor(webm, newDevices["chrome"], Want{Audio: 1, Subtitle: -1}, able)
-	want := []string{"You chose a sound track other than the one a browser plays by itself.", "Its picture (VP9) cannot be repackaged without converting it."}
+	want := []string{"You chose a sound track other than the one a browser plays by itself.", "Its picture (VP9) cannot be repackaged without converting it.",
+		"Its sound is Opus, which cannot be sent along with a converted picture as it is, so it is converted as well."}
 	if p.Method != Convert || p.AudioTrack != 1 || p.AudioCopy || !sameStrings(p.Reasons, want) {
 		t.Errorf("the second sound track of a WebM: %+v", p)
 	}
 	if p = DecideFor(webm, newDevices["chrome"], Want{Audio: -1, Subtitle: -1}, able); p.Method != Direct {
 		t.Errorf("the main sound track of a WebM: %+v", p)
+	}
+
+	// Sound that is converted beside a converted picture always has a
+	// reason that says why: the device cannot play it, or it plays it and
+	// the chunks cannot carry it as it is.
+	for _, c := range []struct {
+		name      string
+		m         Media
+		dev       string
+		reason    string
+		notReason string
+	}{
+		{"FLAC the device plays", film("avi", "mpeg4", 8, "flac", sizes[1], colours[0], ""), "chrome",
+			"Its sound is FLAC, which cannot be sent along with a converted picture as it is, so it is converted as well.", "FLAC, which this browser"},
+		{"AAC out of a TV recording", film("mpegts", "mpeg2video", 8, "aac", sizes[1], colours[0], ""), "chrome",
+			"Its sound is AAC, which cannot be sent along with a converted picture as it is, so it is converted as well.", "AAC, which this browser"},
+		{"DTS, which the device cannot play", film("avi", "mpeg4", 8, "dts", sizes[1], colours[0], ""), "chrome",
+			"Its sound is DTS, which this browser cannot play.", "sent along"},
+		{"AAC out of an MKV: passed on, nothing to explain", film("matroska", "mpeg2video", 8, "aac", sizes[1], colours[0], ""), "chrome", "", "sound"},
+		{"a silent film", film("avi", "mpeg4", 8, "", sizes[1], colours[0], ""), "chrome", "", "sound"},
+	} {
+		p := DecideFor(c.m, newDevices[c.dev], Want{Audio: -1, Subtitle: -1}, able)
+		if p.Method != Convert || c.reason != "" && !has(p.Reasons, c.reason) || has(p.Reasons, c.notReason) {
+			t.Errorf("%s: %s %q", c.name, p.Method, p.Reasons)
+		}
+	}
+
+	// A device that plays no AAC cannot be sent converted sound, so a film
+	// whose sound would have to be converted beside a converted picture is
+	// refused, and it is the browser that is named. Sound it does play and
+	// the chunks can carry is passed on, and a silent film needs none.
+	noAAC := caps(true, "mp4", "h264", "mp3 ac3")
+	for _, c := range []struct {
+		sound string
+		plays bool
+	}{{"mp3", false}, {"dts", false}, {"ac3", true}, {"", true}} {
+		p := DecideFor(film("avi", "mpeg4", 8, c.sound, sizes[1], colours[0], ""), noAAC, Want{Audio: -1, Subtitle: -1}, able)
+		switch {
+		case c.plays && (p.Method != Convert || !p.AudioCopy):
+			t.Errorf("%q beside a converted picture on a device without AAC: %+v; want it converted with the sound passed on", c.sound, p)
+		case !c.plays && (p.Playable != No || !has(p.Reasons, "This browser reports no sound format the sound could be converted to.") || p.PCCannot || p.TooSlow):
+			t.Errorf("%q beside a converted picture on a device without AAC: %+v; want a no that names the browser", c.sound, p)
+		}
 	}
 }
 

@@ -469,6 +469,12 @@ func converted(p Plan, why []string, m Media, a *Track, c *Caps, w Want, l Limit
 		no.TooSlow = true
 		return no
 	}
+	if !keep && c.Audio[a.Codec] {
+		// The device plays this sound, so nothing above says why it is
+		// converted all the same. (The list passed in is not written
+		// into.)
+		why = append(why[:len(why):len(why)], "Its sound is "+AudioName(a.Codec)+", which cannot be sent along with a converted picture as it is, so it is converted as well.")
+	}
 	if !keep && !c.Audio["aac"] {
 		return refuse(p, append(why, "This browser reports no sound format the sound could be converted to."))
 	}
