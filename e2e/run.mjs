@@ -375,18 +375,18 @@ try {
     // page does not hear about. What was set there must be left alone when
     // the film stops and plays again, as it does after every jump: here
     // they are switched off that way, and must still be off afterwards.
-    const after = await page.evaluate(() => new Promise((done) => {
+    await page.evaluate(() => {
       const v = document.querySelector('video')
-      const t = Array.from(v.textTracks).find((x) => x.mode === 'showing')
-      t.mode = 'disabled'
-      v.addEventListener('playing', () => {
-        const mode = t.mode
-        t.mode = 'showing'
-        done(mode)
-      }, { once: true })
-      setTimeout(() => done('the film did not play again within 15 seconds'), 15000)
+      window.switchedByHand = Array.from(v.textTracks).find((x) => x.mode === 'showing')
+      window.switchedByHand.mode = 'disabled'
       v.currentTime = 50
-    }))
+    })
+    await playsBeyond(page, 50.5, 'a jump to 50 seconds')
+    const after = await page.evaluate(() => {
+      const mode = window.switchedByHand.mode
+      window.switchedByHand.mode = 'showing'
+      return mode
+    })
     assert.equal(after, 'disabled', 'subtitles switched off in the browser\'s own menu, after a jump')
   })
 
