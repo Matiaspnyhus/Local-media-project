@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -364,6 +366,62 @@ func TestAWebMFilePlaysWhereMKVDoesNot(t *testing.T) {
 	}
 	if w := e.do("GET", p.URL, remote, nil, nil); w.Code != 200 || w.Header().Get("Content-Type") != "video/webm" {
 		t.Errorf("the file itself: %d, sent as %q", w.Code, w.Header().Get("Content-Type"))
+	}
+}
+
+// A file named .webm with an H.264 picture inside (screen recorders and
+// Chrome's own recorder write these) is not WebM as Firefox and Safari
+// know it: they play only VP8, VP9 and AV1 from a WebM. Sent to them as it
+// is, it does not play. It must reach them repackaged, as any MKV does.
+func TestAFileOnlyNamedWebMIsRepackagedForFirefox(t *testing.T) {
+	e := newConvertEnv(t)
+	ffmpeg := needFFmpeg(t)
+	if out, err := exec.Command(ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+		"-f", "lavfi", "-i", "testsrc2=size=160x90:rate=12:duration=8", "-f", "lavfi", "-i", "sine=frequency=440:duration=8",
+		"-c:v", "libx264", "-preset", "ultrafast", "-g", "24", "-pix_fmt", "yuv420p", "-c:a", "libopus", "-b:a", "24k",
+		"-f", "matroska", filepath.Join(e.media, "Recorder Clip (2018).webm")).CombinedOutput(); err != nil {
+		if os.Getenv("LM_REQUIRE_FFMPEG") != "" {
+			t.Fatalf("ffmpeg could not make the recording: %v %s", err, out)
+		}
+		t.Skipf("this ffmpeg cannot make the recording: %v %s", err, out)
+	}
+	c := e.setup()
+	e.s.InspectNow()
+	film := e.firstItem(c, "Recorder Clip")
+	// What Firefox reports: MP4 and WebM but not MKV; H.264, VP8 and VP9;
+	// AAC and Opus; repackaged video through the page's own player.
+	e.do("POST", "/api/capabilities", remote, c, map[string]any{"containers": map[string]bool{"mp4": true, "webm": true},
+		"video": map[string]bool{"h264": true, "vp8": true, "vp9": true}, "audio": map[string]bool{"aac": true, "opus": true}, "hls": true})
+	var p struct {
+		URL, MimeType string
+		Plan          struct {
+			Playable, Method string
+			Reasons          []string
+		}
+	}
+	decode(t, e.do("POST", "/api/items/"+film+"/play", remote, c, nil), &p)
+	if p.Plan.Playable != "yes" || p.Plan.Method != "audio" || p.MimeType == "video/webm" || !strings.HasPrefix(p.URL, "/hls/") {
+		t.Fatalf("the recording goes to Firefox as %s/%s, sent as %q from %s (%v); want it repackaged with its sound converted, not sent as WebM",
+			p.Plan.Playable, p.Plan.Method, p.MimeType, p.URL, p.Plan.Reasons)
+	}
+	if !strings.Contains(strings.Join(p.Plan.Reasons, " "), "MKV") {
+		t.Errorf("the reasons do not say what the file really is: %v", p.Plan.Reasons)
+	}
+	// And repackaged it does arrive: the picture untouched, the sound as AAC.
+	base := strings.TrimSuffix(p.URL, "index.m3u8")
+	var stream bytes.Buffer
+	for _, name := range []string{"init.mp4", "seg-0.m4s"} {
+		w := e.do("GET", base+name, remote, nil, nil)
+		if w.Code != 200 || w.Body.Len() == 0 {
+			t.Fatalf("%s: %d %s", name, w.Code, w.Body)
+		}
+		stream.Write(w.Body.Bytes())
+	}
+	joined := filepath.Join(t.TempDir(), "joined.mp4")
+	os.WriteFile(joined, stream.Bytes(), 0o600)
+	codecs, _ := exec.Command(probe.Find(), "-v", "error", "-show_entries", "stream=codec_name", "-of", "csv=p=0", joined).Output()
+	if got := strings.Fields(string(codecs)); len(got) != 2 || got[0] != "h264" || got[1] != "aac" {
+		t.Errorf("the stream holds %q, want the untouched picture and AAC sound", got)
 	}
 }
 

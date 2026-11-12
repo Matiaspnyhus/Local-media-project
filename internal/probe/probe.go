@@ -106,7 +106,6 @@ func Run(ctx context.Context, ffprobe, path string) (Result, error) {
 
 type rawProbe struct {
 	Format struct {
-		Filename   string `json:"filename"`
 		FormatName string `json:"format_name"`
 		Duration   string `json:"duration"`
 		BitRate    string `json:"bit_rate"`
@@ -190,7 +189,7 @@ func Parse(out []byte) (Result, error) {
 		}
 		res.Streams = append(res.Streams, st)
 	}
-	res.Container = container(raw.Format.FormatName, raw.Format.Filename, res.Streams)
+	res.Container = container(raw.Format.FormatName, res.Streams)
 	return res, nil
 }
 
@@ -199,12 +198,13 @@ func Parse(out []byte) (Result, error) {
 //
 // MKV and WebM share a name there, because WebM is a kind of MKV. Browsers
 // tell them apart: Firefox and Safari play WebM and not MKV. So a file is
-// called "webm" here when it is named .webm, or when it holds nothing but
-// what WebM may hold.
-func container(formatName, fileName string, streams []Stream) string {
+// called "webm" here when it holds nothing but what WebM may hold. Its name
+// does not decide: recorders write H.264 into files named .webm, and the
+// browsers that play WebM and not MKV cannot play those as they are.
+func container(formatName string, streams []Stream) string {
 	switch {
 	case strings.Contains(formatName, "matroska"):
-		if strings.EqualFold(filepath.Ext(fileName), ".webm") || onlyWebM(streams) {
+		if onlyWebM(streams) {
 			return "webm"
 		}
 		return "matroska"
