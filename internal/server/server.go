@@ -111,7 +111,9 @@ type Server struct {
 	// says about it before that is logged (see pathless).
 	convMu     sync.Mutex
 	converting map[string]string
-	helpers    *helpers // shared and limited runs of ffmpeg and ffprobe, see helpers.go
+	helpers    *helpers        // shared and limited runs of ffmpeg and ffprobe, see helpers.go
+	names      map[string]bool // what the PC is called on the network, see answersTo
+	opens      *openLimiter    // how often the PC's video player may be started, see routes_handoff.go
 	ctx        context.Context
 	stop       context.CancelFunc
 	handler    http.Handler
@@ -141,7 +143,7 @@ func New(cfg Config) (*Server, error) {
 	s := &Server{
 		db: cfg.DB, dataDir: cfg.DataDir, version: cfg.Version, port: cfg.Port, assets: cfg.Assets,
 		limiter: newLoginLimiter(), events: &eventLog{}, update: cfg.Update, ffprobe: cfg.FFprobe, caps: map[string]*playback.Caps{},
-		helpers: newHelpers(),
+		helpers: newHelpers(), opens: newOpenLimiter(),
 	}
 	s.ctx, s.stop = context.WithCancel(context.Background())
 	s.newTMDB = metadata.New

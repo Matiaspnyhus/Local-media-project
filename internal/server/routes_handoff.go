@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -81,6 +82,87 @@ func fromThisPC(r *http.Request) bool {
 	return isLoopback(r) && sameOrigin(r)
 }
 
+// The PC's video player is started by one press of a button. Nothing
+// should be able to start it over and over: not a key held down, not an
+// impatient second press, not a script.
+const (
+	sameFilmWait = 5 * time.Second  // a film just opened is not opened again this soon
+	openWindow   = 10 * time.Second // in any stretch this long...
+	openMost     = 3                // ...at most this many films are opened
+)
+
+// openLimiter holds what has been opened lately, for every viewer
+// together: the PC has one screen.
+type openLimiter struct {
+	mu      sync.Mutex
+	opening bool                 // the operating system is being asked right now
+	films   map[string]time.Time // by file: when it was last opened
+	recent  []time.Time          // every opening within openWindow
+	now     func() time.Time
+}
+
+func newOpenLimiter() *openLimiter {
+	return &openLimiter{films: map[string]time.Time{}, now: time.Now}
+}
+
+// begin asks whether a film may be opened now. If so, the try counts from
+// this moment, and the caller must call done when the operating system has
+// answered. If not, it says why in words for the viewer, and how long to
+// wait.
+func (l *openLimiter) begin(fileID string) (why string, wait time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	kept := l.recent[:0]
+	for _, t := range l.recent {
+		if now.Sub(t) < openWindow {
+			kept = append(kept, t)
+		}
+	}
+	l.recent = kept
+	for id, t := range l.films {
+		if now.Sub(t) >= sameFilmWait {
+			delete(l.films, id)
+		}
+	}
+	if t, ok := l.films[fileID]; ok {
+		return "This film was opened in this PC's video player a moment ago. If no player appeared, wait a few seconds and press the button again.", sameFilmWait - now.Sub(t)
+	}
+	if l.opening {
+		return "This PC is still opening another film. Wait a few seconds and try again.", openWait
+	}
+	if len(l.recent) >= openMost {
+		return "This PC was asked to open films several times just now. Wait a few seconds and try again.", openWindow - now.Sub(l.recent[0])
+	}
+	l.opening = true
+	l.films[fileID] = now
+	l.recent = append(l.recent, now)
+	return "", 0
+}
+
+// done ends a try. One that failed does not hold its film back: the viewer
+// may press again as soon as they have put right what was wrong. It still
+// counts as one of the few tries in a short while, since each try starts
+// something on the PC.
+func (l *openLimiter) done(fileID string, opened bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.opening = false
+	if !opened {
+		delete(l.films, fileID)
+	}
+}
+
+// oneLine keeps a name from starting a line of its own in the log.
+func oneLine(s string) string {
+	return strings.Map(func(c rune) rune {
+		if c < ' ' || c == 0x7f {
+			return ' '
+		}
+		return c
+	}, s)
+}
+
 // handedFile is the file behind an item, once it is known to be a real
 // video file inside its library.
 type handedFile struct {
@@ -142,12 +224,27 @@ func (s *Server) handleOpenLocal(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := openInPlayer(f.path); err != nil {
-		// The file's own name stays in the log, because it says which film
-		// had the problem; its folder does not (see pathless).
-		why := strings.ReplaceAll(err.Error(), f.path, filepath.Base(f.path))
-		s.log.Printf("could not open %s in this PC's video player: %s", filepath.Base(f.path), s.pathless(why))
-		writeErr(w, http.StatusInternalServerError, "This PC could not open the film in a video player. It may have no program set up for this kind of file. VLC is a free player that plays almost anything.")
+	if why, wait := s.opens.begin(f.id); why != "" {
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int((wait+time.Second-1)/time.Second)))) // whole seconds, rounded up
+		writeErr(w, http.StatusTooManyRequests, why)
+		return
+	}
+	// Who opened what on the PC's screen is written down every time, not
+	// only when it fails. The film's own name is in the log, its folder is
+	// not (see pathless).
+	name := oneLine(filepath.Base(f.path))
+	s.log.Printf("%s is opening %s in this PC's video player", oneLine(currentUser(r).Name), name)
+	err := func() (err error) {
+		opened := false // also when the launcher does not come back at all
+		defer func() { s.opens.done(f.id, opened) }()
+		err = openInPlayer(f.path)
+		opened = err == nil
+		return err
+	}()
+	if err != nil {
+		why := strings.ReplaceAll(err.Error(), f.path, name)
+		s.log.Printf("could not open %s in this PC's video player: %s", name, s.pathless(why))
+		writeErr(w, http.StatusInternalServerError, "This PC could not open the film in a video player. It may have no program set up for this kind of file.")
 		return
 	}
 	if os.Getenv(openRecordEnv) != "" {

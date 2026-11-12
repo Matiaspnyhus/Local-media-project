@@ -12,7 +12,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -231,6 +233,158 @@ func TestOpenLocalOpensOnlyVideosInsideTheLibrary(t *testing.T) {
 	}
 }
 
+// later moves the clock by which the server limits how often the PC's
+// video player is started.
+func later(e *env, d time.Duration) {
+	e.s.opens.mu.Lock()
+	defer e.s.opens.mu.Unlock()
+	now := e.s.opens.now
+	e.s.opens.now = func() time.Time { return now().Add(d) }
+}
+
+// stopClock makes that clock stand still, so that a test of the limits
+// gives the same answers on a slow machine; later still moves it.
+func stopClock(e *env) {
+	e.s.opens.mu.Lock()
+	defer e.s.opens.mu.Unlock()
+	at := time.Now()
+	e.s.opens.now = func() time.Time { return at }
+}
+
+// One press of the button starts the PC's video player once. A key held
+// down, an impatient finger or a script must not start it again and again.
+func TestThePlayerIsNotStartedOverAndOver(t *testing.T) {
+	e := newEnv(t)
+	for _, name := range []string{"Second.Film.mkv", "Third.Film.mkv", "Fourth.Film.mkv"} {
+		os.WriteFile(filepath.Join(e.media, "Films", name), []byte("mkvdata"), 0o644)
+	}
+	c := e.setup()
+	stopClock(e)
+	var mu sync.Mutex
+	var started []string
+	hold := make(chan struct{}) // closed: the operating system answers at once
+	close(hold)
+	before := openInPlayer
+	openInPlayer = func(path string) error {
+		mu.Lock()
+		started = append(started, filepath.Base(path))
+		wait := hold
+		mu.Unlock()
+		<-wait
+		return nil
+	}
+	t.Cleanup(func() { openInPlayer = before })
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(started)
+	}
+	open := func(item string) *httptest.ResponseRecorder {
+		return e.ask("POST", "/api/items/"+item+"/open-local", local, pcHost, c, fromPage(pcHost), "{}")
+	}
+	held := func(w *httptest.ResponseRecorder, words string) bool {
+		t.Helper()
+		var said map[string]string
+		decode(t, w, &said)
+		wait, err := strconv.Atoi(w.Header().Get("Retry-After"))
+		return w.Code == 429 && strings.Contains(said["error"], words) && err == nil && wait >= 1 && wait <= 10
+	}
+	clip, second, third, fourth := e.firstItem(c, "clip"), e.firstItem(c, "Second Film"), e.firstItem(c, "Third Film"), e.firstItem(c, "Fourth Film")
+
+	// A hundred requests for one film at the same moment, as a held key or
+	// a script sends them.
+	answers := together(100, func(int) *httptest.ResponseRecorder { return open(clip) })
+	ok := 0
+	for _, w := range answers {
+		if w.Code == 200 {
+			ok++
+		} else if !held(w, "was opened in this PC's video player a moment ago") {
+			t.Errorf("a request that was held back answered %d %q %s", w.Code, w.Header().Get("Retry-After"), w.Body)
+		}
+	}
+	if ok != 1 || count() != 1 {
+		t.Fatalf("100 requests at once: %d were told the film was opened, and the player was started %d times; want once", ok, count())
+	}
+	// A second press a moment later, and a third.
+	for i := 0; i < 2; i++ {
+		if w := open(clip); !held(w, "a moment ago") || count() != 1 {
+			t.Fatalf("pressed again at once: %d %s, player started %d times", w.Code, w.Body, count())
+		}
+	}
+	// Refused requests cost nothing: they are not openings.
+	for i := 0; i < 20; i++ {
+		open(ids.New())
+		e.ask("POST", "/api/items/"+second+"/open-local", remote, phoneHost, c, fromPage(phoneHost), "{}")
+	}
+	// Other films may follow, but only a few in a short while.
+	for i, item := range []string{second, third} {
+		if w := open(item); w.Code != 200 || count() != i+2 {
+			t.Fatalf("film %d within the same few seconds: %d %s, player started %d times", i+2, w.Code, w.Body, count())
+		}
+	}
+	if w := open(fourth); !held(w, "asked to open films several times") || count() != 3 {
+		t.Fatalf("a fourth film within the same few seconds: %d %s, player started %d times", w.Code, w.Body, count())
+	}
+	// A hundred requests across all the films change nothing either.
+	together(100, func(i int) *httptest.ResponseRecorder { return open([]string{clip, second, third, fourth}[i%4]) })
+	if count() != 3 {
+		t.Fatalf("a burst across four films started the player %d times in all, want 3", count())
+	}
+
+	// Once the same-film wait has passed, the film may be opened again
+	// (the viewer closed the player and wants it back); the few-in-a-
+	// short-while limit still stands until its own time has passed.
+	later(e, sameFilmWait)
+	if w := open(clip); !held(w, "asked to open films several times") {
+		t.Fatalf("after %s, with three films just opened: %d %s", sameFilmWait, w.Code, w.Body)
+	}
+	later(e, openWindow)
+	if w := open(clip); w.Code != 200 || count() != 4 {
+		t.Fatalf("after the wait: %d %s, player started %d times", w.Code, w.Body, count())
+	}
+
+	// While the operating system has not yet answered for one film, no
+	// other is handed to it.
+	later(e, time.Minute)
+	mu.Lock()
+	hold = make(chan struct{})
+	mu.Unlock()
+	slow := make(chan *httptest.ResponseRecorder, 1)
+	go func() { slow <- open(second) }()
+	for i := 0; count() != 5; i++ { // until the first one is with the operating system
+		if i > 6000 {
+			t.Fatal("the film was never handed to the operating system")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if w := open(third); !held(w, "still opening another film") || count() != 5 {
+		t.Errorf("a second film while the first is still being opened: %d %s, player started %d times", w.Code, w.Body, count())
+	}
+	close(hold)
+	if w := <-slow; w.Code != 200 {
+		t.Errorf("the film that was being opened: %d %s", w.Code, w.Body)
+	}
+	if w := open(third); w.Code != 200 || count() != 6 {
+		t.Errorf("once the first has been opened: %d %s, player started %d times", w.Code, w.Body, count())
+	}
+
+	// Every start is in the log, with who asked and which film, and
+	// without the film's folder. What was held back is not there as a start.
+	written, _ := os.ReadFile(e.s.log.path)
+	log := string(written)
+	if n := strings.Count(log, "owner is opening "); n != 6 {
+		t.Errorf("the log has %d lines for 6 starts:\n%s", n, log)
+	}
+	for _, line := range []string{"owner is opening clip.mp4 in this PC's video player", "owner is opening Second.Film.mkv in this PC's video player", "owner is opening Third.Film.mkv in this PC's video player"} {
+		if !strings.Contains(log, line) {
+			t.Errorf("the log lacks %q:\n%s", line, log)
+		}
+	}
+	if strings.Contains(log, e.media) || strings.Contains(log, "Fourth.Film") {
+		t.Errorf("the log names the films' folder, or a film that was never opened:\n%s", log)
+	}
+}
+
 func TestAPlayerThatWillNotStartIsSaidInPlainWords(t *testing.T) {
 	e := newEnv(t)
 	c := e.setup()
@@ -255,6 +409,19 @@ func TestAPlayerThatWillNotStartIsSaidInPlainWords(t *testing.T) {
 	if strings.Contains(log, path) || strings.Contains(log, e.media) {
 		t.Errorf("the log names the film's folder: %s", log)
 	}
+	// A try that failed does not hold the film back: the viewer may press
+	// again as soon as they have put right what was wrong. It is still one
+	// of the few tries the PC allows in a short while.
+	stopClock(e)
+	later(e, time.Minute)
+	for i := 1; i <= openMost; i++ {
+		if w := e.ask("POST", "/api/items/"+id+"/open-local", local, pcHost, c, fromPage(pcHost), "{}"); w.Code != 500 {
+			t.Fatalf("try %d after a failure: %d %s", i, w.Code, w.Body)
+		}
+	}
+	if w := e.ask("POST", "/api/items/"+id+"/open-local", local, pcHost, c, fromPage(pcHost), "{}"); w.Code != 429 || !strings.Contains(w.Body.String(), "several times just now") {
+		t.Fatalf("one try too many in a short while: %d %s", w.Code, w.Body)
+	}
 }
 
 // With the test switch set, the program writes down what it would open
@@ -272,6 +439,9 @@ func TestTheSwitchThatOnlyRecords(t *testing.T) {
 		if w := e.ask("POST", "/api/items/"+id+"/open-local", local, pcHost, c, fromPage(pcHost), "{}"); w.Code != 200 {
 			t.Fatalf("%d %s", w.Code, w.Body)
 		}
+		// The same film is not opened twice in a row (see
+		// TestThePlayerIsNotStartedOverAndOver), so time passes in between.
+		later(e, time.Minute)
 	}
 	got, err := os.ReadFile(record)
 	line := filepath.Join(e.media, "clip.mp4") + "\n"
