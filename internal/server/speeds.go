@@ -55,6 +55,10 @@ type speedBook struct {
 	mu        sync.Mutex
 	key       string // the setting they were read from
 	byEncoder map[string]*speedTable
+	// storing lets one write to the settings happen at a time. The tables
+	// themselves are not held shut meanwhile: every list and every Play
+	// reads them, and a write may have to wait for a scan of the library.
+	storing sync.Mutex
 }
 
 var speedClasses = map[playback.Class]string{
@@ -145,17 +149,24 @@ func (b *speedBook) table(encoder string) *speedTable {
 	return t
 }
 
-// saveSpeedBook writes the tables to the settings and drops tables kept for
-// another converter or another number of processors.
-func (s *Server) saveSpeedBook(book *speedBook) error {
+// storeSpeeds writes the tables as they now are to the settings, and drops
+// tables kept for another converter or another number of processors. The
+// caller has let go of the book.
+func (s *Server) storeSpeeds() error {
+	book := &s.helpers.speeds
+	book.storing.Lock()
+	defer book.storing.Unlock()
+	book.mu.Lock()
+	key := book.key
 	raw, err := json.Marshal(book.byEncoder)
-	if err != nil {
+	book.mu.Unlock()
+	if err != nil || key == "" {
 		return err
 	}
-	if err := s.setSetting(book.key, string(raw)); err != nil {
+	if err := s.setSetting(key, string(raw)); err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`DELETE FROM settings WHERE key LIKE 'speed:%' AND key <> ?`, book.key)
+	_, err = s.db.Exec(`DELETE FROM settings WHERE key LIKE 'speed:%' AND key <> ?`, key)
 	return err
 }
 
@@ -208,8 +219,6 @@ func (s *Server) setMeasuredSpeeds(encoder string, measured playback.Speeds) err
 	if s.hls == nil {
 		return errors.New("this PC has no converter to keep speeds for")
 	}
-	book, done := s.openSpeedBook()
-	defer done()
 	kept := playback.Speeds{}
 	for class, row := range measured {
 		if speedClasses[class] == "" {
@@ -222,8 +231,10 @@ func (s *Server) setMeasuredSpeeds(encoder string, measured playback.Speeds) err
 		}
 		kept[class] = row
 	}
+	book, done := s.openSpeedBook()
 	book.table(encoderOf(encoder)).Measured = kept
-	return s.saveSpeedBook(book)
+	done()
+	return s.storeSpeeds()
 }
 
 // sawSpeed lowers the speed table to what a film that was playing showed:
@@ -236,10 +247,10 @@ func (s *Server) sawSpeed(l playback.SpeedLesson) bool {
 		return false
 	}
 	book, done := s.openSpeedBook()
-	defer done()
 	now := s.now().Unix()
 	t := book.table(encoderOf(l.Encoder))
 	if have := t.effective(now)[l.Class][l.Rung-1]; have > 0 && have <= l.Speed {
+		done()
 		return false
 	}
 	if t.Seen == nil {
@@ -253,7 +264,8 @@ func (s *Server) sawSpeed(l playback.SpeedLesson) bool {
 		row[l.Rung-1].Speed = 0.01 // slower than can be written: still a speed, not "never seen"
 	}
 	t.Seen[l.Class] = row
-	if err := s.saveSpeedBook(book); err != nil {
+	done()
+	if err := s.storeSpeeds(); err != nil {
 		s.log.Printf("a speed this PC was seen to convert at could not be stored, so it is kept only until the program next starts: %s", s.pathless(err.Error()))
 	}
 	return true
@@ -343,15 +355,16 @@ func (s *Server) forgetSpeed(id string) bool {
 	}
 	encoder, class := id[:mid], playback.Class(id[mid+1:last])
 	book, done := s.openSpeedBook()
-	defer done()
 	t := book.byEncoder[encoder]
 	if t == nil || t.Seen[class][rung-1].At == 0 {
+		done()
 		return false
 	}
 	row := t.Seen[class]
 	row[rung-1] = seenSpeed{}
 	t.Seen[class] = row
-	if err := s.saveSpeedBook(book); err != nil {
+	done()
+	if err := s.storeSpeeds(); err != nil {
 		s.log.Printf("the speed table could not be stored: %s", s.pathless(err.Error()))
 	}
 	return true

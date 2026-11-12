@@ -610,9 +610,61 @@ func TestWhatAPlayMayTakeOverFrom(t *testing.T) {
 	}
 }
 
+// At the lightest setting a player that runs dry cannot be helped. Whether
+// the PC kept up meanwhile still matters: if it did not, the speed that
+// was seen is kept, so that the next play of such a film is answered
+// honestly from the start. The two are told apart also when the page
+// reports the second after the first.
+func TestTheSameTroubleForAnotherReasonIsAnotherReport(t *testing.T) {
+	e := newTroubleEnv(t)
+	e.s.testPace = healthy
+	p := e.pc.play(e.oldFilm, map[string]any{"lower": playback.NumRungs})
+	if p.Plan.Video.Rung != playback.NumRungs {
+		t.Fatalf("play: %+v", p.Plan)
+	}
+	kept := e.pc.mustTrouble(p.Play, "starved")
+	if kept.Action != "wait" || kept.Notice != "" {
+		t.Fatalf("the PC kept up, and nothing lighter is made: %+v", kept)
+	}
+	e.s.testPace = slow
+	fell := e.pc.mustTrouble(p.Play, "starved")
+	if fell.Action != "wait" || fell.Notice != "This PC could not convert the film fast enough, but it cannot make a lighter picture than this one, so nothing was changed." {
+		t.Fatalf("the PC did not keep up at the lightest setting: %+v", fell)
+	}
+	if got := e.s.speeds("")[playback.ClassHD][playback.NumRungs-1]; got != 0.5 {
+		t.Errorf("the speed that was seen was not kept: %v", e.s.speeds(""))
+	}
+	// Each of the two, reported again, is answered as before and counted
+	// no further.
+	lines := e.troubleLines()
+	if again := e.pc.mustTrouble(p.Play, "starved"); again.Notice != fell.Notice {
+		t.Errorf("reported again while the PC is slow: %+v", again)
+	}
+	e.s.testPace = healthy
+	if again := e.pc.mustTrouble(p.Play, "starved"); again.Notice != "" {
+		t.Errorf("reported again while the PC keeps up: %+v", again)
+	}
+	if n := e.troubleLines(); n != lines || lines != 2 {
+		t.Errorf("the log holds %d lines about trouble after two reports and two repeats (%d before the repeats)", n, lines)
+	}
+	// The next play is told at once that this PC is too slow for the film.
+	var next struct {
+		Play string
+		Plan struct {
+			Playable string
+			TooSlow  bool
+			Reasons  []string
+		}
+	}
+	decode(t, e.pc.do("POST", "/api/items/"+e.oldFilm+"/play", nil), &next)
+	if next.Plan.Playable != "no" || !next.Plan.TooSlow || next.Play != "" || !strings.Contains(strings.Join(next.Plan.Reasons, " "), "0.5 seconds of film a second") {
+		t.Errorf("the next play of the film: %+v", next)
+	}
+}
+
 // A page that reports trouble in a loop is refused after a dozen reports
-// in a minute, and whatever it reports again and again is kept, counted
-// and logged once.
+// in a minute or sixty in an hour, and whatever it reports again and again
+// is kept, counted and logged once.
 func TestAPageThatReportsTroubleInALoop(t *testing.T) {
 	e := newTroubleEnv(t)
 	p := e.pc.play(e.big, nil)
@@ -647,6 +699,29 @@ func TestAPageThatReportsTroubleInALoop(t *testing.T) {
 	e.clock.forward(time.Minute + time.Second)
 	if code, _ := e.pc.trouble(p.Play, "decode"); code != 200 {
 		t.Errorf("a minute later: %d", code)
+	}
+	// A page that keeps it up, a dozen a minute, is stopped at sixty in
+	// the hour, and may report again when the hour is over.
+	for taken := troublePerMinute + 1; taken < troublePerHour; {
+		e.clock.forward(time.Minute + time.Second)
+		for i := 0; i < troublePerMinute && taken < troublePerHour; i++ {
+			if code, _ := e.pc.trouble(p.Play, "decode"); code != 200 {
+				t.Fatalf("report %d of the hour: %d", taken+1, code)
+			}
+			taken++
+		}
+	}
+	e.clock.forward(time.Minute + time.Second)
+	if code, _ := e.pc.trouble(p.Play, "decode"); code != 429 {
+		t.Errorf("the 61st report of the hour: %d", code)
+	}
+	e.clock.forward(time.Hour)
+	if code, _ := e.pc.trouble(p.Play, "decode"); code != 200 {
+		t.Errorf("an hour later: %d", code)
+	}
+	// (The second line in the log is the other sign-in's one report.)
+	if hits, lines := e.count(`SELECT sum(hits) FROM lessons WHERE device_id=?`, e.pc.device()), e.troubleLines(); hits != 1 || lines != 2 {
+		t.Errorf("after all that the lesson counts %d reports and the log holds %d lines about trouble", hits, lines)
 	}
 	// Reports that are refused, or about nothing, do not fill the memory.
 	for i := 0; i < 3000; i++ {

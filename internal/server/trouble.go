@@ -39,9 +39,11 @@ const (
 	// so that the play that replaces it can take over its count of steps
 	// whichever of "stop the old one" and "start the new one" arrives first.
 	handover = 10 * time.Minute
-	// troublePerMinute is how many reports of trouble one sign-in may send
-	// in a minute. A page in good order sends one or two in a film.
+	// troublePerMinute and troublePerHour are how many reports of trouble
+	// one sign-in may send. A page in good order sends one or two in a
+	// film; every report that is taken writes a line to the log.
 	troublePerMinute = 12
+	troublePerHour   = 60
 )
 
 // openFilm is what the server remembers about one film a device has open:
@@ -67,7 +69,7 @@ type openFilm struct {
 	// is repeated to a page that asks again. said is what each kind of
 	// trouble was answered with when nothing could be done.
 	replay *troubleAnswer
-	said   map[playback.Evidence]troubleAnswer
+	said   map[string]troubleAnswer
 
 	opened time.Time
 	closed time.Time // zero while the film is open
@@ -236,12 +238,16 @@ func (l *troubleLimiter) allow(sessionID string, now time.Time) bool {
 		l.recent = map[string][]time.Time{} // sign-ins that reported long ago are not worth keeping
 	}
 	kept := l.recent[sessionID][:0]
+	inMinute := 0
 	for _, at := range l.recent[sessionID] {
-		if now.Sub(at) < time.Minute {
+		if now.Sub(at) < time.Hour {
 			kept = append(kept, at)
+			if now.Sub(at) < time.Minute {
+				inMinute++
+			}
 		}
 	}
-	if len(kept) >= troublePerMinute {
+	if inMinute >= troublePerMinute || len(kept) >= troublePerHour {
 		l.recent[sessionID] = kept
 		return false
 	}
@@ -370,11 +376,6 @@ func (s *Server) handleTrouble(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, f.replay)
 		return
 	}
-	if ans, ok := f.said[ev]; ok {
-		writeJSON(w, http.StatusOK, ans)
-		return
-	}
-
 	// How fast the film was being converted counts only as playback wants
 	// it: over three chunks. Before that nothing is known.
 	pace := 0.0
@@ -382,6 +383,17 @@ func (s *Server) handleTrouble(w http.ResponseWriter, r *http.Request) {
 		if p, n := s.paceOf(token); n >= 3 {
 			pace = p
 		}
+	}
+	// "The same thing" is the same kind of trouble. A player that runs dry
+	// while the PC keeps up, and one that runs dry because it does not,
+	// are two things.
+	about := string(ev)
+	if ev == playback.Starved && tooSlow(pace) {
+		about += ", PC too slow"
+	}
+	if ans, ok := f.said[about]; ok {
+		writeJSON(w, http.StatusOK, ans)
+		return
 	}
 	out := playback.Replan(f.media, f.caps, f.want, f.limits, ev, pace, len(f.taken))
 	ans := troubleAnswer{Action: "wait", Notice: out.Notice, Lessons: []string{}}
@@ -410,9 +422,9 @@ func (s *Server) handleTrouble(w http.ResponseWriter, r *http.Request) {
 			have.replay = &ans
 		} else {
 			if have.said == nil {
-				have.said = map[playback.Evidence]troubleAnswer{}
+				have.said = map[string]troubleAnswer{}
 			}
-			have.said[ev] = ans
+			have.said[about] = ans
 		}
 	}
 	o.mu.Unlock()
@@ -434,6 +446,14 @@ func (s *Server) paceOf(token string) (pace float64, chunks int) {
 		return 0, 0
 	}
 	return s.hls.Pace(token)
+}
+
+// tooSlow says a pace counts as this PC not keeping up with a film. Where
+// the line is drawn is package playback's business, so it is asked: what
+// would a converted film that ran dry at this pace teach?
+func tooSlow(pace float64) bool {
+	converted := playback.Plan{Playable: playback.Yes, Method: playback.Convert, Video: playback.Video{Rung: 1}}
+	return playback.StepDown(converted, playback.Starved, pace, 0).Lesson == playback.LessonPC
 }
 
 // keepStep keeps what a step teaches: a lesson about the device the report

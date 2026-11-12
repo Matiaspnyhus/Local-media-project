@@ -34,6 +34,10 @@ const (
 	// deviceSeenEvery is how often at most a device's "last seen" is
 	// written down: not on every request.
 	deviceSeenEvery = time.Hour
+	// idleDeviceLife is how long a device is kept that nobody is signed in
+	// on and nothing was learned about. Nothing is lost with it: should
+	// its browser come back, it is given a device again.
+	idleDeviceLife = 30 * 24 * time.Hour
 )
 
 // deviceCookieValue is what the cookie of a device holds: the device's id
@@ -74,8 +78,12 @@ func (s *Server) setDeviceCookie(w http.ResponseWriter, id string) {
 func (s *Server) newDevice(r *http.Request) (string, error) {
 	now := s.now().Unix()
 	// Devices whose cookie has run out can never come back. They go, and
-	// what was learned about them with them.
+	// what was learned about them with them. So do, much sooner, devices
+	// that are signed out and were never learned anything about: a script
+	// that signs in again and again must not fill the owner's list.
 	s.db.Exec(`DELETE FROM devices WHERE last_seen_at < ?`, now-int64(deviceLife.Seconds()))
+	s.db.Exec(`DELETE FROM devices WHERE last_seen_at < ? AND id NOT IN (SELECT device_id FROM lessons)
+		AND id NOT IN (SELECT device_id FROM sessions WHERE device_id IS NOT NULL AND revoked_at IS NULL)`, now-int64(idleDeviceLife.Seconds()))
 	id := newID()
 	_, err := s.db.Exec(`INSERT INTO devices(id,label,created_at,last_seen_at) VALUES(?,?,?,?)`, id, deviceLabel(r.UserAgent()), now, now)
 	return id, err

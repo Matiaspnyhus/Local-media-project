@@ -257,19 +257,45 @@ func TestWhenADeviceWasLastSeen(t *testing.T) {
 		t.Errorf("the device is now called %q", d.Label)
 	}
 
-	// 401 days on, a phone that has not been back is gone when the next
-	// device is made. The PC, which has been back, stays.
+	// Three more browsers. A phone something was learned about, where the
+	// viewer then signed out; a tablet that is signed out and was never
+	// learned anything about; a TV that stays signed in.
+	known := func(b *browser) bool { return e.count(`SELECT count(*) FROM devices WHERE id=?`, b.device()) == 1 }
 	phone := e.signedIn(safariOnIPhone)
 	e.must(`INSERT INTO lessons(id,device_id,kind,value,learned_at,expires_at) VALUES(?,?,'hdr','',?,?)`,
 		ids.New(), phone.device(), clock.at.Unix(), clock.at.Add(500*day).Unix())
+	phone.do("POST", "/api/logout", nil)
+	tablet := e.signedIn("Mozilla/5.0 (Linux; Android 13; SM-X710) AppleWebKit/537.36 Chrome/130.0.0.0 Safari/537.36")
+	tablet.do("POST", "/api/logout", nil)
+	tv := e.signedIn("Mozilla/5.0 (SMART-TV; Linux; Tizen 7.0) AppleWebKit/537.36 TV Safari/537.36")
+	// A month on, when the next device is made, only the tablet is gone:
+	// nothing is lost with it, and if it comes back it is a device again.
+	clock.forward(31 * day)
+	e.signedIn(firefoxOnLinux)
+	if !known(phone) || known(tablet) || !known(tv) || !known(pc) {
+		t.Errorf("a month on: the phone is known %v, the tablet %v, the TV %v, the PC %v; want all but the tablet", known(phone), known(tablet), known(tv), known(pc))
+	}
+	tablet.signIn("owner", "a good password")
+	if !known(tablet) {
+		t.Error("a browser whose device was removed did not get a device when it came back")
+	}
+
+	// 401 days on, devices that have not been back are gone when the next
+	// device is made, with what was learned about them: their cookies
+	// have run out. The PC, which has been back, stays.
 	clock.forward(401 * day)
 	pc.do("GET", "/api/movies", nil)
 	e.signedIn(firefoxOnLinux)
 	if n := e.count(`SELECT count(*) FROM devices WHERE id=?`, phone.device()) + e.count(`SELECT count(*) FROM lessons WHERE device_id=?`, phone.device()); n != 0 {
 		t.Errorf("%d rows are left of a device whose cookie ran out", n)
 	}
-	if n := e.count(`SELECT count(*) FROM devices WHERE id=?`, pc.device()); n != 1 {
-		t.Error("a device that was seen yesterday was removed")
+	if known(tv) || !known(pc) {
+		t.Errorf("401 days on: the TV, not seen since, is known %v; the PC, seen today, %v", known(tv), known(pc))
+	}
+	// The TV's sign-in is not undone by that: it is simply on no device
+	// until it is next used.
+	if w := tv.do("GET", "/api/device", nil); w.Code != 200 || !known(tv) {
+		t.Errorf("the TV coming back after its device was removed: %d", w.Code)
 	}
 }
 
