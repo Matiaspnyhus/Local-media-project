@@ -342,9 +342,9 @@ func (s *Server) loadMemory(userID, scope string) *playback.Memory {
 // it is given, is that much later than the same moment in the file played
 // as it is. The page knows nothing of this, and does not need to. Play
 // notes how far ahead the player it has just answered will run, and gives
-// that player the place to carry on from on the player's clock. What the
-// player then reports is moved back by as much before it is saved (see
-// handleProgress).
+// that player the place to carry on from on the player's clock, with the
+// length of the player's timeline. What the player then reports is moved
+// back by as much before it is saved (see handleProgress).
 //
 // A note is kept by sign-in and film, in memory, and only for a clock that
 // does run ahead, which few do. It outlives the conversion it was made
@@ -519,6 +519,13 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	if pos > 0 {
 		out["positionMs"] = pos + subtitleShift
 	}
+	// The length goes with the place: it is the length of this player's
+	// timeline, which is longer than the film by what its clock runs ahead.
+	// The page compares the two, so as not to carry on within the last few
+	// seconds of a film, and two times on different clocks made it start
+	// such a clip from the beginning when it had been stopped a little
+	// before that.
+	out["durationMs"] = durationMs + subtitleShift
 	// For the page, should it ever need the film's own time from its
 	// player's clock: it is the player's time less this.
 	out["clockAheadMs"] = subtitleShift
