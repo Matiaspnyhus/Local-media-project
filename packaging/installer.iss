@@ -97,33 +97,51 @@ end;
   owner runs for something else is somewhere else, and is left alone.
 
   Windows itself is asked which programs are running and from where (the
-  same service Task Manager's details come from). If it cannot be asked,
-  that is noted in the log and the wait below has to do. }
+  same service Task Manager's details come from). The whole description
+  of each is asked for, with "SELECT *": a program can only be stopped
+  through a description that carries what Windows knows it by, and one
+  cut down to a few chosen fields does not carry it.
+
+  If Windows cannot be asked, that is noted in the log and the wait below
+  has to do. A helper that cannot be stopped is noted as well, in words of
+  its own (most likely it ended by itself in that very moment), and the
+  others still get their turn. }
 procedure StopHelpersIn(Dir: String);
 var
-  Locator, Service, Found, Helper: Variant;
+  Locator, Service, Found, Helper, Answer: Variant;
   I: Integer;
   Path: String;
 begin
   try
     Locator := CreateOleObject('WbemScripting.SWbemLocator');
     Service := Locator.ConnectServer('', 'root\CIMV2', '', '');
-    Found := Service.ExecQuery('SELECT ProcessId, ExecutablePath FROM Win32_Process WHERE Name = "ffmpeg.exe" OR Name = "ffprobe.exe"');
+    Found := Service.ExecQuery('SELECT * FROM Win32_Process WHERE Name = "ffmpeg.exe" OR Name = "ffprobe.exe"');
     for I := 0 to Found.Count - 1 do
     begin
-      Helper := Found.ItemIndex(I);
-      { One that ended in this very moment is no longer there to read.
-        Another user's program shows no path, and is not ours to stop. }
-      if not VarIsNull(Helper) then
-        if not VarIsNull(Helper.ExecutablePath) then
-        begin
-          Path := Helper.ExecutablePath;
-          if CompareText(ExtractFilePath(Path), AddBackslash(Dir)) = 0 then
+      Path := '';
+      try
+        Helper := Found.ItemIndex(I);
+        { Another user's program shows no path, and is not ours to stop. }
+        if not VarIsNull(Helper) then
+          if not VarIsNull(Helper.ExecutablePath) then
           begin
-            Log('Stopping a helper program that was still running: ' + Path);
-            Helper.Terminate();
+            Path := Helper.ExecutablePath;
+            if CompareText(ExtractFilePath(Path), AddBackslash(Dir)) = 0 then
+            begin
+              Log('Stopping a helper program that was still running: ' + Path);
+              { Windows answers 0 when it has stopped it. }
+              Answer := Helper.Terminate();
+              if not VarIsNull(Answer) then
+                if Answer <> 0 then
+                  Log('Could not stop the helper program ' + Path + ': Windows answered ' + IntToStr(Answer));
+            end;
           end;
-        end;
+      except
+        if Path = '' then
+          Log('Could not tell where a helper program is running from: ' + GetExceptionMessage)
+        else
+          Log('Could not stop the helper program ' + Path + ': ' + GetExceptionMessage);
+      end;
     end;
   except
     Log('Could not look for helper programs that are still running: ' + GetExceptionMessage);
