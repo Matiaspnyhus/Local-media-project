@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -331,60 +329,6 @@ func (s *Server) playCaps(u *User) *playback.Caps {
 	without := *c
 	without.HLS = false
 	return &without
-}
-
-// longestChunk is the longest chunk a list of cuts may hold and still be
-// believed. Chunks are meant to last a few seconds (hls.SegmentSeconds) and
-// are cut at key frames, which films have every few seconds. A list with a
-// chunk longer than this came from a search that did not find the key
-// frames, which has happened for whole kinds of file. Played by such a
-// list, a film does not start until the converter has worked through the
-// whole chunk, so the plain every-few-seconds list is used instead.
-const longestChunk = time.Minute
-
-// usableGrid reports whether a list of cuts is in order and has no
-// absurdly long chunk.
-func usableGrid(g hls.Grid) bool {
-	if !g.Valid() {
-		return false
-	}
-	for i, at := range g.Cuts {
-		end := g.EndMs
-		if i+1 < len(g.Cuts) {
-			end = g.Cuts[i+1]
-		}
-		if end-at > longestChunk.Milliseconds() {
-			return false
-		}
-	}
-	return true
-}
-
-// grid returns where a file is cut into chunks, working it out the first
-// time the file is played this way.
-func (s *Server) grid(ctx context.Context, fileID, path string, size, mtime, durationMs int64) hls.Grid {
-	stamp := fmt.Sprintf("%d-%d-%d", size, mtime, durationMs)
-	var have, text string
-	if err := s.db.QueryRow(`SELECT stamp, grid FROM cuts WHERE file_id=?`, fileID).Scan(&have, &text); err == nil && have == stamp {
-		var g hls.Grid
-		if json.Unmarshal([]byte(text), &g) == nil && usableGrid(g) {
-			return g
-		}
-	}
-	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	g, err := hls.FindCuts(ctx, s.ffprobe, path, durationMs)
-	if err == nil && !usableGrid(g) {
-		err = errors.New("the search did not find the film's key frames")
-	}
-	if err != nil {
-		s.log.Printf("could not find where to cut %s; jumping in it will be less exact: %v", filepath.Base(path), err)
-		return hls.Uniform(durationMs)
-	}
-	if b, err := json.Marshal(g); err == nil {
-		s.db.Exec(`INSERT INTO cuts(file_id,stamp,grid) VALUES(?,?,?) ON CONFLICT(file_id) DO UPDATE SET stamp=excluded.stamp, grid=excluded.grid`, fileID, stamp, string(b))
-	}
-	return g
 }
 
 // handlePlay decides how this device gets the file and hands the player an
@@ -728,87 +672,6 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	}
 	s.subtitleByFFmpeg(w, r, filepath.Join(libPath, filepath.FromSlash(rel)), n, fmt.Sprintf("%s-%s-%d-%d", fileID, key, size, mtime))
 }
-
-// subtitleByFFmpeg converts subtitle track n of path to WebVTT. The result
-// is sent while it is being made, since reading a long film through takes
-// a while, and kept under name for next time.
-func (s *Server) subtitleByFFmpeg(w http.ResponseWriter, r *http.Request, path string, n int, name string) {
-	dir := filepath.Join(s.dataDir, "cache", "subtitles")
-	cached := filepath.Join(dir, name+".vtt")
-	if b, err := os.ReadFile(cached); err == nil {
-		w.Write(b)
-		return
-	}
-	if s.ffmpeg == "" {
-		writeErr(w, http.StatusNotFound, "This subtitle needs the converter, which is not installed.")
-		return
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not prepare the subtitle.")
-		return
-	}
-	cmd := exec.CommandContext(r.Context(), s.ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-i", path,
-		"-map", "0:s:"+strconv.Itoa(n), "-f", "webvtt", "pipe:1")
-	hideWindow(cmd)
-	out, err := cmd.StdoutPipe()
-	if err != nil || cmd.Start() != nil {
-		writeErr(w, http.StatusInternalServerError, "Could not prepare the subtitle.")
-		return
-	}
-	tmp, err := subtitleTemp(dir, "making-*.tmp")
-	if err != nil {
-		cmd.Process.Kill()
-		cmd.Wait()
-		writeErr(w, http.StatusInternalServerError, "Could not prepare the subtitle.")
-		return
-	}
-	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, 32<<10)
-	// copyErr: the viewer went away. keepErr: the copy for next time could
-	// not be written, which is no reason to stop sending to the viewer.
-	var copyErr, keepErr error
-	for {
-		k, err := out.Read(buf)
-		if k > 0 {
-			if _, werr := tmp.Write(buf[:k]); werr != nil && keepErr == nil {
-				keepErr = werr
-			}
-			if _, werr := w.Write(buf[:k]); werr != nil {
-				copyErr = werr
-				break
-			}
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		if err != nil {
-			break
-		}
-	}
-	if copyErr != nil {
-		cmd.Process.Kill()
-	}
-	waitErr := cmd.Wait()
-	if err := tmp.Close(); err != nil && keepErr == nil {
-		keepErr = err
-	}
-	// The copy is kept only if it is whole: ffmpeg finished, the viewer got
-	// everything, and every write to the copy and its close succeeded. A
-	// short copy (the disk filled up) would be served from then on.
-	if copyErr == nil && waitErr == nil && keepErr == nil {
-		if os.Rename(tmp.Name(), cached) == nil {
-			return
-		}
-	}
-	if keepErr != nil {
-		s.log.Printf("a subtitle could not be kept for next time: %s", s.pathless(keepErr.Error()))
-	}
-	os.Remove(tmp.Name())
-}
-
-// subtitleTemp makes the file a subtitle is written to while it is being
-// taken out of a film. Tests replace it to stand in for a full disk.
-var subtitleTemp = os.CreateTemp
 
 // handleDiagnostics says what this device reported it can play and what the
 // PC has to convert with: the facts behind every "why is this converting?".

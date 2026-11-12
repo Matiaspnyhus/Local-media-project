@@ -111,6 +111,7 @@ type Server struct {
 	// says about it before that is logged (see pathless).
 	convMu     sync.Mutex
 	converting map[string]string
+	helpers    *helpers // shared and limited runs of ffmpeg and ffprobe, see helpers.go
 	ctx        context.Context
 	stop       context.CancelFunc
 	handler    http.Handler
@@ -140,6 +141,7 @@ func New(cfg Config) (*Server, error) {
 	s := &Server{
 		db: cfg.DB, dataDir: cfg.DataDir, version: cfg.Version, port: cfg.Port, assets: cfg.Assets,
 		limiter: newLoginLimiter(), events: &eventLog{}, update: cfg.Update, ffprobe: cfg.FFprobe, caps: map[string]*playback.Caps{},
+		helpers: newHelpers(),
 	}
 	s.ctx, s.stop = context.WithCancel(context.Background())
 	s.newTMDB = metadata.New

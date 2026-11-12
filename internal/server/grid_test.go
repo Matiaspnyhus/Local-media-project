@@ -90,9 +90,15 @@ func TestAListOfCutsWithAbsurdlyLongChunksIsNotUsedOrKept(t *testing.T) {
 	// 2. The key-frame search itself comes back with nothing (this stand-in
 	// for ffprobe prints nothing and reports success, as the real one did
 	// for whole kinds of file). The result must be neither used nor stored.
+	// (The file's date differs here, so this is a search of its own and
+	// not the remembered failure of the one above.)
 	e.s.db.Exec(`DELETE FROM cuts`)
-	e.s.ffprobe = script(t, "exit 0")
-	g = e.s.grid(context.Background(), e.fileID, path, size, mtime, duration)
+	ran := filepath.Join(t.TempDir(), "ran")
+	e.s.ffprobe = script(t, ": > '"+ran+"'\nexit 0")
+	g = e.s.grid(context.Background(), e.fileID, path, size, mtime+1, duration)
+	if _, err := os.Stat(ran); err != nil {
+		t.Fatal("the stand-in for ffprobe was never run, so this part proves nothing")
+	}
 	if !g.Valid() || longest(g) > 60_000 {
 		t.Fatalf("a search that found nothing was believed: %d chunks, the longest %d s", len(g.Cuts), longest(g)/1000)
 	}
