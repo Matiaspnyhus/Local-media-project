@@ -220,6 +220,48 @@ func TestAJumpIntoAPictureTrackCountsFromItsBase(t *testing.T) {
 	}
 }
 
+// Why the files keep the film's own times: laid over the film's picture by
+// ffmpeg, with both left on their own clocks as the converter does it, a
+// caption is there when the film has it and gone when it is over. That
+// holds for a film whose clock starts at zero and for a recording whose
+// clock starts ten hours in, and for each sort of picture file.
+//
+// The film's picture is painted grey first, so that the caption's colour
+// can be told from it, and the track is brought to the picture's size (it
+// was made for a larger one). The captions are yellow, from 20 to 22
+// seconds into the film and every four seconds after.
+func TestAnExtractedTrackLinesUpWithTheFilm(t *testing.T) {
+	tl := tools(t)
+	for _, name := range []string{"late", "recording"} {
+		path := madeFilm(t, tl, name)
+		dir, res, _ := extracted(t, tl, path)
+		for _, tr := range res.Tracks {
+			// Pictures 21, 23 and 25 seconds in, at 24 a second: during
+			// the first caption, after it, and during the second.
+			cmd := exec.Command(tl.FFmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-copyts", "-i", path, "-i", filepath.Join(dir, tr.File),
+				"-filter_complex", `[0:v:0]drawbox=c=gray:t=fill[v];[1:s:0]scale=320:180[s];[v][s]overlay=eof_action=pass,select='eq(n\,504)+eq(n\,552)+eq(n\,600)',format=rgb24[o]`,
+				"-map", "[o]", "-fps_mode", "passthrough", "-frames:v", "3", "-f", "rawvideo", "pipe:1")
+			var said bytes.Buffer
+			cmd.Stderr = &said
+			out, err := cmd.Output()
+			if err != nil || len(out) != 3*320*180*3 {
+				t.Errorf("%s, %s: laying the track over the film: %v, %d bytes\n%s", name, tr.File, err, len(out), said.String())
+				continue
+			}
+			// The middle of where the first caption lies, at this size.
+			for i, want := range []bool{true, false, true} {
+				at := i*320*180*3 + (134*320+62)*3
+				r, g, b := int(out[at]), int(out[at+1]), int(out[at+2])
+				yellow := r > 200 && g > 200 && b < 60
+				grey := r > 100 && r < 150 && g > 100 && g < 150 && b > 100 && b < 150
+				if want && !yellow || !want && !grey {
+					t.Errorf("%s, %s: picture %d has %d,%d,%d where the caption lies; caption wanted there: %v", name, tr.File, i, r, g, b, want)
+				}
+			}
+		}
+	}
+}
+
 // A TV recording's clock starts hours in. The files keep the film's own
 // times, the index says where the clock starts, and progress is counted
 // from there, not from zero.

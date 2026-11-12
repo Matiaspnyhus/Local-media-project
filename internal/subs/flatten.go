@@ -88,14 +88,25 @@ const joinMs = 100
 // Cue.Role), so a caller can leave some out.
 func Flatten(script []byte) []Cue {
 	text := string(decodeText(script))
-	text = strings.ReplaceAll(text, "\r\n", "\n")
-	text = strings.ReplaceAll(text, "\r", "\n")
 	var (
 		section string
 		fields  = defaultFields
 		lines   []scriptLine
 	)
-	for _, line := range strings.Split(text, "\n") {
+	for len(text) > 0 {
+		// A line ends the Unix way, the Windows way or the old Mac way. (A
+		// heavily styled script runs to tens of megabytes, so it is gone
+		// through as it lies and not copied about.)
+		var line string
+		if i := strings.IndexAny(text, "\r\n"); i < 0 {
+			line, text = text, ""
+		} else {
+			line = text[:i]
+			if text[i] == '\r' && i+1 < len(text) && text[i+1] == '\n' {
+				i++
+			}
+			text = text[i+1:]
+		}
 		line = strings.TrimSpace(line)
 		if line == "" || line[0] == ';' {
 			continue

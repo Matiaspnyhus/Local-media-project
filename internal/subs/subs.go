@@ -14,6 +14,24 @@
 // every font into a folder, under names this package chooses, and notes
 // what it found in an index there. Load reads that index back.
 //
+// A folder that Extract has finished holds, for a film whose subtitle
+// tracks are numbered 0, 1, 2 ... in the film's order and whose attachments
+// are numbered the same way:
+//
+//	index.json   what the folder holds (see Result); written last
+//	s<N>.ass     styled track N, as the film has it
+//	t<N>.vtt     text track N, as WebVTT
+//	p<N>.sup     picture track N from a Blu-ray disc (PGS)
+//	p<N>.mks     picture track N from a DVD (VobSub) or a broadcast (DVB)
+//	fonts/f<K>   attachment K, if it is a font
+//
+// While a run is going, its files are in a folder "making" inside that
+// one, and count for nothing.
+//
+// Every time in those files is on the film's own clock, the one the
+// converter in internal/hls cuts by, so that a track laid over the picture
+// lines up with it. Result.StartMs says where that clock starts.
+//
 // Besides that the package has what later steps need to work with what was
 // taken out:
 //

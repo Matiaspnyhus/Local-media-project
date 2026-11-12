@@ -153,6 +153,43 @@ func TestFlattenShowsRepeatedWordsOnce(t *testing.T) {
 	}
 }
 
+// A heavily styled script is long: here, two hundred signs that each move
+// for a hundred frames, among two thousand spoken lines. Every sign is one
+// caption and every spoken line is kept.
+func TestFlattenOfALongScript(t *testing.T) {
+	var all []string
+	for sign := 0; sign < 200; sign++ {
+		for frame := 0; frame < 100; frame++ {
+			from := sign*10000 + frame*40
+			all = append(all, fmt.Sprintf(`Dialogue: 0,%d:%02d:%02d.%02d,%d:%02d:%02d.%02d,Signs,,0,0,0,,{\pos(%d,%d)}Sign number %d`,
+				from/3600000, from/60000%60, from/1000%60, from%1000/10, (from+40)/3600000, (from+40)/60000%60, (from+40)/1000%60, (from+40)%1000/10, frame, sign, sign))
+		}
+	}
+	for line := 0; line < 2000; line++ {
+		from := line * 1000
+		all = append(all, fmt.Sprintf(`Dialogue: 0,%d:%02d:%02d.00,%d:%02d:%02d.90,Default,,0,0,0,,Spoken line %d`,
+			from/3600000, from/60000%60, from/1000%60, from/3600000, from/60000%60, from/1000%60, line))
+	}
+	got := Flatten(lines(all...))
+	signs, speech := 0, 0
+	for i, c := range got {
+		switch {
+		case c.Role == Sign && c.EndMs-c.StartMs == 4000:
+			signs++
+		case c.Role == Speech && c.EndMs-c.StartMs == 900:
+			speech++
+		default:
+			t.Fatalf("caption %d: %+v", i, c)
+		}
+		if i > 0 && c.StartMs < got[i-1].StartMs {
+			t.Fatalf("caption %d begins at %d, after one that begins at %d", i, c.StartMs, got[i-1].StartMs)
+		}
+	}
+	if signs != 200 || speech != 2000 {
+		t.Errorf("%d signs and %d spoken lines from 200 and 2000", signs, speech)
+	}
+}
+
 // Captions come out in the order they appear, whatever order the script
 // has them in. Of those that appear together, speech is first (a player
 // puts the first lowest), then signs, then songs, and within a sort the
