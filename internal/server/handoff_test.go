@@ -706,6 +706,92 @@ func TestHandoffLinkWorksUntilItsSignInEnds(t *testing.T) {
 	}
 }
 
+// What the page is told about how long a link lasts is what the viewer
+// reads, so it has to be true: a link dies with its sign-in, and a sign-in
+// can have less left than a link's usual twelve hours.
+func TestALinkNeverClaimsToOutliveItsSignIn(t *testing.T) {
+	e := newEnv(t)
+	c := e.setup()
+	homeAt(t, "http://"+phoneHost)
+	id := e.firstItem(c, "clip")
+	var sid string
+	e.s.db.QueryRow(`SELECT id FROM sessions ORDER BY rowid DESC LIMIT 1`).Scan(&sid)
+	ends := time.Now().Add(time.Hour).Unix() // the sign-in has one hour left
+	if _, err := e.s.db.Exec(`UPDATE sessions SET created_at=? WHERE id=?`, time.Unix(ends, 0).Add(-sessionLife).Unix(), sid); err != nil {
+		t.Fatal(err)
+	}
+	endOf := func(link string) int64 {
+		t.Helper()
+		u, err := url.Parse(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		end, err := strconv.ParseInt(u.Query().Get("e"), 10, 64)
+		if err != nil {
+			t.Fatalf("the link %q does not say when it ends", link)
+		}
+		return end
+	}
+	inPlaylist := func(query string) (*httptest.ResponseRecorder, string) {
+		t.Helper()
+		w := e.ask("GET", "/api/items/"+id+"/handoff.xspf"+query, remote, phoneHost, c, nil, "")
+		if w.Code != 200 {
+			return w, ""
+		}
+		return w, readXSPF(t, w.Body.Bytes()).Tracks[0].Location
+	}
+
+	var h handoffAnswer
+	decode(t, e.ask("GET", "/api/items/"+id+"/handoff", remote, phoneHost, c, nil, ""), &h)
+	if h.ExpiresAt != ends || h.ValidSeconds > 3600 || h.ValidSeconds < 3600-120 || endOf(h.URL) != ends {
+		t.Errorf("a sign-in with an hour left (until %d) was told: %+v", ends, h)
+	}
+	if w := e.fetchLink(h.URL); w.Code != 206 {
+		t.Errorf("the link itself: %d", w.Code)
+	}
+	if _, link := inPlaylist(""); endOf(link) != ends {
+		t.Errorf("the link in the file for VLC ends at %d, the sign-in at %d", endOf(link), ends)
+	}
+
+	// With a full sign-in again, a link lasts its usual time, and the file
+	// for VLC ends when the page says the link it shows does: the page
+	// passes that moment on.
+	e.s.db.Exec(`UPDATE sessions SET created_at=? WHERE id=?`, time.Now().Unix(), sid)
+	now := time.Now().Unix()
+	usual := int64(linkLife / time.Second)
+	decode(t, e.ask("GET", "/api/items/"+id+"/handoff", remote, phoneHost, c, nil, ""), &h)
+	if h.ValidSeconds != usual || h.ExpiresAt < now+usual || h.ExpiresAt > now+usual+60 {
+		t.Errorf("a fresh sign-in was told: %+v", h)
+	}
+	soon := now + 600
+	w, link := inPlaylist("?at=5&until=" + strconv.FormatInt(soon, 10))
+	if w.Code != 200 || endOf(link) != soon {
+		t.Fatalf("asked for a file whose link ends at %d: %d, ends at %d", soon, w.Code, endOf(link))
+	}
+	if w := e.fetchLink(link); w.Code != 206 {
+		t.Errorf("that link: %d", w.Code)
+	}
+	// It can shorten a link's life, never lengthen it.
+	for _, far := range []int64{now + usual + 3600, now + 400*24*3600, 1 << 62} {
+		w, link := inPlaylist("?until=" + strconv.FormatInt(far, 10))
+		if w.Code != 200 || endOf(link) > time.Now().Unix()+usual {
+			t.Errorf("asked for a link until %d: %d, ends at %d, more than the usual time away", far, w.Code, endOf(link))
+		}
+	}
+	// A moment that has passed gives no file with a dead link in it; the
+	// viewer is told to ask again.
+	for _, past := range []int64{now - 1, now - 3600, 1} {
+		if w, _ := inPlaylist("?until=" + strconv.FormatInt(past, 10)); w.Code != 410 || !strings.Contains(w.Body.String(), "has run out") {
+			t.Errorf("until=%d, which has passed: %d %s", past, w.Code, w.Body)
+		}
+	}
+	for _, bad := range []string{"abc", "0", "-5", "12.5", "1e12", "99999999999999999999", "+" + strconv.FormatInt(soon, 10) + "x", strconv.FormatInt(soon, 10) + "%20"} {
+		if w, _ := inPlaylist("?until=" + bad); w.Code != 400 {
+			t.Errorf("until=%s: %d %s", bad, w.Code, w.Body)
+		}
+	}
+}
+
 func TestHandoffAddressIsAlwaysOneOfTheServersOwn(t *testing.T) {
 	e := newEnv(t)
 	req := func(from, host string, arrivedAt net.Addr) *http.Request {

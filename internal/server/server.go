@@ -130,6 +130,9 @@ type User struct {
 	Name      string
 	Role      string
 	SessionID string
+	// SignInEnds is when this sign-in runs out by itself (Unix seconds).
+	// Nothing handed out under it may claim to last longer.
+	SignInEnds int64
 }
 
 const (
@@ -390,6 +393,7 @@ func (s *Server) userFromRequest(r *http.Request) *User {
 	if signInExpired(created) {
 		return nil
 	}
+	u.SignInEnds = time.Unix(created, 0).Add(sessionLife).Unix()
 	return &u
 }
 

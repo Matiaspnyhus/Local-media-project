@@ -295,11 +295,21 @@ func (s *Server) handleOpenLocal(w http.ResponseWriter, r *http.Request) {
 
 // signedStream makes a fresh link to an original file for one sign-in, the
 // same kind handlePlay hands to the page's own player, and says when it
-// runs out.
-func (s *Server) signedStream(fileID, sessionID string) (link string, expires int64) {
-	expires = time.Now().Add(linkLife).Unix()
-	sig := auth.SignLink(s.linkKey, fileID, expires, sessionID)
-	return "/stream/" + fileID + "?e=" + strconv.FormatInt(expires, 10) + "&s=" + sessionID + "&g=" + sig, expires
+// runs out: after linkLife, or when the sign-in itself runs out if that is
+// sooner (the link dies with its sign-in either way, and the page tells the
+// viewer how long they have), or at until, if the caller wants it sooner
+// still (0 for no such wish).
+func (s *Server) signedStream(fileID string, u *User, until int64) (link string, expires, validSeconds int64) {
+	now := time.Now()
+	expires = now.Add(linkLife).Unix()
+	if u.SignInEnds > 0 && u.SignInEnds < expires {
+		expires = u.SignInEnds
+	}
+	if until > 0 && until < expires {
+		expires = until
+	}
+	sig := auth.SignLink(s.linkKey, fileID, expires, u.SessionID)
+	return "/stream/" + fileID + "?e=" + strconv.FormatInt(expires, 10) + "&s=" + u.SessionID + "&g=" + sig, expires, expires - now.Unix()
 }
 
 // handoffBase is the address a player outside the browser should use for
@@ -329,15 +339,16 @@ func (s *Server) handoffBase(r *http.Request) (string, bool) {
 	return "", false
 }
 
-// handoffLink is a complete, freshly signed address for a film's file.
-func (s *Server) handoffLink(w http.ResponseWriter, r *http.Request, f handedFile) (link string, expires int64, ok bool) {
+// handoffLink is a complete, freshly signed address for a film's file (see
+// signedStream for until, and for how long the link lasts).
+func (s *Server) handoffLink(w http.ResponseWriter, r *http.Request, f handedFile, until int64) (link string, expires, validSeconds int64, ok bool) {
 	base, ok := s.handoffBase(r)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "No home network address was found for this PC, so there is no link to give to another player.")
-		return "", 0, false
+		return "", 0, 0, false
 	}
-	link, expires = s.signedStream(f.id, currentUser(r).SessionID)
-	return base + link, expires, true
+	link, expires, validSeconds = s.signedStream(f.id, currentUser(r), until)
+	return base + link, expires, validSeconds, true
 }
 
 // handleHandoff gives the page a link to show as text, for pasting into a
@@ -347,14 +358,16 @@ func (s *Server) handleHandoff(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	link, expires, ok := s.handoffLink(w, r, f)
+	link, expires, validSeconds, ok := s.handoffLink(w, r, f, 0)
 	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"url":          link,
-		"expiresAt":    expires, // Unix seconds
-		"validSeconds": int64(linkLife / time.Second),
+		"url":       link,
+		"expiresAt": expires, // Unix seconds
+		// How long that is from now: linkLife, or less when the sign-in
+		// itself runs out sooner.
+		"validSeconds": validSeconds,
 		// Whether open-local would be allowed for this browser, so the page
 		// knows which of the two ways out to offer.
 		"thisPC": fromThisPC(r),
@@ -375,11 +388,27 @@ func (s *Server) handleHandoffXSPF(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The page says when the link it shows stops working, and that the
+	// file stops then too. So the page passes that moment on, and the link
+	// in the file ends at it, however much later the file is asked for.
+	// This can only shorten a link's life, never lengthen it.
+	until := int64(0)
+	if v := r.URL.Query().Get("until"); v != "" {
+		var err error
+		if until, err = strconv.ParseInt(v, 10, 64); err != nil || until <= 0 {
+			writeErr(w, http.StatusBadRequest, "The time the link should stop working could not be read.")
+			return
+		}
+		if until <= time.Now().Unix() {
+			writeErr(w, http.StatusGone, "This offer has run out. Press \"Open in another player\" again for a new one.")
+			return
+		}
+	}
 	f, ok := s.fileToHand(w, r)
 	if !ok {
 		return
 	}
-	link, _, ok := s.handoffLink(w, r, f)
+	link, _, _, ok := s.handoffLink(w, r, f, until)
 	if !ok {
 		return
 	}
