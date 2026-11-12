@@ -85,6 +85,10 @@ type Manager struct {
 	stop    chan struct{}
 	closing sync.Once
 	done    sync.WaitGroup
+	// inGap, when set, is called by halt at the moment it has let go of the
+	// lock to wait for ffmpeg to stop. Only tests set it: it lets them make
+	// something else happen at exactly that moment.
+	inGap func()
 }
 
 // A session's ffmpeg takes a few thousandths of a second to stop, and the
@@ -801,7 +805,11 @@ func (m *Manager) halt(s *session) {
 	done := make(chan struct{})
 	s.halting = done
 	r.kill()
+	inGap := m.inGap
 	m.mu.Unlock()
+	if inGap != nil {
+		inGap()
+	}
 	<-r.exited
 	m.mu.Lock()
 	s.halting = nil

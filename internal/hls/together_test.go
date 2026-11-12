@@ -20,23 +20,42 @@ import (
 // middle of a jump, and many of everything at once. They use the "long"
 // film: two minutes, twenty chunks.
 
-// midRestart waits for the moment a request has taken the session's ffmpeg
-// away to stop it and is waiting, without the lock, for it to be gone.
-func midRestart(t *testing.T, m *Manager, s *session) {
+// gap holds the manager at the moment that matters here: the next time it
+// stops an ffmpeg, it stays where it has let go of the lock and is waiting
+// for the process to be gone. reached is closed when it is there; resume
+// lets it go on. What a test starts in between arrives in the gap.
+func gap(t *testing.T, m *Manager) (reached <-chan struct{}, resume func()) {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		m.mu.Lock()
-		stopping := s.run == nil
-		m.mu.Unlock()
-		if stopping {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the jump never stopped the running converter")
+	in, out := make(chan struct{}), make(chan struct{})
+	var held atomic.Bool
+	m.mu.Lock()
+	m.inGap = func() {
+		if held.CompareAndSwap(false, true) {
+			close(in)
+			<-out
 		}
 	}
+	m.mu.Unlock()
+	var once sync.Once
+	resume = func() { once.Do(func() { close(out) }) }
+	t.Cleanup(resume)
+	return in, resume
 }
+
+// arrive waits for the gap to be reached.
+func arrive(t *testing.T, reached <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-reached:
+	case <-time.After(20 * time.Second):
+		t.Fatal("no ffmpeg was stopped, so nothing could be made to arrive while one was stopping")
+	}
+}
+
+// moment is how long what a test starts in the gap is given to get as far
+// as it can before the gap is left. Should that not be enough on a busy
+// machine, the test still passes: it has then checked less, not wrongly.
+const moment = 50 * time.Millisecond
 
 // converters lists the ffmpeg processes this test program has started and
 // that are still alive, where the system offers a way to ask (Linux).
@@ -105,7 +124,7 @@ func TestASecondJumpDuringARestartIsAnswered(t *testing.T) {
 	m := manager(t, ffmpeg)
 	m.Ahead = 2 // the converter stays near the viewer, so every jump is a restart
 	bg := context.Background()
-	for round := 0; round < 12; round++ {
+	for round := 0; round < 8; round++ {
 		token := m.Open(spec)
 		if _, err := m.Segment(bg, token, 0); err != nil {
 			t.Fatal(err)
@@ -113,18 +132,34 @@ func TestASecondJumpDuringARestartIsAnswered(t *testing.T) {
 		m.mu.Lock()
 		s := m.sessions[token]
 		m.mu.Unlock()
+		reached, resume := gap(t, m)
 		given, giveUp := context.WithCancel(bg)
-		first := make(chan error, 1)
+		first, second := make(chan error, 1), make(chan error, 1)
 		go func() {
 			_, err := m.Segment(given, token, 8)
 			first <- err
 		}()
-		midRestart(t, m, s)
-		giveUp()
-		if _, err := m.Segment(bg, token, 14); err != nil {
+		arrive(t, reached) // the first jump is stopping the old ffmpeg
+		// A player gives the first request up before it sends the second.
+		// The server may learn of that before or after the second arrives:
+		// both are tried.
+		knownInTime := round%2 == 0
+		if knownInTime {
+			giveUp()
+		}
+		go func() {
+			_, err := m.Segment(bg, token, 14)
+			second <- err
+		}()
+		time.Sleep(moment)
+		resume()
+		if err := <-second; err != nil {
 			t.Fatalf("round %d: the jump the player is waiting for: %v", round, err)
 		}
-		<-first
+		giveUp()
+		if err := <-first; err == nil {
+			t.Errorf("round %d: the jump that was given up was answered", round)
+		}
 		m.mu.Lock()
 		at, starts := -1, s.starts
 		if s.run != nil {
@@ -134,8 +169,10 @@ func TestASecondJumpDuringARestartIsAnswered(t *testing.T) {
 		if at != 14 {
 			t.Errorf("round %d: the converter ended up at chunk %d, the player is at 14", round, at)
 		}
-		if starts > 3 {
-			t.Errorf("round %d: ffmpeg was started %d times for one start and two jumps", round, starts)
+		// The film, the second jump, and the first jump only if it was not
+		// known in time that nobody wanted it.
+		if want := map[bool]int{true: 2, false: 3}[knownInTime]; starts != want {
+			t.Errorf("round %d: ffmpeg was started %d times, want %d", round, starts, want)
 		}
 		if n := m.Running(); n != 1 {
 			t.Errorf("round %d: %d converters running for one viewer", round, n)
@@ -158,15 +195,23 @@ func TestPressingPlayWhileTheIdleCheckIsStopping(t *testing.T) {
 	m.Ahead, m.IdleStop = 2, 50*time.Millisecond
 	bg := context.Background()
 	token := m.Open(spec)
-	m.mu.Lock()
-	s := m.sessions[token]
-	m.mu.Unlock()
 	for round := 0; round < 3; round++ {
 		if _, err := m.Segment(bg, token, 0); err != nil {
 			t.Fatalf("round %d: %v", round, err)
 		}
-		midRestart(t, m, s) // within a second or so: the idle check
-		if b, err := m.Segment(bg, token, 1); err != nil || len(b) == 0 {
+		reached, resume := gap(t, m)
+		arrive(t, reached) // within a second or so: the idle check is stopping ffmpeg
+		play := make(chan error, 1)
+		go func() {
+			b, err := m.Segment(bg, token, 1)
+			if err == nil && len(b) == 0 {
+				err = errors.New("an empty chunk")
+			}
+			play <- err
+		}()
+		time.Sleep(moment)
+		resume()
+		if err := <-play; err != nil {
 			t.Fatalf("round %d: pressing play as the idle check stopped the converter: %v", round, err)
 		}
 	}
@@ -356,31 +401,38 @@ func TestClosingDuringAJumpLeavesNothingRunning(t *testing.T) {
 				m.mu.Lock()
 				s := m.sessions[token]
 				m.mu.Unlock()
-				jump := make(chan error, 1)
+				reached, resume := gap(t, m)
+				jump, closed := make(chan error, 1), make(chan struct{})
 				go func() {
 					_, err := m.Segment(bg, token, 10)
 					jump <- err
 				}()
-				midRestart(t, m, s)
-				switch closer {
-				case "the player is closed":
-					m.Stop(token)
-				case "its owner signs out":
-					m.Drop("ann")
-				case "a seventh film is opened":
-					for i := 0; i < maxPerOwner; i++ {
-						m.Open(spec)
+				arrive(t, reached) // the jump is stopping the old ffmpeg
+				go func() {
+					defer close(closed)
+					switch closer {
+					case "the player is closed":
+						m.Stop(token)
+					case "its owner signs out":
+						m.Drop("ann")
+					case "a seventh film is opened":
+						for i := 0; i < maxPerOwner; i++ {
+							m.Open(spec)
+						}
+					case "the program shuts down":
+						m.Close()
 					}
-				case "the program shuts down":
-					m.Close()
-				}
+				}()
+				time.Sleep(moment)
+				resume()
 				if err := <-jump; err == nil {
 					t.Errorf("the jump was answered though its session was closed")
 				}
+				<-closed
 				left := func() bool {
 					m.mu.Lock()
 					defer m.mu.Unlock()
-					return s.run != nil && s.run.alive()
+					return s.run != nil && s.run.alive() || len(m.live) != 0
 				}
 				if settled(func() bool { return !left() }); left() {
 					t.Errorf("a converter was started for a session that had been closed, and nothing can stop it")
