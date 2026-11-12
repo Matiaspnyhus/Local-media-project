@@ -326,8 +326,12 @@ func TestASubtitleThatCannotBeMadeIsAnErrorThatIsNotKept(t *testing.T) {
 
 	// It dies after some captions have been sent on. The answer began as a
 	// success and cannot be taken back, so the connection is cut: a browser
-	// then knows the subtitle did not arrive whole, and keeps nothing.
-	e.s.ffmpeg = script(t, `printf 'WEBVTT\n\n00:01.000 --> 00:02.000\nThe only caption that got out\n\n'; sleep 0.3; exit 1`)
+	// then knows the subtitle did not arrive whole, and keeps nothing. (The
+	// stand-in dies when the test tells it to, which is once the caption has
+	// arrived; it gives up waiting after a minute.)
+	die := filepath.Join(t.TempDir(), "die")
+	e.s.ffmpeg = script(t, `printf 'WEBVTT\n\n00:01.000 --> 00:02.000\nThe only caption that got out\n\n'
+n=0; while [ ! -e '`+die+`' ] && [ $n -lt 600 ]; do sleep 0.1; n=$((n+1)); done; exit 1`)
 	srv := httptest.NewServer(e.s)
 	defer srv.Close()
 	r, _ := http.NewRequest("GET", srv.URL+subs[2].URL, nil)
@@ -336,13 +340,21 @@ func TestASubtitleThatCannotBeMadeIsAnErrorThatIsNotKept(t *testing.T) {
 	if err != nil {
 		t.Fatalf("asking for a subtitle that fails partway: %v", err)
 	}
-	body, err := io.ReadAll(resp.Body)
+	var body []byte
+	for buf := make([]byte, 4096); err == nil; {
+		var k int
+		k, err = resp.Body.Read(buf)
+		body = append(body, buf[:k]...)
+		if strings.Contains(string(body), "The only caption that got out") {
+			os.WriteFile(die, nil, 0o644)
+		}
+	}
 	resp.Body.Close()
-	if err == nil {
+	if err == io.EOF {
 		t.Errorf("a subtitle that failed partway ended like a whole one: %d %q", resp.StatusCode, body)
 	}
-	if cc := resp.Header.Get("Cache-Control"); cc != "no-store" {
-		t.Errorf("a subtitle still being made was sent with Cache-Control %q, so a browser may keep it if it fails", cc)
+	if cc := resp.Header.Get("Cache-Control"); resp.StatusCode != 200 || cc != "no-store" {
+		t.Errorf("a subtitle still being made was answered %d with Cache-Control %q; want 200 that a browser will not keep", resp.StatusCode, cc)
 	}
 	if !strings.Contains(string(body), "The only caption that got out") {
 		t.Errorf("what ffmpeg had made before it died was not sent on: %q", body)
