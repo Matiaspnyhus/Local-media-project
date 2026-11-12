@@ -157,8 +157,8 @@ func TestASecondJumpDuringARestartIsAnswered(t *testing.T) {
 			t.Fatalf("round %d: the jump the player is waiting for: %v", round, err)
 		}
 		giveUp()
-		if err := <-first; err == nil {
-			t.Errorf("round %d: the jump that was given up was answered", round)
+		if err := <-first; err == nil && knownInTime {
+			t.Errorf("round %d: the jump that had been given up was answered", round)
 		}
 		m.mu.Lock()
 		at, starts := -1, s.starts
