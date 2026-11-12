@@ -226,7 +226,13 @@ func TestUpdateGoBackAndABrokenUpdate(t *testing.T) {
 	update("v1.1.0")
 	s.waitVersion("v1.1.0", 90*time.Second)
 	stillWatched("after updating to v1.1.0")
-	if st := status(); st.LastResult != "ok" || st.LastTo != "v1.1.0" || !st.CanUndo || st.Available != "" {
+	// The new version answers a moment before it has noted that the update
+	// went well, so "pending" is waited out rather than taken for the answer.
+	st := status()
+	for end := time.Now().Add(30 * time.Second); st.LastResult == "pending" && time.Now().Before(end); st = status() {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if st.LastResult != "ok" || st.LastTo != "v1.1.0" || !st.CanUndo || st.Available != "" {
 		t.Fatalf("after a good update: %+v", st)
 	}
 	if m, _ := filepath.Glob(filepath.Join(data, "backups", "*.db")); len(m) != 1 {

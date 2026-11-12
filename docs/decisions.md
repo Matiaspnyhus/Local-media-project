@@ -243,6 +243,8 @@ The session that built it could not publish it the planned way: its access to Gi
 
 One fault was found and fixed on the way to this commit: which film is closed when a sign-in opens a seventh was decided by clock time, which ties on Windows (its clock moves in steps of several milliseconds); it is now decided by order of use.
 
+**v0.3.0 was published on 2026-11-12** by commit message, from a commit whose code is line for line the code that had passed on every system. Afterwards the updater's own code was run against the real release (`LM_LIVE_UPDATE=1 go test ./internal/update -run TestLive`): it is offered v0.3.0, the download matches the release's checksum list, and the package unpacks with every file in it. The ARM Linux check failed in that run on a test that looked at an update's result a moment too early (the new version answers before it has noted that the update went well); the test now waits. ARM does not gate a release.
+
 Installed copies only update themselves from the *second* release on. See "Known and not yet fixed" above for what to repair before that one.
 
 ## 2026-11-12: M4 — started, not finished (stopped to save the owner's usage)
