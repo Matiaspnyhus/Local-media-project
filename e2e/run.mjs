@@ -203,6 +203,11 @@ try {
     await page.keyboard.type('a good password')
     await page.keyboard.press('Enter')
     await page.waitForSelector('text=Films (3)')
+    // The line at the foot of the page describes this version, not the
+    // first one, which played only what a browser plays by itself.
+    const foot = await page.textContent('main')
+    assert.match(foot, /repackaged while you watch/)
+    assert.doesNotMatch(foot, /plays only files your browser can play by itself/)
   })
 
   await step('play a file, keyboard only', async () => {

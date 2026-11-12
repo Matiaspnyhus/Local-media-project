@@ -415,9 +415,10 @@ function Library({
         </>
       )}
       <p className="dim" style={{ marginTop: '2rem' }}>
-        Local Media {state.version}. This early version plays only files your browser can play by itself. The others
-        are marked; converting them arrives in a later version. Posters and descriptions come from TMDB: this product
-        uses the TMDB API but is not endorsed or certified by TMDB.
+        Local Media {state.version}. Files this device cannot play as they are get repackaged while you watch, with
+        their sound converted if need be. Files whose picture would have to be converted are marked; that arrives in a
+        later version. Posters and descriptions come from TMDB: this product uses the TMDB API but is not endorsed or
+        certified by TMDB.
       </p>
     </main>
   )
