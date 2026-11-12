@@ -76,10 +76,10 @@ func recordOpen(record, path string) error {
 var homeAddresses = (*Server).LANURLs
 
 // fromThisPC reports whether a request was made by a browser on the PC the
-// server runs on, showing the server's own page: the two checks that also
-// guard setup (see guard).
+// server runs on, showing the server's own page: the checks that also
+// guard setup (see onThisPC and guard).
 func fromThisPC(r *http.Request) bool {
-	return isLoopback(r) && sameOrigin(r)
+	return onThisPC(r) && sameOrigin(r)
 }
 
 // The PC's video player is started by one press of a button. Nothing

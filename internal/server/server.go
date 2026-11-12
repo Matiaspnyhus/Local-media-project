@@ -145,6 +145,9 @@ func New(cfg Config) (*Server, error) {
 		limiter: newLoginLimiter(), events: &eventLog{}, update: cfg.Update, ffprobe: cfg.FFprobe, caps: map[string]*playback.Caps{},
 		helpers: newHelpers(), opens: newOpenLimiter(),
 	}
+	if name, err := pcName(); err == nil {
+		s.names = namesOf(name)
+	}
 	s.ctx, s.stop = context.WithCancel(context.Background())
 	s.newTMDB = metadata.New
 	s.lookupErr.Store("")
@@ -313,7 +316,13 @@ func (s *Server) guard(rt Route) http.HandlerFunc {
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Content-Security-Policy", "default-src 'self'; img-src 'self' data:; media-src 'self' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'")
 
-		local := isLoopback(r)
+		// Before anything else: was the request sent to an address that is
+		// this server's own? (See answersTo for why that matters.)
+		if !s.answersTo(r.Host) {
+			s.refuseName(w, r)
+			return
+		}
+		local := onThisPC(r)
 		// Until the owner has finished setup, the server answers only the
 		// PC it runs on. Otherwise anyone on the Wi-Fi could claim it.
 		if !s.setupDone.Load() && !local && rt.Pattern != "/health" {
@@ -432,6 +441,118 @@ func isLoopback(r *http.Request) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// pcName is what the PC calls itself on the network. It is a variable so
+// that tests do not depend on the machine they run on.
+var pcName = os.Hostname
+
+// namesOf lists the names other devices at home may know a PC by: its own
+// name as it is, the short form of it, and the short form with ".local"
+// (how phones and Macs find a PC by name on a home network). Nothing else:
+// "mediapc.example.com" is somebody else's name to give out.
+func namesOf(name string) map[string]bool {
+	names := map[string]bool{}
+	name = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), "."))
+	if name == "" {
+		return names
+	}
+	short, _, _ := strings.Cut(name, ".")
+	names[name] = true
+	if short != "" {
+		names[short], names[short+".local"] = true, true
+	}
+	return names
+}
+
+// hostName is the name part of the address a request was sent to (its Host
+// header), in lower case, without the port and without the brackets around
+// an IPv6 address. It is "" for anything that is not a name and a port.
+func hostName(host string) string {
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		for _, c := range port {
+			if c < '0' || c > '9' {
+				return ""
+			}
+		}
+		host = h
+	} else if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return strings.ToLower(host)
+}
+
+// answersTo reports whether host, the address a request says it was sent
+// to, is one of this server's own: an address written as numbers,
+// "localhost", or the PC's own name.
+//
+// Why it matters. A browser decides which page may talk to which server by
+// the name in the address. Somebody who owns a name on the internet can
+// make it point at this PC, or at 127.0.0.1, after a page of theirs has
+// loaded in a browser at home ("DNS rebinding"). Their page then talks to
+// this server as if it were the server's own page, and on the PC itself it
+// arrives from the PC. The one thing that gives it away is the name, which
+// the browser sends along; so a name that is not this server's is answered
+// with nothing. An address written as numbers cannot be pointed elsewhere.
+func (s *Server) answersTo(host string) bool {
+	name := hostName(host)
+	if name == "" {
+		return false
+	}
+	return name == "localhost" || net.ParseIP(name) != nil || s.names[name]
+}
+
+// refuseName answers a request sent to a name that is not this server's.
+// It says how to get here, and nothing about the PC: whoever reads the
+// answer may be a page that should not learn its addresses.
+func (s *Server) refuseName(w http.ResponseWriter, r *http.Request) {
+	if strings.HasPrefix(r.URL.Path, "/api/") || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
+		writeErr(w, http.StatusForbidden, "Local Media does not answer to this address. Use the address with numbers that the PC shows under \"Open on another device\".")
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusForbidden)
+	fmt.Fprintf(w, `<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Local Media</title><body style="font:16px system-ui;margin:2rem;max-width:32rem"><h1>Local Media does not answer to this address</h1><p>On the PC that runs Local Media, open <b>http://localhost:%d</b>. On any other device at home, use the address with numbers that the PC shows under &ldquo;Open on another device&rdquo;.</p>`, s.port)
+}
+
+// passedOn reports whether a request carries any of the marks that a
+// program which passes requests on for others (a proxy, a tunnel) puts on
+// them. A browser adds none of these itself.
+func passedOn(r *http.Request) bool {
+	for name := range r.Header { // names arrive in their standard spelling
+		switch name {
+		case "Forwarded", "Via", "X-Real-Ip", "Cf-Connecting-Ip", "True-Client-Ip":
+			return true
+		}
+		if strings.HasPrefix(name, "X-Forwarded-") {
+			return true
+		}
+	}
+	return false
+}
+
+// onThisPC reports whether a request was made on the PC the server runs
+// on. Three things must all hold:
+//
+//   - the connection comes from the PC itself (see isLoopback);
+//   - it was sent to the PC's address for itself, "localhost" or 127.0.0.1,
+//     which is what the program opens and what no other device can use;
+//   - nothing on it says it was passed on for somebody else. A program on
+//     the PC that lets people in from outside (a tunnel, a reverse proxy)
+//     connects from the PC too, and marks what it forwards (see passedOn).
+//
+// What it cannot tell apart: another person signed in to Windows on the
+// same PC, and a tunnel that forwards without saying so.
+func onThisPC(r *http.Request) bool {
+	if !isLoopback(r) {
+		return false
+	}
+	name := hostName(r.Host)
+	if ip := net.ParseIP(name); name != "localhost" && (ip == nil || !ip.IsLoopback()) {
+		return false
+	}
+	return !passedOn(r)
 }
 
 // sameOrigin rejects writes that another website tries to send through the

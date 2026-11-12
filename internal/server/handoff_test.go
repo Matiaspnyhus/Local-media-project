@@ -176,6 +176,95 @@ func TestOpenLocalOnlyFromTheBrowserOnThePC(t *testing.T) {
 	}
 }
 
+// "The PC's own browser" is a connection from the PC, to the PC's address
+// for itself, that nobody passed on. A page under a foreign name that
+// points at the PC arrives from the PC too; so does everything a tunnel or
+// a proxy on the PC lets in from outside.
+func TestOnlyThePCsOwnAddressCountsAsThePC(t *testing.T) {
+	namedPC(t, "MediaPC")
+	e := newEnv(t)
+	c := e.setup()
+	homeAt(t, "http://"+phoneHost)
+	opened := recordOpens(t)
+	id := e.firstItem(c, "clip")
+	target := "/api/items/" + id + "/open-local"
+	with := func(host string, more map[string]string) map[string]string {
+		h := fromPage(host)
+		for k, v := range more {
+			h[k] = v
+		}
+		return h
+	}
+
+	// A foreign name that points at this computer. Its page cannot even
+	// sign in, and the owner's own sign-in would not help it.
+	const evil = "evil.example:8177"
+	w := e.ask("POST", "/api/login", local, evil, nil, fromPage(evil), `{"name":"owner","password":"a good password"}`)
+	if w.Code != 403 || sessionCookie(w) != nil {
+		t.Errorf("sign-in under a foreign name, from the PC: %d %s", w.Code, w.Body)
+	}
+	if w := e.ask("POST", target, local, evil, c, fromPage(evil), "{}"); w.Code != 403 {
+		t.Errorf("open-local under a foreign name, from the PC: %d %s", w.Code, w.Body)
+	}
+	if w := e.ask("GET", "/api/items/"+id+"/handoff", local, evil, c, map[string]string{"Origin": "http://" + evil}, ""); w.Code != 403 || strings.Contains(w.Body.String(), "thisPC") || strings.Contains(w.Body.String(), "/stream/") {
+		t.Errorf("handoff under a foreign name, from the PC: %d %s", w.Code, w.Body)
+	}
+
+	// From the PC, to one of the server's own addresses, but not the PC's
+	// address for itself; or passed on by something.
+	for _, k := range []struct {
+		name, host string
+		more       map[string]string
+	}{
+		{"the PC's home address (a port passed on by a program on the PC)", phoneHost, nil},
+		{"the PC's own name", "mediapc.local:8177", nil},
+		{"the PC's own short name", "mediapc:8177", nil},
+		{"passed on: X-Forwarded-For", pcHost, map[string]string{"X-Forwarded-For": "203.0.113.9"}},
+		{"passed on: X-Forwarded-For that claims to be the PC", pcHost, map[string]string{"X-Forwarded-For": "127.0.0.1"}},
+		{"passed on: Forwarded", pcHost, map[string]string{"Forwarded": "for=203.0.113.9;host=localhost"}},
+		{"passed on: X-Forwarded-Host", pcHost, map[string]string{"X-Forwarded-Host": "films.example.com"}},
+		{"passed on: X-Forwarded-Proto", pcHost, map[string]string{"X-Forwarded-Proto": "https"}},
+		{"passed on: X-Real-IP", pcHost, map[string]string{"X-Real-IP": "203.0.113.9"}},
+		{"passed on: Via", pcHost, map[string]string{"Via": "1.1 tunnel"}},
+		{"passed on: any other X-Forwarded header", pcHost, map[string]string{"x-forwarded-port": "443"}},
+		{"passed on: a tunnel's own header", pcHost, map[string]string{"CF-Connecting-IP": "203.0.113.9"}},
+		{"passed on: True-Client-IP", pcHost, map[string]string{"True-Client-IP": "203.0.113.9"}},
+		{"passed on: an empty X-Forwarded-For", pcHost, map[string]string{"X-Forwarded-For": ""}},
+	} {
+		if w := e.ask("POST", target, local, k.host, c, with(k.host, k.more), "{}"); w.Code != 403 || !strings.Contains(w.Body.String(), "from the browser on that PC") {
+			t.Errorf("%s: open-local answered %d %s", k.name, w.Code, w.Body)
+		}
+		get := map[string]string{"Origin": "http://" + k.host}
+		for key, v := range k.more {
+			get[key] = v
+		}
+		w := e.ask("GET", "/api/items/"+id+"/handoff", local, k.host, c, get, "")
+		var h handoffAnswer
+		decode(t, w, &h)
+		if w.Code != 200 || h.ThisPC || h.URL == "" {
+			t.Errorf("%s: handoff answered %d %+v, want the link and the file for VLC, as for any other device", k.name, w.Code, h)
+		}
+	}
+	if len(*opened) != 0 {
+		t.Fatalf("a request that was not the PC's own browser opened %q", *opened)
+	}
+
+	// The PC's address for itself, in every spelling a browser uses.
+	for _, k := range []struct{ from, host string }{
+		{local, "localhost:8177"}, {local, "LOCALHOST:8177"}, {local, "127.0.0.1:8177"}, {"[::1]:50000", "[::1]:8177"},
+		{"[::1]:50000", "localhost:8177"}, {local, "localhost"}, {"127.0.0.2:50000", "127.0.0.2:8177"},
+	} {
+		*opened = (*opened)[:0]
+		var h handoffAnswer
+		decode(t, e.ask("GET", "/api/items/"+id+"/handoff", k.from, k.host, c, nil, ""), &h)
+		w := e.ask("POST", target, k.from, k.host, c, fromPage(k.host), "{}")
+		if !h.ThisPC || w.Code != 200 || len(*opened) != 1 {
+			t.Errorf("from %s to %s: handoff says this PC %v; open-local %d %s; opened %q", k.from, k.host, h.ThisPC, w.Code, w.Body, *opened)
+		}
+		later(e, time.Minute)
+	}
+}
+
 func TestOpenLocalOpensOnlyVideosInsideTheLibrary(t *testing.T) {
 	e := newEnv(t)
 	c := e.setup()
