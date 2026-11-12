@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { api, ApiError, type Folders, type Home, type Item, type Diagnostics, type PlayInfo, type Prefs, type Season, type Settings, type Show, type State, type UpdateStatus } from './api'
 import { builtInChunks, measureCaps } from './caps'
+import { Learned } from './Learned'
 import { OpenElsewhere } from './OpenElsewhere'
+import { RULES, lateChunk, look, mark, newWatch, reading, type Evidence, type Watch as StallWatch } from './stall'
 
 type Screen = { name: 'library' } | { name: 'watch'; id: string } | { name: 'show'; id: string }
 
@@ -316,6 +318,7 @@ function Library({
       </div>
 
       {showSettings && <PlaybackCard />}
+      {showSettings && <Learned owner={isOwner} onSignedOut={onSignedOut} />}
       {showSettings && isOwner && <SettingsCard onChanged={load} />}
       {showSettings && isOwner && <UpdateCard />}
       {showConnect && (
@@ -417,9 +420,8 @@ function Library({
       )}
       <p className="dim" style={{ marginTop: '2rem' }}>
         Local Media {state.version}. Files this device cannot play as they are get repackaged while you watch, with
-        their sound converted if need be. Files whose picture would have to be converted are marked; that arrives in a
-        later version. Posters and descriptions come from TMDB: this product uses the TMDB API but is not endorsed or
-        certified by TMDB.
+        their sound or picture converted if need be. Files that cannot be played here even so are marked. Posters and
+        descriptions come from TMDB: this product uses the TMDB API but is not endorsed or certified by TMDB.
       </p>
     </main>
   )
@@ -740,8 +742,38 @@ const mediaErrors: Record<number, string> = {
   4: 'MEDIA_ERR_SRC_NOT_SUPPORTED',
 }
 
-const NO_PICTURE =
-  "This browser can play this file's sound but not its picture. Converting the picture of such files arrives in a later version (M4)."
+// What is said when a film plays with sound and no picture. The PC is told
+// (as trouble showing the picture), converts the picture for this device
+// from then on, and the film is started again converted. These are the
+// words for the moment in between, and for when the PC has nothing to offer.
+const NO_PICTURE = "This device plays this film's sound but no picture."
+const NO_PICTURE_ASKING = NO_PICTURE + ' The PC is being asked to convert the picture into a kind this device can show…'
+const NO_PICTURE_STUCK =
+  NO_PICTURE + ' The PC has no other way of sending this film that would help. "Open in another player" below may play it.'
+
+const STOPPED =
+  'This film stopped while it was being prepared for this browser. Go back and try again; if it keeps happening, export a support bundle.'
+const COULD_NOT_PLAY =
+  'This browser could not play this file. If the app said it could, that is a mistake worth reporting: export a support bundle from the library page.'
+
+// What the page says after a film was started again another way: the PC's
+// sentence about what went wrong and what is different now, or the page's
+// own about something the viewer asked for.
+interface Notice {
+  text: string
+  // Set when the change can be taken back: what to forget, the lighter
+  // picture the viewer had asked for before, and how the film played before.
+  // auto marks a change the app made by itself after trouble. Two of those
+  // in a row are taken back together: Undo then puts the film back to how
+  // it played before the first.
+  undo?: { lessons: string[]; lower: number; method: string; rung: number; auto?: boolean }
+}
+
+// earlier is what an automatic change that follows another has to take
+// back as well.
+function earlier(old: Notice | null): Notice['undo'] | undefined {
+  return old && old.undo && old.undo.auto ? old.undo : undefined
+}
 
 // playedSeconds is how much of the film has really been played since it was
 // handed to the player.
@@ -751,20 +783,60 @@ function playedSeconds(v: HTMLVideoElement): number {
   return total
 }
 
+// How a film is asked for again while it is open.
+interface Again {
+  // The play it replaces (see PlayWish.from).
+  from?: string
+  // The viewer had the film paused: it stays paused when it is back.
+  paused?: boolean
+  then?: (p: PlayInfo) => void
+  // Asked only to see whether anything would change. If this says no, the
+  // film that is playing stays and the one the PC just opened is closed.
+  useIf?: (p: PlayInfo) => boolean
+  otherwise?: () => void
+}
+
 function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; onSignedOut: () => void }) {
   const [info, setInfo] = useState<PlayInfo | null>(null)
   const [error, setError] = useState('')
   const [problem, setProblem] = useState('')
+  const [notice, setNotice] = useState<Notice | null>(null)
+  const [waitStage, setWaitStage] = useState<0 | 1 | 2>(0) // see stall.ts: 1 says the film is being got ready, 2 offers ways out
+  const [hdrSaid, setHdrSaid] = useState('')
   const [tryAnyway, setTryAnyway] = useState(false)
   const [subKey, setSubKey] = useState('') // which subtitles are on; '' for none
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const noticeRef = useRef<HTMLDivElement | null>(null)
+  const infoRef = useRef<PlayInfo | null>(null) // the same as info, for code that runs later
+  infoRef.current = info
   const lastSent = useRef(0)
   const reported = useRef<Record<string, boolean>>({})
-  const carryOn = useRef<number | null>(null) // where to pick up after switching sound, in seconds
+  const carryOn = useRef<number | null>(null) // where to pick up when the film is started again, in seconds of the film's own time
   const first = useRef(true)
   const chunkPlayer = useRef(false)
   const pictureJudged = useRef(false) // a film that arrives as chunks has been checked for a picture
   const asked = useRef(0) // how many times the film has been asked for
+  const left = useRef(false) // the player has been left
+  // What the viewer has asked for in this viewing. It goes with every
+  // request for the film, so that starting it again for one reason does
+  // not undo what was picked for another.
+  const pickedAudio = useRef<number | undefined>(undefined)
+  const lowerWish = useRef(0) // a lighter picture: the best setting that may be used, 0 for any
+  // The watch kept on the player (stall.ts), and what it is told.
+  const watch = useRef<StallWatch>(newWatch(performance.now()))
+  const pending = useRef(true) // a request for the film is on its way
+  const starting = useRef(true) // the film has been handed to the player and has not begun to play
+  const needsTap = useRef(false) // the browser waits for the viewer to press Play
+  const dead = useRef(false) // the player has given up on what it was handed
+  const stayPaused = useRef(false) // the film being handed over is not to start by itself
+  const troubleOut = useRef(false) // a report of trouble is on its way
+  const stateAsked = useRef(false) // the PC has been asked how this conversion is going
+  const noPictureSaid = useRef(false) // what the page says is wrong is "sound but no picture"
+  const focusNotice = useRef(false) // the next notice takes the keyboard's place: the button that led to it is gone
+  const hdrBusy = useRef(false)
+  // The viewer undid a change. From then on nothing is changed by itself
+  // for as long as this film is open: they have said how they want it.
+  const leftAlone = useRef(false)
 
   // Each request for the film is numbered and only the newest one's answer
   // is used. When the sound is changed twice in a row the answers can come
@@ -772,23 +844,40 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
   // carry on from. The PC opens the film for every answer, so one that is
   // not used is closed again.
   const load = useCallback(
-    (audio?: number) => {
+    (how: Again = {}) => {
+      // Once the player has been left nothing more is asked for: an answer
+      // that came then would open a film on the PC with nobody to close it.
+      if (left.current) return
       const n = ++asked.current
+      pending.current = true
       api
-        .play(id, audio)
+        .play(id, { audio: pickedAudio.current, lower: lowerWish.current, from: how.from })
         .then((p) => {
           if (n !== asked.current) {
-            if (p.hls) api.hlsStop(p.hls)
+            if (p.play) api.hlsStop(p.play)
             return
           }
-          if (carryOn.current !== null) p.positionMs = Math.floor(carryOn.current * 1000)
+          pending.current = false
+          if (how.useIf && !how.useIf(p)) {
+            if (p.play) api.hlsStop(p.play)
+            carryOn.current = null
+            if (how.otherwise) how.otherwise()
+            return
+          }
+          // The place is kept in the film's own time. This player's clock
+          // may run a little ahead of it.
+          if (carryOn.current !== null) p.positionMs = Math.max(0, Math.floor(carryOn.current * 1000) + (p.clockAheadMs || 0))
           carryOn.current = null
           if (first.current) setSubKey(p.subtitles.find((s) => s.selected)?.key || '')
           first.current = false
+          stayPaused.current = !!how.paused
           setInfo(p)
+          if (how.then) how.then(p)
         })
         .catch((e: ApiError) => {
           if (n !== asked.current) return
+          pending.current = false
+          focusNotice.current = false
           if (e.status === 401) onSignedOut()
           else setError(e.message)
         })
@@ -796,13 +885,30 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     [id, onSignedOut],
   )
   useEffect(() => {
+    left.current = false
     first.current = true
+    pickedAudio.current = undefined
+    lowerWish.current = 0
+    leftAlone.current = false
     load()
     // An answer that arrives after the player has been left is not used.
     return () => {
       asked.current++
+      left.current = true
     }
   }, [load])
+
+  // keepPlace notes where the film is, so that it carries on from there
+  // when it is started again. While it is still starting again after an
+  // earlier change its clock reads nothing, and the place to keep is the
+  // one it was about to start from.
+  const keepPlace = useCallback(() => {
+    const v = videoRef.current
+    const cur = infoRef.current
+    const ahead = ((cur && cur.clockAheadMs) || 0) / 1000
+    if (v && v.currentTime > 0) carryOn.current = Math.max(0, v.currentTime - ahead)
+    else if (carryOn.current === null && cur) carryOn.current = Math.max(0, cur.positionMs / 1000 - ahead)
+  }, [])
 
   const report = useCallback(
     (kind: string, detail: string) => {
@@ -811,6 +917,112 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       api.clientEvent(kind, id, detail)
     },
     [id],
+  )
+
+  // again starts the film afresh where it is, without a word: nothing went
+  // wrong that the viewer could do anything about. A film the viewer had
+  // paused stays paused.
+  const again = useCallback(
+    (cur: PlayInfo) => {
+      const v = videoRef.current
+      keepPlace()
+      load({ from: cur.play, paused: !!v && v.paused && !starting.current })
+    },
+    [load, keepPlace],
+  )
+
+  // tell reports trouble in the film that is playing to the PC, which
+  // answers what to do about it: start the film again (it has changed how
+  // the film is sent, and may have learned something about this device),
+  // or leave it. The film is then started again where it is, and the PC's
+  // sentence is shown with a way to take the change back.
+  //
+  // onWait is called with the PC's sentence ('' when it has none) when the
+  // film is to be left as it is, or the PC could not be asked. Without it
+  // the sentence is simply shown. The result says whether a report went
+  // out: one at a time, and none for a film the PC has no name for.
+  const tell = useCallback(
+    (evidence: Evidence, detail: string, onWait?: (said: string) => void): boolean => {
+      const cur = infoRef.current
+      if (!cur || !cur.play || troubleOut.current) return false
+      troubleOut.current = true
+      api
+        .trouble(cur.play, evidence, detail)
+        .then((ans) => {
+          if (infoRef.current !== cur) return // the film has been started again for another reason meanwhile
+          if (ans.action !== 'replay') {
+            if (onWait) onWait(ans.notice)
+            // (What was changed before this can still be taken back.)
+            else if (ans.notice) setNotice((old) => ({ text: ans.notice, undo: earlier(old) }))
+            return
+          }
+          keepPlace()
+          load({
+            from: cur.play,
+            then: () => {
+              noPictureSaid.current = false
+              setProblem('')
+              setNotice((old) => {
+                const first = earlier(old)
+                return {
+                  text: ans.notice || 'The film was started again in a way that should play better on this device.',
+                  undo: {
+                    auto: true,
+                    lessons: (first ? first.lessons : []).concat(ans.lessons || []),
+                    lower: first ? first.lower : lowerWish.current,
+                    method: first ? first.method : cur.plan.method,
+                    rung: first ? first.rung : cur.plan.video.rung,
+                  },
+                }
+              })
+            },
+          })
+        })
+        .catch((e: ApiError) => {
+          if (infoRef.current !== cur) return
+          // The PC takes no report about a film it no longer has open (it
+          // was restarted, say). That is why the film stands still: it is
+          // started again where it is.
+          if (e.status === 403) again(cur)
+          else if (e.status === 401) onSignedOut()
+          // Too many reports in a short time, or the PC is out of reach:
+          // the film is left as it is.
+          else if (onWait) onWait('')
+        })
+        .then(() => {
+          troubleOut.current = false
+        })
+      return true
+    },
+    [load, keepPlace, again, onSignedOut],
+  )
+
+  // askPC asks how the film is doing on the PC. If the PC no longer has it
+  // open (it was restarted, say, while the phone was locked), the film is
+  // started again. If the PC says it converts slower than the film plays,
+  // that is reported as the trouble it is about to become, without waiting
+  // for the film to stall. otherwise is called when the film is still open.
+  const askPC = useCallback(
+    (otherwise?: () => void) => {
+      const cur = infoRef.current
+      if (!cur || !cur.play) return otherwise && otherwise()
+      api
+        .playState(cur.play)
+        .then((st) => {
+          if (infoRef.current !== cur) return
+          if (!st.alive) return again(cur)
+          const v = videoRef.current
+          if (st.advice === 'lower' && !leftAlone.current && v && !v.paused)
+            tell('starved', `the PC said it converts ${st.pace} seconds of film a second`)
+          if (otherwise) otherwise()
+        })
+        .catch((e: ApiError) => {
+          if (infoRef.current !== cur) return
+          if (e.status === 401) onSignedOut()
+          else if (otherwise) otherwise()
+        })
+    },
+    [again, tell, onSignedOut],
   )
 
   const save = useCallback(
@@ -835,6 +1047,44 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       document.removeEventListener('visibilitychange', onHide)
     }
   }, [save])
+
+  // When the page is looked at again (the phone was unlocked, the tab was
+  // brought back), the film may have been closed on the PC meanwhile.
+  useEffect(() => {
+    const shown = () => {
+      if (document.visibilityState !== 'visible') return
+      mark(watch.current, performance.now())
+      askPC()
+    }
+    const onShow = (e: PageTransitionEvent) => {
+      if (e.persisted) shown()
+    }
+    document.addEventListener('visibilitychange', shown)
+    window.addEventListener('pageshow', onShow)
+    return () => {
+      document.removeEventListener('visibilitychange', shown)
+      window.removeEventListener('pageshow', onShow)
+    }
+  }, [askPC])
+
+  // Twice a second the player is looked at (see stall.ts): how long the
+  // viewer has been waiting for a film that should be moving, and whether
+  // it is in trouble the PC should hear about.
+  useEffect(() => {
+    const t = window.setInterval(() => {
+      const v = videoRef.current
+      const now = performance.now()
+      const hidden = document.visibilityState === 'hidden'
+      const seen =
+        v && !dead.current
+          ? reading(v, now, starting.current && !needsTap.current, hidden)
+          : { now, playing: false, starting: !v && pending.current, time: 0, ready: 0, hidden }
+      const found = look(watch.current, seen)
+      setWaitStage(found.stage)
+      if (found.trouble && !leftAlone.current) tell(found.trouble.evidence, found.trouble.detail)
+    }, RULES.everyMs)
+    return () => window.clearInterval(t)
+  }, [tell])
 
   const showPlayer = !!info && (info.plan.playable !== 'no' || tryAnyway)
 
@@ -863,6 +1113,11 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
   // film plays again after every jump) whatever is showing is left alone,
   // which may be subtitles the viewer switched on in the browser's own menu.
   const onPlaying = () => {
+    if (starting.current) {
+      // The start is over. A moment's wait just after it is still normal.
+      starting.current = false
+      mark(watch.current, performance.now())
+    }
     if (started.current) return
     started.current = true
     applySubs()
@@ -875,7 +1130,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
   useEffect(() => {
     const v = videoRef.current
     if (!info || !showPlayer || !v) return
-    const token = info.hls
+    const token = info.play || info.hls
     const stop = () => token && api.hlsStop(token)
     // Leaving the page for good stops the conversion at once. But a browser
     // may only put the page aside, to bring it back exactly as it was when
@@ -885,13 +1140,24 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     // work. If the page never comes back, the PC stops converting by itself
     // after a little over a minute without requests.
     const onHide = (e: PageTransitionEvent) => {
-      if (!e.persisted) stop()
+      if (e.persisted) return
+      // The page is going for good. The film is closed on the PC, and must
+      // not be asked for again by a player that finds its film closed.
+      left.current = true
+      stop()
     }
     window.addEventListener('pagehide', onHide)
     chunkPlayer.current = false
     pictureJudged.current = false
+    stateAsked.current = false
+    dead.current = false
+    needsTap.current = false
+    starting.current = true
+    // A new watch for a new start. A wait that is already under way (for
+    // the PC's answer, or for the film this one replaces) goes on counting.
+    watch.current = newWatch(performance.now(), watch.current.waitSince)
     subsOff()
-    if (!token || builtInChunks()) {
+    if (!info.hls || builtInChunks()) {
       v.src = info.url
       return () => {
         window.removeEventListener('pagehide', onHide)
@@ -911,10 +1177,34 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
           startPosition: info.positionMs > 0 && info.positionMs < info.durationMs - 5000 ? info.positionMs / 1000 : -1,
           maxBufferLength: 30,
           maxMaxBufferLength: 60,
+          // A chunk may take a while to begin arriving: after a jump the PC
+          // has to convert the film up to it first. Only after half a
+          // minute is it taken for lost and asked for again.
+          fragLoadPolicy: { default: { ...Hls.DefaultConfig.fragLoadPolicy.default, maxTimeToFirstByteMs: 30000 } },
         })
         player = hls
         let recovered = false
+        let refused = false
         hls.on(Hls.Events.ERROR, (_e, data) => {
+          // Parts of a film are refused once the PC no longer has the film
+          // open (it was restarted, or this sign-in has opened many films
+          // since). The player may go on asking for a while before it
+          // gives up; the PC is asked at the first refusal, and if the
+          // film is indeed gone it is started again where it is.
+          if (data.response && data.response.code === 403 && !refused) {
+            refused = true
+            if (data.fatal) dead.current = true
+            askPC(data.fatal ? () => setProblem(STOPPED) : undefined)
+            return
+          }
+          // The player running dry (hls.js calls it bufferStalledError) is
+          // seen by the watch itself, in every browser. A chunk that did
+          // not begin to arrive in half a minute is trouble of the same
+          // kind even if the player still holds film to show meanwhile.
+          if (data.details === Hls.ErrorDetails.FRAG_LOAD_TIMEOUT && !leftAlone.current) {
+            const late = lateChunk(watch.current, performance.now(), !v.paused && !v.ended)
+            if (late) tell(late.evidence, late.detail)
+          }
           if (!data.fatal) return
           if (data.type === Hls.ErrorTypes.MEDIA_ERROR && !recovered) {
             recovered = true
@@ -922,8 +1212,19 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
             hls.recoverMediaError()
             return
           }
-          setProblem('This film stopped while it was being repackaged for this browser. Go back and try again; if it keeps happening, export a support bundle.')
-          report('convert-error', `${info.container} ${info.plan.method} ${data.type} ${data.details}`)
+          dead.current = true
+          const stopped = () => {
+            setProblem(STOPPED)
+            report('convert-error', `${info.container} ${info.plan.method} ${data.type} ${data.details}`)
+          }
+          if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+            // The player has given up on the picture twice. The PC may
+            // have an easier one to send.
+            if (leftAlone.current || !tell('decode', `the player gave up on the film: ${data.details}`, (said) => (said ? setProblem(said) : stopped())))
+              stopped()
+            return
+          }
+          stopped()
         })
         hls.loadSource(info.url)
         hls.attachMedia(v)
@@ -935,7 +1236,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       if (player) player.destroy()
       stop()
     }
-  }, [info, showPlayer, report, subsOff])
+  }, [info, showPlayer, report, subsOff, tell, askPC])
 
   // A choice of subtitles takes effect at once if the film is playing. If
   // it is not yet, the choice is kept and takes effect when it is.
@@ -944,6 +1245,14 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     applySubs()
   }, [info, showPlayer, subKey, applySubs])
 
+  // A notice that follows the press of a button takes the keyboard's place
+  // on the page: the button is gone, or will be in a moment.
+  useEffect(() => {
+    if (!notice || !focusNotice.current) return
+    focusNotice.current = false
+    if (noticeRef.current) noticeRef.current.focus()
+  }, [notice])
+
   const remember = (audioIndex: number, sub: string) => {
     if (!info) return
     const a = info.audio[audioIndex]
@@ -951,23 +1260,113 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     api.choice(id, { audioLang: a?.language || '', subLang: s?.language || '', subsOn: !!s, audioIndex: a ? audioIndex : -1, subKey: s ? s.key : '' })
   }
   const pickAudio = (index: number) => {
-    const v = videoRef.current
-    // Carry on from where the film is. While it is still starting again
-    // after an earlier change its clock reads nothing, and the place to
-    // keep is the one it was about to start from.
-    if (v && v.currentTime > 0) carryOn.current = v.currentTime
-    else if (carryOn.current === null && info) carryOn.current = info.positionMs / 1000
+    keepPlace()
     remember(index, subKey)
-    load(index)
+    pickedAudio.current = index
+    load({ from: info ? info.play : undefined })
   }
   const pickSub = (key: string) => {
     setSubKey(key)
     remember(info ? info.plan.audioTrack : -1, key)
   }
 
+  // The same film as before? Starting it again would then be for nothing.
+  const sameWay = (p: PlayInfo, q: PlayInfo) => p.plan.method === q.plan.method && p.plan.video.rung === q.plan.video.rung
+
+  // lighter asks for the film with a lighter picture: quicker for the PC to
+  // make and for the connection to carry.
+  const lighter = () => {
+    const cur = infoRef.current
+    if (!cur || !cur.lighter) return
+    const before = lowerWish.current
+    lowerWish.current = cur.lighter
+    focusNotice.current = true
+    keepPlace()
+    load({
+      from: cur.play,
+      useIf: (p) => !sameWay(p, cur),
+      then: () =>
+        setNotice({
+          text: 'The film now plays with a lighter picture, which is quicker for the PC to make and to send.',
+          undo: { lessons: [], lower: before, method: cur.plan.method, rung: cur.plan.video.rung },
+        }),
+      otherwise: () => {
+        lowerWish.current = before
+        setNotice({ text: 'This is already the lightest picture this PC can make of this film.' })
+      },
+    })
+  }
+
+  // undo takes back the change the notice is about: what the app learned
+  // from it is forgotten, and the film is started again as a new viewing
+  // would start it.
+  const undo = () => {
+    const u = notice && notice.undo
+    if (!u) return
+    leftAlone.current = true
+    lowerWish.current = u.lower
+    focusNotice.current = true
+    Promise.all(u.lessons.map((l) => api.forgetLesson(l).catch(() => undefined))).then(() => {
+      keepPlace()
+      load({
+        then: (p) =>
+          setNotice({
+            text:
+              p.plan.method === u.method && p.plan.video.rung === u.rung
+                ? 'Undone: the film plays the way it did before' +
+                  (u.lessons.length > 0 ? ', and what the app had just learned is forgotten' : '') +
+                  '. Nothing more is changed by itself while this film is open.'
+                : 'The change could not be taken back completely: the PC still sends this film another way than before. If that comes from what the PC has learned about its own speed, the owner can have it forgotten under Settings.',
+          }),
+      })
+    })
+  }
+
+  // The viewer says HDR colours look wrong on this device. The PC notes it
+  // and from then on converts HDR films to normal colour for this device,
+  // where it can. Where it cannot, the film that is playing is left alone.
+  const coloursWrong = () => {
+    const cur = infoRef.current
+    if (!cur || hdrBusy.current) return
+    hdrBusy.current = true
+    setHdrSaid('One moment…')
+    api
+      .hdrWrong(true)
+      .then((r) => {
+        focusNotice.current = true
+        keepPlace()
+        load({
+          from: cur.play,
+          useIf: (p) => !sameWay(p, cur),
+          then: () => {
+            setHdrSaid('')
+            setNotice({
+              text: 'Noted. HDR films are now converted to normal colour for this device.',
+              undo: { lessons: r.lesson ? [r.lesson] : [], lower: lowerWish.current, method: cur.plan.method, rung: cur.plan.video.rung },
+            })
+          },
+          otherwise: () => {
+            focusNotice.current = false
+            setHdrSaid(
+              'Noted. It is listed in Settings under "Learned about this device". Nothing changes for this film, though: this PC cannot convert its colours for this device. "Open in another player" below may show them right.',
+            )
+          },
+        })
+      })
+      .catch((e: ApiError) => (e.status === 401 ? onSignedOut() : setHdrSaid(e.message)))
+      .then(() => {
+        hdrBusy.current = false
+      })
+  }
+
   const noPicture = () => {
-    setProblem(NO_PICTURE)
     report('no-picture', `${info?.container} videoWidth=0`)
+    noPictureSaid.current = true
+    const stuck = (said: string) => {
+      if (noPictureSaid.current) setProblem(said ? NO_PICTURE + ' ' + said : NO_PICTURE_STUCK)
+    }
+    if (!leftAlone.current && tell('decode', 'sound but no picture: the picture has no size', stuck)) setProblem(NO_PICTURE_ASKING)
+    else stuck('')
   }
 
   const onLoaded = () => {
@@ -976,6 +1375,22 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     // hls.js was told where to start; everything else is told here.
     if (!chunkPlayer.current && info.positionMs > 0 && info.positionMs / 1000 < v.duration - 5) v.currentTime = info.positionMs / 1000
     applySubs() // a track the browser switched on by itself goes off again, like the rest
+    if (stayPaused.current) {
+      // The viewer had the film paused when it was started again.
+      stayPaused.current = false
+      needsTap.current = true
+      v.pause()
+    } else if (v.paused) {
+      // The film starts by itself where the browser lets it. It is asked
+      // here as well, because the answer tells two waits apart: a browser
+      // that will not start a film until the viewer presses Play says so
+      // at once, and one that is still fetching the film does not.
+      const going = v.play()
+      if (going)
+        going.catch((e: unknown) => {
+          if (e && (e as { name?: string }).name === 'NotAllowedError') needsTap.current = true
+        })
+    }
     // An ordinary file knows the size of its picture by now, so no size
     // means no picture. A film that arrives as chunks may not know it yet:
     // Safari's own chunk player learns it a moment later. That case is
@@ -983,11 +1398,21 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     if (!info.hls && v.videoWidth === 0) noPicture()
   }
 
+  // A browser that stops fetching a film it has not begun to play is
+  // waiting for the viewer to press Play (an iPhone saving data does this).
+  const onSuspend = () => {
+    const v = videoRef.current
+    if (v && v.paused && starting.current) needsTap.current = true
+  }
+
   // The size of the picture has become known, so there is a picture after
   // all.
   const onResize = () => {
     const v = videoRef.current
-    if (v && v.videoWidth > 0) setProblem((p) => (p === NO_PICTURE ? '' : p))
+    if (v && v.videoWidth > 0 && noPictureSaid.current) {
+      noPictureSaid.current = false
+      setProblem('')
+    }
   }
 
   const onTime = () => {
@@ -1009,16 +1434,31 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       pictureJudged.current = true
       if (v.videoWidth === 0) noPicture()
     }
+    // Twelve seconds into a film whose picture is being converted, the PC
+    // knows how fast it is going. If that is slower than the film plays,
+    // it is better to step down now than to wait for the film to stall.
+    if (v && info?.plan.method === 'convert' && !stateAsked.current && playedSeconds(v) > 12) {
+      stateAsked.current = true
+      askPC()
+    }
   }
 
   const onError = () => {
     const v = videoRef.current
     if (chunkPlayer.current) return // hls.js reports its own errors, with more detail
     const code = v?.error?.code || 0
-    setProblem(
-      'This browser could not play this file. If the app said it could, that is a mistake worth reporting: export a support bundle from the library page.',
-    )
-    report('play-error', `${info?.container} ${info?.plan.method} ${mediaErrors[code] || 'code ' + code} ${v?.error?.message || ''}`.trim())
+    dead.current = true
+    const could = () => {
+      setProblem(COULD_NOT_PLAY)
+      report('play-error', `${info?.container} ${info?.plan.method} ${mediaErrors[code] || 'code ' + code} ${v?.error?.message || ''}`.trim())
+    }
+    // The browser began on the film and gave up on what is in it: the PC
+    // may have an easier picture to send.
+    if (code === 3 && !leftAlone.current && tell('decode', 'the browser gave up on the film while playing it', (said) => (said ? setProblem(said) : could()))) return
+    // A link to a file runs out after some hours, and stops working when
+    // the PC is restarted: the film is then simply started again.
+    if (code === 2 || code === 4) askPC(could)
+    else could()
   }
 
   // "Open in another player" is offered under the player and where a film
@@ -1037,6 +1477,10 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       onSignedOut={onSignedOut}
     />
   )
+  const unplayable = !!info && info.plan.playable === 'no' && !tryAnyway
+  // Where the film is, or is on its way: the player, or the wait for the
+  // PC's first answer.
+  const waitingRoom = showPlayer || (!info && !error)
 
   return (
     <main>
@@ -1046,7 +1490,25 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       </div>
       {error && <p className="error" role="alert">{error}</p>}
       {problem && <p className="note" role="alert" data-testid="play-problem">{problem}</p>}
-      {info && info.plan.playable === 'no' && !tryAnyway && (
+      <div className={notice ? 'notice' : undefined} role="status" tabIndex={-1} ref={noticeRef} data-testid="step-notice">
+        {notice && (
+          <>
+            <p data-testid="step-said">{notice.text}</p>
+            {notice.undo && (
+              <p>
+                <button type="button" data-testid="step-undo" onClick={undo}>
+                  Undo
+                </button>{' '}
+                <span className="dim">
+                  Undo plays the film the way it was
+                  {notice.undo.lessons.length > 0 ? ', and the app forgets what it has just learned' : ''}.
+                </span>
+              </p>
+            )}
+          </>
+        )}
+      </div>
+      {info && unplayable && (
         <div className="card" role="alert" data-testid="play-problem">
           <p>{info.explain}</p>
           <ul>
@@ -1069,8 +1531,11 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
             preload="metadata"
             data-method={info.plan.method}
             data-rung={info.plan.method === 'convert' ? info.plan.video.rung : undefined}
+            data-subtitles={info.plan.subtitles !== 'none' ? info.plan.subtitles : subKey ? 'track' : 'none'}
             onLoadedMetadata={onLoaded}
             onPlaying={onPlaying}
+            onSeeking={() => mark(watch.current, performance.now())}
+            onSuspend={onSuspend}
             onResize={onResize}
             onTimeUpdate={onTime}
             onPause={() => save(true)}
@@ -1108,6 +1573,17 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
               </label>
             )}
           </div>
+        </>
+      )}
+      {waitingRoom && (
+        // What the page says about a film that should be moving and is
+        // not: these words after three seconds, ways out after twelve.
+        <div role="status" data-testid="wait-words">
+          {waitStage >= 1 && <p className="dim">Still getting the film ready…</p>}
+        </div>
+      )}
+      {info && showPlayer && (
+        <>
           {info.pictureSubtitles > 0 && (
             <p className="dim">
               This file also has {info.pictureSubtitles} subtitle {info.pictureSubtitles === 1 ? 'track' : 'tracks'} stored as pictures
@@ -1137,9 +1613,46 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
                 </ul>
               </>
             )}
+            {info.hdr && (
+              <div data-testid="hdr">
+                <p className="dim">
+                  This film is in HDR (extra bright and rich colour) and is sent as it is. If its colours look washed out, dull or odd on this
+                  screen, say so: the PC then converts HDR films to normal colour for this device, where it can.
+                </p>
+                <button type="button" data-testid="hdr-wrong" onClick={coloursWrong}>
+                  Colours look wrong on this device
+                </button>
+                <div role="status" data-testid="hdr-said">
+                  {hdrSaid && <p>{hdrSaid}</p>}
+                </div>
+              </div>
+            )}
           </details>
-          {elsewhere}
         </>
+      )}
+      {waitingRoom && (
+        // After twelve seconds of waiting this becomes a card with ways
+        // out. "Open in another player" is in it, and stays where it is
+        // when the card comes and goes, so the keyboard's place on it is
+        // never lost.
+        <div className={waitStage === 2 ? 'card waiting' : undefined} data-testid={waitStage === 2 ? 'wait-card' : undefined}>
+          {waitStage === 2 && (
+            <>
+              <p>This is taking a long time. You can go on waiting, or:</p>
+              <div className="bar">
+                {info && showPlayer && info.lighter > 0 && (
+                  <button type="button" data-testid="wait-lighter" onClick={lighter}>
+                    Play with a lighter picture
+                  </button>
+                )}
+                <button type="button" data-testid="wait-back" onClick={onBack}>
+                  Go back
+                </button>
+              </div>
+            </>
+          )}
+          {(showPlayer || waitStage === 2) && elsewhere}
+        </div>
       )}
     </main>
   )

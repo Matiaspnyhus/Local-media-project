@@ -129,6 +129,21 @@ export interface PlayInfo {
   // Set when the film reaches the player as a list of chunks (repackaged,
   // perhaps with its sound converted) rather than as the original file.
   hls?: string
+  // The name this play goes by on the PC: for reporting trouble in it, for
+  // asking how it is doing, for closing it, and for telling the PC which
+  // play a new one replaces. The same as hls for a film sent in chunks; ''
+  // for a film that cannot be played.
+  play: string
+  // The setting to ask for (lower) when the viewer wants a lighter picture
+  // than this one; 0 when none is made.
+  lighter: number
+  // How far this player's clock runs ahead of the film's own time, in
+  // milliseconds: 0 for nearly every film. positionMs is on the player's
+  // clock already.
+  clockAheadMs: number
+  // The film's picture is HDR and is sent as it is, so its colours are for
+  // the device to get right.
+  hdr: boolean
   explain: string
   plan: PlayPlan
   audio: AudioTrack[]
@@ -175,6 +190,65 @@ export interface Prefs {
   audioLang: string
   subLang: string
   subs: 'auto' | 'always' | 'off'
+  // Subtitles that have a design of their own: shown as designed, or as
+  // plain text. Kept by the PC; nothing on the page sets it yet.
+  styled: 'designed' | 'plain'
+}
+// What to ask for when a film is opened, beyond the film itself.
+export interface PlayWish {
+  audio?: number // the sound track the viewer picked
+  // A lighter picture: the number of the best setting that may be used
+  // (see PlayVideo.rung and PlayInfo.lighter).
+  lower?: number
+  // The play this one replaces (PlayInfo.play): the same film started again
+  // with another sound track, a lighter picture, or after trouble. The new
+  // play then carries on what the old one had come to.
+  from?: string
+}
+// What the PC answers to a report of trouble in a film that is playing.
+export interface TroubleAnswer {
+  // replay: start the film again where it is, naming this play as "from".
+  // wait: leave it playing.
+  action: 'replay' | 'wait'
+  notice: string // one sentence for the viewer; '' when there is nothing to say
+  lower: number // for information only; it is not sent back
+  // What the report taught about this device. Forgetting these and playing
+  // again without "from" undoes the step.
+  lessons: string[]
+}
+// How a film the page has open is doing on the PC.
+export interface PlayState {
+  alive: boolean // false: the PC no longer has this film open, so it must be asked for again
+  method: string
+  rung: number
+  pace: number // seconds of film the PC converts in a second; means nothing while chunks is under two
+  chunks: number
+  advice: '' | 'lower' // lower: the PC converts slower than the film plays, and a lighter picture would help
+}
+// One thing that was learned from trouble while playing, in the PC's words.
+export interface Lesson {
+  id: string
+  kind: 'picture' | 'height' | 'rate' | 'hdr' | 'draw' | 'speed'
+  text: string
+  learnedAt: string // both as written by the PC: 2026-11-12T20:26:26Z
+  expiresAt: string
+}
+// A device as the PC knows it: by kind ("iPhone", "Windows PC, Chrome"),
+// never by a name.
+export interface Device {
+  label: string
+  hdrWrong: boolean // the viewer said HDR colours look wrong on it
+  lessons: Lesson[]
+}
+export interface KnownDevice extends Device {
+  id: string
+  lastSeenAt: string
+  thisDevice?: boolean
+}
+// Every device, and what was learned about this PC's own speed.
+export interface Devices {
+  devices: KnownDevice[]
+  pc: { lessons: Lesson[] }
 }
 export interface Diagnostics {
   device: Caps | null
@@ -240,10 +314,29 @@ export const api = {
   setAutoUpdate: (on: boolean) => call<{ ok: boolean }>('PUT', '/api/settings/auto-update', { on }),
   health: () => call<{ status: string; version: string }>('GET', '/health'),
   capabilities: (c: Caps) => call<{ ok: boolean }>('POST', '/api/capabilities', c),
-  // lower asks for a lighter picture: the number of the best setting that
-  // may be used (see PlayVideo.rung).
-  play: (id: string, audio?: number, lower?: number) =>
-    call<PlayInfo>('POST', `/api/items/${id}/play`, { ...(audio === undefined ? {} : { audio }), ...(lower ? { lower } : {}) }),
+  play: (id: string, wish: PlayWish = {}) =>
+    call<PlayInfo>('POST', `/api/items/${id}/play`, {
+      ...(wish.audio === undefined ? {} : { audio: wish.audio }),
+      ...(wish.lower ? { lower: wish.lower } : {}),
+      ...(wish.from ? { from: wish.from } : {}),
+    }),
+  // Tells the PC that a film it is sending has run into trouble here.
+  // evidence says what kind (see stall.ts); detail is a few words for the
+  // PC's log.
+  trouble: (token: string, evidence: 'decode' | 'starved' | 'renderer', detail: string) =>
+    call<TroubleAnswer>('POST', `/api/hls/${token}/trouble`, { evidence, detail }),
+  playState: (token: string) => call<PlayState>('GET', `/api/hls/${token}/state`),
+  // What was learned about this device, and about every device (the owner).
+  device: () => call<Device>('GET', '/api/device'),
+  forgetLesson: (lessonId: string) => call<{ ok: boolean }>('DELETE', `/api/device/lessons/${lessonId}`),
+  // The viewer's word that HDR colours look wrong on this device, or that
+  // they look right after all. lesson names what was kept ('' for off).
+  hdrWrong: (on: boolean) => call<{ ok: boolean; on: boolean; lesson: string }>('POST', '/api/device/hdr-wrong', { on }),
+  devices: () => call<Devices>('GET', '/api/devices'),
+  // deviceId is a device's id from the list, or 'pc' for what was learned
+  // about this PC's own speed.
+  forgetDeviceLesson: (deviceId: string, lessonId: string) =>
+    call<{ ok: boolean }>('DELETE', `/api/devices/${deviceId}/lessons/${encodeURIComponent(lessonId)}`),
   // What the viewer picked while watching. The tracks themselves are sent
   // (audioIndex, -1 for none; subKey, '' for off) as well as their
   // languages: the same film is opened again with exactly those tracks,
