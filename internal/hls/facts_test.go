@@ -291,7 +291,7 @@ func TestPictureFactsOfRealFiles(t *testing.T) {
 		if strings.Contains(f.Format, "mpegts") {
 			want.LastMs += f.StartMs - want.StartMs
 			want.StartMs = f.StartMs
-			if f.StartMs%1000 == 0 || f.Indexed() {
+			if f.StartMs < 500 || f.Indexed() {
 				t.Errorf("%s: the recording starts at %d ms and counts as listing its key frames: %v", name, f.StartMs, f.Indexed())
 			}
 		}

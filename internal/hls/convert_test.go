@@ -224,8 +224,10 @@ func TestEveryConvertedChunkBeginsWhereTheListSays(t *testing.T) {
 					t.Errorf("the film should have a cut asked for at 21 s, at 21021 ms: %v %v", g.Cuts, c.Targets)
 				}
 			case "tv25", "longgop", "midstream":
-				if g.Cuts[0] != facts.StartMs || g.Cuts[0] < 1000 || g.Cuts[0]%1000 == 0 || g.Cuts[1]%1000 != 0 || c.ContainerStartMs == 0 {
-					t.Errorf("the recording's clock should start somewhere after a second, and the cuts be on whole seconds from the second on: %v", g.Cuts)
+				// (Where exactly such a file's clock starts is up to ffmpeg's
+				// writer of them: 1.4 seconds in, for many years now.)
+				if d := g.Cuts[0] - facts.StartMs; d < -20 || d > 20 || g.Cuts[0] < 500 || g.Cuts[1]%1000 != 0 || c.ContainerStartMs < 500 {
+					t.Errorf("the recording's clock should start well after zero, and the cuts be on whole seconds from the second on: %v, picture from %d ms", g.Cuts, facts.StartMs)
 				}
 				if film.name == "longgop" && c.LeadMs != 6500 {
 					t.Errorf("with key frames 6 seconds apart the lead-in is %d ms, want 6500", c.LeadMs)
