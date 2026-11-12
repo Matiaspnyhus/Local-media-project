@@ -213,4 +213,27 @@ Before the first release, the M3 code was read by seven independent reviewers, e
 - *A page the browser only puts aside* (the back/forward cache, or leaving Safari and coming back) keeps its film open; pages that never return are covered by the 75-second idle stop.
 - The browser test grew from 15 steps to 20 and now covers each of these.
 
+**The second check.** Each set of repairs was then checked by a reviewer who had not written it. All but one repair held (the one that did not, sound from TV recordings, needed the server to tell the converter what it was passing on, which the joining commit added). The check found 13 further faults, most of them small, and a repair round fixed them: a change of sound alone is no longer remembered as a wish about subtitles; a file is called WebM by what is inside it, not by its name; a device's report is kept in memory when it cannot be written down; the program's own folder stays out of the log; Safari's claim to play 10-bit H.264 is not believed (it shows no picture); a film whose key frames are over a minute apart is cut at the key frames it has, if reading it through found them; a jump given up while the converter was stopping no longer leaves chunks behind. The last repair helper (converter) was stopped early to save the owner's usage; what it had committed is merged and tested, what it had not is not.
+
 **Not done.** Nothing here has run on a real iPhone or in Safari itself, only in Safari's engine on the macOS test machine; the owner's checklist is the first real test. Two copies started on purpose with different ports on the same data folder are still not caught.
+
+**Known and not yet fixed** (found by the review's last pass, which looked for what the first seven reviewers had no brief for; each was confirmed by a second reviewer; none stops ordinary use):
+- A read error or a cut-short file in mid-film is taken for the end of the film: chunks after it answer "not found", nothing is logged, and there is no fresh try when the file is back (a network drive that drops out). Medium.
+- A TV recording whose clock jumps forward part-way stops at the jump. Medium.
+- The automatic update can restart the program under a viewer: "nobody is watching" is checked once, before the download, and counts only chunk requests (not a film sent as it is). Medium. To fix before the second release, which is the first one that installs itself.
+- When the converter dies between two pieces, the half-written chunk is served as whole and a few seconds are skipped silently. Low.
+- A converter that hangs is not noticed or replaced. Low.
+- A subtitle file beside a film in .ass/.ssa/.sub form saved in an old Western European encoding loses its lines with accented letters, and that result is kept. Low.
+- The installer and uninstaller stop only the program itself; a subtitle or key-frame helper still running can block replacing ffmpeg.exe. Low (reasoned, not run on Windows).
+- A forced end leaves temporary files that nothing removes (cache/subtitles/making-*.tmp; the chunk folder if the program is never started again). Low.
+- Two versions of one film: the list judges the largest file while Play opens the first one found, so the list can say "plays" for a film that Play then refuses. Low.
+- For a clip trimmed without re-encoding (see above), the saved position is a few seconds off between a device that gets it repackaged and one that plays it as it is.
+
+## 2026-11-12: M4 — started, not finished (stopped to save the owner's usage)
+
+The design is `docs/design/M4.md` (three independent designs, three judges, one synthesis), with measured speeds in its section 8. Three parts were built by helpers, each in its own branch, and are merged into the working branch **after** the v0.3.0 tag so that they are not lost; none of it is in v0.3.0:
+- *The picture converter* (`internal/hls`: `lattice.go`, `facts.go`, `abilities.go`, `Spec.Convert`). Nothing calls it yet. Its two independent checks were stopped before they reported.
+- *The decision rules* (`internal/playback`: `DecideFor`, `Want`, `Limits`, the five rungs, `StepDown`). `Decide` is a wrapper that gives M3's answers, so nothing changes yet. Its check finished and found four medium faults that are **not repaired**: a wish for a lighter picture is treated as a demand, so a step after "PC too slow" can refuse a film that would play; a rung never measured is trusted even when a lighter one is recorded as too slow or the PC is already converting; the connection lesson (4 Mbit/s) rules out both 720p rungs (ceiling 5 Mbit/s); `StepDown` writes the viewer's sentence before the outcome is known.
+- *Open in another player* (`internal/server`, the page, the browser test; routes `open-local`, `handoff`, `handoff.xspf`). It is reachable, starts a program on the PC, and has **not been independently checked**: do that (security first) before any release that contains it. The Windows launcher has never run outside the test machine.
+
+Next for M4, in the design's order: repair and check the three parts above; wire the planner and converter into Play and the page (slice 2); sizes, HDR, deinterlacing (3); speed table and benchmark (4); burned-in subtitles (5); devices, lessons and stepping down (6); the hardware test (7); drawn subtitles (8); checklist and status (10).
