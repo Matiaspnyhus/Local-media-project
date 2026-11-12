@@ -470,7 +470,8 @@ var errStopped = errors.New("stopped")
 
 // slice does the cutting. ffmpeg's output is a header followed by
 // fragments, each a short index (moof) and its data (mdat), one per key
-// frame. A fragment goes into the chunk its start time falls in.
+// frame. A fragment goes into the chunk that the moment its key frame is
+// shown falls in.
 func (m *Manager) slice(s *session, r *run, out io.Reader) error {
 	br := bufio.NewReaderSize(out, 256<<10)
 	grid := s.spec.Grid

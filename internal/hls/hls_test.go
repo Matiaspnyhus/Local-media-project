@@ -3,6 +3,7 @@ package hls
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"math"
 	"os"
@@ -16,11 +17,16 @@ import (
 	"github.com/Matiaspnyhus/Local-media-project/internal/probe"
 )
 
-// These tests run the real ffmpeg on two small films made for the purpose:
+// These tests run the real ffmpeg on small films made for the purpose:
 //
-//	plain: 40 seconds, a key frame every 2 seconds, Dolby (AC-3) sound.
-//	rough: 60 seconds, key frames at irregular moments up to 7 seconds apart,
-//	       frames stored out of order (B-frames), as most real films are.
+//	plain:  40 seconds, a key frame every 2 seconds, Dolby (AC-3) sound.
+//	rough:  60 seconds, key frames at irregular moments up to 7 seconds apart,
+//	        frames stored out of order (B-frames), as most real films are.
+//	open:   60 seconds as the x265 encoder makes them when left alone: each
+//	        key frame is followed by a few frames that are shown before it
+//	        ("open GOP"), as on most discs and in most HEVC films.
+//	uneven: 60 seconds with every fifth frame missing, so the time from one
+//	        frame to the next varies (a "variable frame rate").
 
 func tools(t *testing.T) (ffmpeg, ffprobe string) {
 	t.Helper()
@@ -50,22 +56,48 @@ func source(t *testing.T, ffmpeg, name string) string {
 		filmDir = dir
 	}
 	p := filepath.Join(filmDir, name+".mkv")
-	a := []string{"-hide_banner", "-loglevel", "error", "-y"}
+	picture := func(seconds string) []string {
+		return []string{"-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=" + seconds, "-f", "lavfi", "-i", "sine=frequency=440:duration=" + seconds}
+	}
+	// Each film has one or more recipes; the first this ffmpeg can follow
+	// is used.
+	var recipes [][]string
 	switch name {
 	case "plain":
-		a = append(a, "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=40", "-f", "lavfi", "-i", "sine=frequency=440:duration=40",
-			"-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)
+		recipes = [][]string{append(picture("40"),
+			"-c:v", "libx264", "-preset", "ultrafast", "-g", "48", "-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
 	case "rough":
-		a = append(a, "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=24:duration=60", "-f", "lavfi", "-i", "sine=frequency=440:duration=60",
+		recipes = [][]string{append(picture("60"),
 			"-c:v", "libx264", "-preset", "veryfast", "-bf", "2", "-g", "168", "-sc_threshold", "0",
 			"-force_key_frames", "3.5,5,11.25,18,19,26.5,33,40.75,47,54.5",
-			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)
-	}
-	if out, err := exec.Command(ffmpeg, a...).CombinedOutput(); err != nil {
-		if os.Getenv("LM_REQUIRE_FFMPEG") != "" {
-			t.Fatalf("ffmpeg could not make the test film: %v %s", err, out)
+			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
+	case "open":
+		recipes = [][]string{
+			append(picture("60"), "-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error",
+				"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p),
+			// Without x265, the same shape from x264.
+			append(picture("60"), "-c:v", "libx264", "-preset", "veryfast", "-x264-params", "open-gop=1:keyint=96:bframes=3",
+				"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p),
 		}
-		t.Skipf("this ffmpeg cannot make the test film: %v %s", err, out)
+	case "uneven":
+		recipes = [][]string{append(picture("60"),
+			"-vf", `select=not(eq(mod(n\,5)\,3))`, "-fps_mode", "vfr",
+			"-c:v", "libx264", "-preset", "veryfast", "-bf", "2", "-g", "40",
+			"-pix_fmt", "yuv420p", "-c:a", "ac3", "-b:a", "96k", p)}
+	}
+	var out []byte
+	var err error
+	for _, recipe := range recipes {
+		a := append([]string{"-hide_banner", "-loglevel", "error", "-y"}, recipe...)
+		if out, err = exec.Command(ffmpeg, a...).CombinedOutput(); err == nil {
+			break
+		}
+	}
+	if err != nil || len(recipes) == 0 {
+		if os.Getenv("LM_REQUIRE_FFMPEG") != "" {
+			t.Fatalf("ffmpeg could not make the test film %q: %v %s", name, err, out)
+		}
+		t.Skipf("this ffmpeg cannot make the test film %q: %v %s", name, err, out)
 	}
 	films[name] = p
 	return p
@@ -317,37 +349,163 @@ func TestCutsAreFoundAtRealKeyFrames(t *testing.T) {
 // where the list said it would, and holds exactly the same frames.
 func TestEveryChunkBeginsWhereTheListSays(t *testing.T) {
 	ffmpeg, ffprobe := tools(t)
-	src := source(t, ffmpeg, "rough")
-	g := grid(t, ffprobe, src, 60000)
-	for _, copySound := range []bool{true, false} {
-		m := manager(t, ffmpeg)
-		straight := m.Open(Spec{Path: src, Grid: g, VideoCodec: "h264", AudioTrack: 0, AudioCopy: copySound})
-		whole := fetch(t, m, straight, 0, len(g.Cuts)-1)
-		got, want := inspect(t, ffprobe, whole), inspect(t, ffprobe, src)
-		if got["video"].Packets != want["video"].Packets {
-			t.Errorf("played straight through: %s frames of %s", got["video"].Packets, want["video"].Packets)
-		}
-		decodes(t, ffmpeg, whole)
-		for k := range g.Cuts {
-			a := inspect(t, ffprobe, fetch(t, m, straight, k, k))
-			// A fresh session asked for chunk k first: ffmpeg starts there.
-			jumped := m.Open(Spec{Path: src, Grid: g, VideoCodec: "h264", AudioTrack: 0, AudioCopy: copySound})
-			b := inspect(t, ffprobe, fetch(t, m, jumped, k, k))
-			wantStart := float64(g.Cuts[k])/1000 + shift
-			for name, x := range map[string]map[string]streamInfo{"played through": a, "jumped to": b} {
-				if st := f(x["video"].StartTime); math.Abs(st-wantStart) > 0.002 {
-					t.Errorf("copy sound %v: chunk %d %s begins at %.3f s, the list says %.3f", copySound, k, name, st, wantStart)
-				}
-				if off := f(x["video"].StartTime) - f(x["audio"].StartTime); math.Abs(off) > 0.1 {
-					t.Errorf("copy sound %v: chunk %d %s: picture and sound start %.3f s apart", copySound, k, name, off)
-				}
+	for _, film := range []string{"rough", "open", "uneven"} {
+		t.Run(film, func(t *testing.T) {
+			src := source(t, ffmpeg, film)
+			g := grid(t, ffprobe, src, 60000)
+			codec := inspect(t, ffprobe, src)["video"].Codec
+			for _, copySound := range []bool{true, false} {
+				everyChunk(t, ffmpeg, ffprobe, Spec{Path: src, Grid: g, VideoCodec: codec, AudioTrack: 0, AudioCopy: copySound}, film != "rough")
 			}
-			if a["video"].Packets != b["video"].Packets || copySound && a["audio"].Packets != b["audio"].Packets {
-				t.Errorf("copy sound %v: chunk %d differs: played through %s/%s frames, jumped to %s/%s", copySound, k,
-					a["video"].Packets, a["audio"].Packets, b["video"].Packets, b["audio"].Packets)
+		})
+	}
+}
+
+// firstFrame returns when the first frame stored in a file is shown and
+// when it is decoded, in seconds. A chunk's first stored frame is the key
+// frame it opens with.
+func firstFrame(t *testing.T, ffprobe, path string) (shown, decoded float64) {
+	t.Helper()
+	out, err := exec.Command(ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#1",
+		"-show_entries", "packet=pts_time,dts_time", "-of", "csv=p=0", path).Output()
+	if err != nil {
+		t.Fatalf("ffprobe: %v", err)
+	}
+	p := strings.Split(strings.TrimSpace(string(out)), ",")
+	if len(p) < 2 {
+		t.Fatalf("ffprobe said %q about the first frame of %s", out, path)
+	}
+	return f(p[0]), f(p[1])
+}
+
+// everyChunk fetches each chunk of a film twice, once played through from
+// the start and once by a fresh session that asks for it first, and checks
+// both against the list.
+//
+// byKeyFrame is for films in which the time between a key frame being
+// decoded and being shown varies. There a chunk is judged by the key frame
+// it opens with: frames shown just before a key frame may be stored after
+// it and travel with it, and a chunk's sound begins when its key frame is
+// decoded, which can be an eighth of a second before it is shown.
+func everyChunk(t *testing.T, ffmpeg, ffprobe string, spec Spec, byKeyFrame bool) {
+	t.Helper()
+	g, copySound := spec.Grid, spec.AudioCopy
+	m := manager(t, ffmpeg)
+	defer m.Close()
+	straight := m.Open(spec)
+	whole := fetch(t, m, straight, 0, len(g.Cuts)-1)
+	got, want := inspect(t, ffprobe, whole), inspect(t, ffprobe, spec.Path)
+	if got["video"].Packets != want["video"].Packets {
+		t.Errorf("played straight through: %s frames of %s", got["video"].Packets, want["video"].Packets)
+	}
+	decodes(t, ffmpeg, whole)
+	for k := range g.Cuts {
+		through := fetch(t, m, straight, k, k)
+		// A fresh session asked for chunk k first: ffmpeg starts there.
+		jumped := m.Open(spec)
+		direct := fetch(t, m, jumped, k, k)
+		m.Stop(jumped)
+		a, b := inspect(t, ffprobe, through), inspect(t, ffprobe, direct)
+		wantStart := float64(g.Cuts[k])/1000 + shift
+		for _, c := range []struct {
+			name, path string
+			x          map[string]streamInfo
+		}{{"played through", through, a}, {"jumped to", direct, b}} {
+			start, sound := f(c.x["video"].StartTime), f(c.x["audio"].StartTime)
+			early, late := 0.1, 0.1 // how far the sound may begin before and after the picture
+			if byKeyFrame {
+				var decoded float64
+				start, decoded = firstFrame(t, ffprobe, c.path)
+				early, late = start-decoded+0.05, 0.05
+			}
+			if math.Abs(start-wantStart) > 0.002 {
+				t.Errorf("copy sound %v: chunk %d %s begins at %.3f s, the list says %.3f", copySound, k, c.name, start, wantStart)
+			}
+			if off := start - sound; off > early || off < -late {
+				t.Errorf("copy sound %v: chunk %d %s: picture and sound start %.3f s apart", copySound, k, c.name, off)
 			}
 		}
-		m.Close()
+		if a["video"].Packets != b["video"].Packets || copySound && a["audio"].Packets != b["audio"].Packets {
+			t.Errorf("copy sound %v: chunk %d differs: played through %s/%s frames, jumped to %s/%s", copySound, k,
+				a["video"].Packets, a["audio"].Packets, b["video"].Packets, b["audio"].Packets)
+		}
+	}
+}
+
+// box builds one MP4 box from its type and contents.
+func box(typ string, parts ...[]byte) []byte {
+	body := bytes.Join(parts, nil)
+	b := binary.BigEndian.AppendUint32(nil, uint32(8+len(body)))
+	return append(append(b, typ...), body...)
+}
+
+func u32(v ...uint32) []byte {
+	var b []byte
+	for _, x := range v {
+		b = binary.BigEndian.AppendUint32(b, x)
+	}
+	return b
+}
+
+// The same thing without ffmpeg, on a header and a fragment written out by
+// hand with the numbers ffmpeg gave for a film made by x265: the fragment
+// is stamped 10.375 s (when its key frame is decoded), and its key frame
+// is shown at 10.417 s, which is where the cut is.
+func TestAFragmentIsFiledByWhenItsKeyFrameIsShown(t *testing.T) {
+	zeros := func(n int) []byte { return make([]byte, n) }
+	moov := bytes.Join([][]byte{
+		box("mvhd", zeros(100)),
+		box("trak", // the sound, listed first to be skipped
+			box("tkhd", u32(0, 0, 0, 2), zeros(68)),
+			box("mdia", box("mdhd", u32(0, 0, 0, 44100, 0)), box("hdlr", u32(0, 0), []byte("soun"), zeros(13)))),
+		box("trak",
+			box("tkhd", u32(0, 0, 0, 1), zeros(68)),
+			box("edts", box("elst", u32(0, 2, 500, 0xffffffff, 0x10000, 0, 1328, 0x10000))),
+			box("mdia", box("mdhd", u32(0, 0, 0, 16000, 0)), box("hdlr", u32(0, 0), []byte("vide"), zeros(13)))),
+	}, nil)
+	v := findVideo(moov)
+	if v.id != 1 || v.scale != 16000 || v.edit != 1328 {
+		t.Fatalf("the picture track was read as %+v", v)
+	}
+	const stamped = 182000 // 10.375 s, plus the second every time is moved by
+	moof := bytes.Join([][]byte{
+		box("mfhd", u32(0, 2)),
+		box("traf",
+			box("tfhd", u32(0x020000, 1)),
+			box("tfdt", u32(0x01000000, 0, stamped)),
+			// Two frames: flags say each has a length, a size, flags of its own
+			// and how long after decoding it is shown; the list has a data
+			// offset and flags for its first frame.
+			box("trun", u32(0x000f05, 2, 0, 0, 666, 5000, 0, 2000, 666, 400, 0, 0))),
+		box("traf",
+			box("tfhd", u32(0x020000, 2)),
+			box("tfdt", u32(0x01000000, 0, 500000)),
+			box("trun", u32(0x000201, 1, 0, 300))),
+	}, nil)
+	ms, ok := fragmentStart(moof, v)
+	if !ok || math.Abs(ms-clockShiftMs-10417) > 0.5 {
+		t.Fatalf("the fragment's key frame is shown at %.1f ms (%v), want 10417", ms-clockShiftMs, ok)
+	}
+	g := Grid{EndMs: 60000, Cuts: []int64{0, 10417, 20833}}
+	if k := g.index(ms - clockShiftMs); k != 1 {
+		t.Errorf("the fragment was filed in chunk %d, want 1", k)
+	}
+	// A header with no edit list and a fragment whose frames are all shown
+	// when they are decoded: the stamp is the time.
+	plain := findVideo(box("trak", box("tkhd", u32(0, 0, 0, 7), zeros(68)),
+		box("mdia", box("mdhd", u32(0, 0, 0, 1000, 0)), box("hdlr", u32(0, 0), []byte("vide"), zeros(13)))))
+	ms, ok = fragmentStart(box("traf", box("tfhd", u32(0, 7)), box("tfdt", u32(0, 4500)), box("trun", u32(0x000201, 1, 0, 300))), plain)
+	if !ok || ms != 4500 {
+		t.Errorf("a plain fragment: %.1f ms (%v), want 4500", ms, ok)
+	}
+	// Cut-off or senseless boxes are read as "no information", never a crash.
+	for _, junk := range [][]byte{nil, {0}, u32(0x000800), u32(0x000800, 1), u32(0x000f05, 1, 0, 0)} {
+		if d := firstShownAfter(junk); d != 0 {
+			t.Errorf("junk %x was read as %d", junk, d)
+		}
+		if d := editStart(junk); d != 0 {
+			t.Errorf("junk %x was read as an edit at %d", junk, d)
+		}
 	}
 }
 
