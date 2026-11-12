@@ -333,6 +333,33 @@ func (s *Server) playCaps(u *User) *playback.Caps {
 	return &without
 }
 
+// longestChunk is the longest chunk a list of cuts may hold and still be
+// believed. Chunks are meant to last a few seconds (hls.SegmentSeconds) and
+// are cut at key frames, which films have every few seconds. A list with a
+// chunk longer than this came from a search that did not find the key
+// frames, which has happened for whole kinds of file. Played by such a
+// list, a film does not start until the converter has worked through the
+// whole chunk, so the plain every-few-seconds list is used instead.
+const longestChunk = time.Minute
+
+// usableGrid reports whether a list of cuts is in order and has no
+// absurdly long chunk.
+func usableGrid(g hls.Grid) bool {
+	if !g.Valid() {
+		return false
+	}
+	for i, at := range g.Cuts {
+		end := g.EndMs
+		if i+1 < len(g.Cuts) {
+			end = g.Cuts[i+1]
+		}
+		if end-at > longestChunk.Milliseconds() {
+			return false
+		}
+	}
+	return true
+}
+
 // grid returns where a file is cut into chunks, working it out the first
 // time the file is played this way.
 func (s *Server) grid(ctx context.Context, fileID, path string, size, mtime, durationMs int64) hls.Grid {
@@ -340,14 +367,17 @@ func (s *Server) grid(ctx context.Context, fileID, path string, size, mtime, dur
 	var have, text string
 	if err := s.db.QueryRow(`SELECT stamp, grid FROM cuts WHERE file_id=?`, fileID).Scan(&have, &text); err == nil && have == stamp {
 		var g hls.Grid
-		if json.Unmarshal([]byte(text), &g) == nil && g.Valid() {
+		if json.Unmarshal([]byte(text), &g) == nil && usableGrid(g) {
 			return g
 		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
 	g, err := hls.FindCuts(ctx, s.ffprobe, path, durationMs)
-	if err != nil || !g.Valid() {
+	if err == nil && !usableGrid(g) {
+		err = errors.New("the search did not find the film's key frames")
+	}
+	if err != nil {
 		s.log.Printf("could not find where to cut %s; jumping in it will be less exact: %v", filepath.Base(path), err)
 		return hls.Uniform(durationMs)
 	}
