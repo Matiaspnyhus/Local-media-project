@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,7 +51,7 @@ type subtitleView struct {
 type fileTracks struct {
 	media    playback.Media
 	subs     []playback.Subtitle // text subtitles, inside the file and beside it
-	subKeys  []string            // "e2": the third subtitle track inside; "x<id>": a file beside it
+	subKeys  []string            // "e2": the third subtitle track inside; "x...": a file beside it (see sidecarKey)
 	pictures int                 // picture subtitles, which cannot be shown yet
 }
 
@@ -89,23 +91,47 @@ func (s *Server) loadTracks(fileID string, probed bool, container string) (fileT
 	if err := rows.Err(); err != nil {
 		return ft, err
 	}
-	rows, err = s.db.Query(`SELECT id, format, language, is_forced FROM sidecars WHERE file_id=? ORDER BY rel_path`, fileID)
+	rows, err = s.db.Query(`SELECT rel_path, format, language, is_forced FROM sidecars WHERE file_id=? ORDER BY rel_path`, fileID)
 	if err != nil {
 		return ft, err
 	}
 	defer rows.Close()
 	for rows.Next() {
-		var id, format, lang string
+		var rel, format, lang string
 		var forced int
-		if err := rows.Scan(&id, &format, &lang, &forced); err != nil {
+		if err := rows.Scan(&rel, &format, &lang, &forced); err != nil {
 			return ft, err
 		}
 		if textSubtitles[strings.ToLower(format)] {
 			ft.subs = append(ft.subs, playback.Subtitle{Language: lang, Forced: forced != 0})
-			ft.subKeys = append(ft.subKeys, "x"+id)
+			ft.subKeys = append(ft.subKeys, sidecarKey(rel))
 		}
 	}
 	return ft, rows.Err()
+}
+
+// sidecarKey names a subtitle file beside a film in addresses: "x" and a
+// fingerprint of the file's path. It is not made from the file's row in the
+// database, because every scan writes those rows afresh, and an address
+// handed to a player must keep working after the next scan.
+func sidecarKey(relPath string) string {
+	sum := sha256.Sum256([]byte(relPath))
+	return "x" + hex.EncodeToString(sum[:])[:32]
+}
+
+// sidecar finds the subtitle file beside a film that key names.
+func (s *Server) sidecar(fileID, key string) (relPath, format string, ok bool) {
+	rows, err := s.db.Query(`SELECT rel_path, format FROM sidecars WHERE file_id=?`, fileID)
+	if err != nil {
+		return "", "", false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if rows.Scan(&relPath, &format) == nil && sidecarKey(relPath) == key {
+			return relPath, format, true
+		}
+	}
+	return "", "", false
 }
 
 var languageNames = map[string]string{
@@ -527,8 +553,8 @@ func (s *Server) handleSubtitle(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/vtt; charset=utf-8")
 	w.Header().Set("Cache-Control", "private, max-age=3600")
 	if key[0] == 'x' {
-		var subRel, format string
-		if err := s.db.QueryRow(`SELECT rel_path, format FROM sidecars WHERE id=? AND file_id=?`, key[1:], fileID).Scan(&subRel, &format); err != nil {
+		subRel, format, ok := s.sidecar(fileID, key)
+		if !ok {
 			writeErr(w, http.StatusNotFound, "Not found.")
 			return
 		}
