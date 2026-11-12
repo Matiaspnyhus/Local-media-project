@@ -43,6 +43,10 @@ type Convert struct {
 	// MaxRateK the most the picture may take, in thousands of bits a second.
 	Preset   Preset
 	MaxRateK int
+	// SoundRunsOn says that the file goes on for seconds after the
+	// picture's last frame: sound, with nothing to see. ffmpeg is then told
+	// to wait for the picture however long it takes (see convertArgs).
+	SoundRunsOn bool
 }
 
 // Preset is how much work the encoder puts into each frame: more work
@@ -217,12 +221,26 @@ func convertArgs(spec Spec, startSeg, readRate, burst int) []string {
 			a = append(a, "-c:a", "aac", "-ac", "2", "-b:a", "192k")
 		}
 	}
-	// Picture and sound are written in the order of their times. When one
-	// of them has nothing for a while ffmpeg waits ten seconds for it and
-	// then goes on without, which files sound into the wrong chunk when it
-	// carries on long after the picture has ended. It is told to wait as
-	// long as it takes.
-	a = append(a, "-max_interleave_delta", "0")
+	// Picture and sound are written in the order of their times, and when
+	// one of them has nothing for a while ffmpeg waits for it: until the
+	// other is ten seconds ahead, and then it goes on without.
+	//
+	// That is right for a film whose sound stops before its picture does
+	// (many do, by a second or two; a commentary may by minutes): what is
+	// made after the sound has stopped is sent ten seconds of film late, and
+	// then steadily. Told to wait for ever, ffmpeg sends nothing more until
+	// it has converted the film to its end, and whoever is watching waits
+	// with it.
+	//
+	// It is wrong for the opposite film, whose sound runs on after the
+	// picture. There the last frames are still inside the encoder when the
+	// sound gets ten seconds ahead, the sound is sent on without them, and
+	// lands in the chunk before the one it belongs to. For that film alone,
+	// ffmpeg is told to wait as long as it takes: its sound is not going to
+	// stop early.
+	if c.SoundRunsOn {
+		a = append(a, "-max_interleave_delta", "0")
+	}
 	return append(a, outputArgs(g)...)
 }
 

@@ -37,7 +37,7 @@ import (
 //	midstream: tv25 with its beginning cut off in the middle of things, as
 //	           every real recording begins: the first frames in the file
 //	           cannot be decoded, for want of the key frame before them.
-//	shortsound: 16 seconds of picture whose sound stops after 7.
+//	shortsound: 22 seconds of picture whose sound stops after 4.
 func convertFilm(t *testing.T, ffmpeg, name string) string {
 	t.Helper()
 	key := "to convert: " + name
@@ -99,7 +99,7 @@ func convertFilm(t *testing.T, ffmpeg, name string) string {
 		recipe = join(pic("25", "19"), snd("19"), x264, []string{"-g", "150", "-keyint_min", "150", "-sc_threshold", "0",
 			"-c:a", "aac", "-b:a", "96k", "-f", "mpegts", p})
 	case "shortsound":
-		recipe = join(pic("24", "16"), snd("7"), x264, []string{"-g", "48", "-c:a", "ac3", "-b:a", "96k", p})
+		recipe = join(pic("24", "22"), snd("4"), x264, []string{"-g", "48", "-c:a", "ac3", "-b:a", "96k", p})
 	default:
 		t.Fatalf("no recipe for a film called %q", name)
 	}
@@ -233,9 +233,12 @@ func TestEveryConvertedChunkBeginsWhereTheListSays(t *testing.T) {
 					t.Errorf("with key frames 6 seconds apart the lead-in is %d ms, want 6500", c.LeadMs)
 				}
 			case "longsound":
-				if last := g.Cuts[len(g.Cuts)-1]; g.EndMs-facts.LastMs < 9000 || last > facts.LastMs || len(g.Cuts) != 4 {
+				if last := g.Cuts[len(g.Cuts)-1]; g.EndMs-facts.LastMs < 9000 || last > facts.LastMs || len(g.Cuts) != 4 || !c.SoundRunsOn {
 					t.Errorf("the list should end with the picture (last frame at %d ms) and the file's end stay where it is (%d): %v", facts.LastMs, facts.EndMs, g.Cuts)
 				}
+			}
+			if c.SoundRunsOn != (film.name == "longsound") {
+				t.Errorf("the sound is taken to run on after the picture: %v", c.SoundRunsOn)
 			}
 			for _, sound := range film.sounds {
 				spec.AudioCopy, spec.AudioCodec = sound != "", sound
@@ -388,7 +391,7 @@ func TestTheCommandLineForAConvertedPicture(t *testing.T) {
 	want := "-hide_banner -nostdin -loglevel error -readrate 8 -readrate_initial_burst 60 -i film.mkv -map 0:v:0" +
 		" -vf fps=24000/1001:start_time=0.000,scale=1920:800:flags=bicubic,setsar=1,format=yuv420p" +
 		" -c:v libx264 -preset veryfast -crf 22 -maxrate 10000k -bufsize 20000k -profile:v high -bf 0 -sc_threshold 0 -g 146 -forced-idr 1" +
-		" -fps_mode vfr -force_key_frames 3,6,9,12,15,18,21,24 -map 0:a:1 -c:a copy -max_interleave_delta 0" + out
+		" -fps_mode vfr -force_key_frames 3,6,9,12,15,18,21,24 -map 0:a:1 -c:a copy" + out
 	if got := strings.Join(args(spec, 0, 8, 60), " "); got != want {
 		t.Errorf("from the top:\n got %s\nwant %s", got, want)
 	}
@@ -400,7 +403,7 @@ func TestTheCommandLineForAConvertedPicture(t *testing.T) {
 	want = "-hide_banner -nostdin -loglevel error -ss 13.020 -noaccurate_seek -readrate 8 -readrate_initial_burst 60 -i film.mkv -map 0:v:0" +
 		" -vf fps=24000/1001:start_time=0.000,trim=start=14.890,scale=1920:800:flags=bicubic,setsar=1,format=yuv420p" +
 		" -c:v libx264 -preset superfast -crf 22 -maxrate 5000k -bufsize 10000k -profile:v high -bf 0 -sc_threshold 0 -g 146 -forced-idr 1" +
-		" -fps_mode vfr -force_key_frames 15,18,21,24 -map 0:a:1 -af atrim=start=14.890 -c:a aac -ac 2 -b:a 192k -max_interleave_delta 0" + out
+		" -fps_mode vfr -force_key_frames 15,18,21,24 -map 0:a:1 -af atrim=start=14.890 -c:a aac -ac 2 -b:a 192k" + out
 	if got := strings.Join(args(spec, 5, 8, 60), " "); got != want {
 		t.Errorf("from chunk 5:\n got %s\nwant %s", got, want)
 	}
@@ -426,6 +429,18 @@ func TestTheCommandLineForAConvertedPicture(t *testing.T) {
 	if one := strings.Join(args(Spec{Path: "x", Grid: g1, AudioTrack: -1, Convert: &c1}, 0, 8, 60), " "); strings.Contains(one, "force_key_frames") || strings.Contains(one, "0:a") || !strings.Contains(one, " -g 152 ") {
 		t.Errorf("a film of one chunk, without sound: %s", one)
 	}
+	// A film whose sound runs on after its picture: ffmpeg is told to wait
+	// for the picture however long it takes. No other film is.
+	if strings.Contains(strings.Join(args(spec, 0, 8, 60), " ")+strings.Join(args(spec, 5, 8, 60), " "), "interleave") {
+		t.Errorf("a film that ends with its picture has ffmpeg told how long to wait for it")
+	}
+	c.SoundRunsOn = true
+	for _, seg := range []int{0, 5} {
+		if on := strings.Join(args(spec, seg, 8, 60), " "); !strings.Contains(on, " -b:a 192k -max_interleave_delta 0 -sn ") {
+			t.Errorf("a film whose sound runs on, from chunk %d: %s", seg, on)
+		}
+	}
+	c.SoundRunsOn = false
 	// Sound that is passed through as AAC is rewrapped, as it is beside an
 	// untouched picture; times below zero are written as such; and each
 	// preset has its word.
@@ -472,7 +487,7 @@ func TestConvertCommandLineIsBuiltOnlyFromTypedValues(t *testing.T) {
 					t.Errorf("start %d, chunk %d: the path is given %d times: %q", start, seg, paths, a)
 				}
 				joined := strings.Join(a, "\x00")
-				for _, want := range []string{"-c:v\x00libx264", "-bf\x000", "-sc_threshold\x000", "-forced-idr\x001", "-fps_mode\x00vfr", "-max_interleave_delta\x000", "-copyts",
+				for _, want := range []string{"-c:v\x00libx264", "-bf\x000", "-sc_threshold\x000", "-forced-idr\x001", "-fps_mode\x00vfr", "-copyts",
 					"fps=30000/1001:start_time=" + clock(c.AnchorMs) + ",", ",scale=1280:534:flags=bicubic,setsar=1,format=yuv420p\x00"} {
 					if !strings.Contains(joined, want) {
 						t.Errorf("start %d, chunk %d: missing %q in %q", start, seg, strings.ReplaceAll(want, "\x00", " "), a)
@@ -793,10 +808,16 @@ func TestPaceOfARealConversion(t *testing.T) {
 	if pace, n := m.Pace(token); pace != 0 || n != 0 {
 		t.Errorf("before anything is asked for: %v over %d chunks", pace, n)
 	}
-	const pause = 1500 * time.Millisecond
+	pause := 1500 * time.Millisecond
 	for k := 0; k < 6; k++ {
+		asked := time.Now()
 		if _, err := m.Segment(ctx, token, k); err != nil {
 			t.Fatalf("chunk %d: %v", k, err)
+		}
+		if k == 0 {
+			// On a machine so busy that the first chunk took a while, the
+			// pause is made long enough to stand out all the same.
+			pause = max(pause, 5*time.Since(asked))
 		}
 		if k == 2 {
 			// The viewer pauses, in effect: the converter makes the one
@@ -853,8 +874,8 @@ func TestJumpingToWhereTheSoundHasEndedInAConvertedFilm(t *testing.T) {
 	ffmpeg, ffprobe := tools(t)
 	spec, _ := convertSpec(t, ffprobe, convertFilm(t, ffmpeg, "shortsound"))
 	last := len(spec.Grid.Cuts) - 1
-	if last != 5 {
-		t.Fatalf("the film was cut into %d chunks, want 6", last+1)
+	if last != 7 {
+		t.Fatalf("the film was cut into %d chunks, want 8", last+1)
 	}
 	ctx := context.Background()
 	for _, sound := range []string{"ac3", ""} {
@@ -866,15 +887,15 @@ func TestJumpingToWhereTheSoundHasEndedInAConvertedFilm(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		// Straight to the last chunk, from 15 seconds: no sound there.
+		// Straight to the last chunk, from 21 seconds: no sound there.
 		tail, err := m.Segment(ctx, token, last)
 		if err != nil {
 			t.Fatalf("sound %q: jumping to the silent end: %v", sound, err)
 		}
 		whole := joined(t, header, tail)
 		got := inspect(t, ffprobe, whole)
-		if got["video"].Packets != "24" || math.Abs(f(got["video"].StartTime)-15-shift) > 0.002 {
-			t.Errorf("sound %q: the silent end has %s frames from %s s, want 24 from %.3f", sound, got["video"].Packets, got["video"].StartTime, 15+shift)
+		if got["video"].Packets != "24" || math.Abs(f(got["video"].StartTime)-21-shift) > 0.002 {
+			t.Errorf("sound %q: the silent end has %s frames from %s s, want 24 from %.3f", sound, got["video"].Packets, got["video"].StartTime, 21+shift)
 		}
 		decodes(t, ffmpeg, whole)
 		m.mu.Lock()
@@ -888,8 +909,47 @@ func TestJumpingToWhereTheSoundHasEndedInAConvertedFilm(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := inspect(t, ffprobe, joined(t, header, early)); f(got["audio"].Packets) < 50 || got["video"].Packets != "72" {
+		if got := inspect(t, ffprobe, joined(t, header, early)); f(got["audio"].Packets) < 20 || got["video"].Packets != "72" {
 			t.Errorf("sound %q: back at 3 seconds: %s frames of picture, %s of sound", sound, got["video"].Packets, got["audio"].Packets)
+		}
+		m.Close()
+	}
+}
+
+// The same film played through. Once the sound has stopped, ffmpeg holds
+// the picture back until it is ten seconds of film ahead, and then sends it
+// on as it is made. It must not hold it back until the film is done: a
+// viewer near the end of a long film would wait minutes for the next chunk,
+// which is what telling ffmpeg to wait for ever (as it is told for a film
+// whose sound runs on) does to this one.
+func TestAFilmWhoseSoundStopsEarlyStillArrivesAsItIsMade(t *testing.T) {
+	ffmpeg, ffprobe := tools(t)
+	spec, _ := convertSpec(t, ffprobe, convertFilm(t, ffmpeg, "shortsound"))
+	if spec.Convert.SoundRunsOn {
+		t.Fatal("a film whose sound stops first is taken for one whose sound runs on")
+	}
+	for _, sound := range []string{"ac3", ""} {
+		spec.AudioCopy, spec.AudioCodec = sound != "", sound
+		m := manager(t, ffmpeg)
+		// Read at four times the speed it plays, with no head start: the 22
+		// seconds take five and a half, so that "before the film is done"
+		// is a moment that can be told from "when it is done".
+		m.ReadRate, m.Burst = 4, 1
+		ctx := context.Background()
+		token := m.Open(spec)
+		// The sound stops at 4 seconds, inside the second chunk. That chunk
+		// is whole once the picture has been made up to 16 seconds or so.
+		for k := 0; k < 2; k++ {
+			if _, err := m.Segment(ctx, token, k); err != nil {
+				t.Fatalf("sound %q: chunk %d: %v", sound, k, err)
+			}
+		}
+		m.mu.Lock()
+		r := m.sessions[token].run
+		alive, next := r.alive(), r.next
+		m.mu.Unlock()
+		if !alive || next > 6 {
+			t.Errorf("sound %q: the chunk in which the sound stops arrived when the converter was done with the film (still running: %v, chunks made: %d of 8)", sound, alive, next)
 		}
 		m.Close()
 	}

@@ -20,7 +20,7 @@ func TestLatticeOfAnOrdinaryFilm(t *testing.T) {
 	if !g.Valid() || fmt.Sprint(g.Cuts) != fmt.Sprint(want) || g.StartMs != 0 || g.EndMs != 25025 || g.From != "lattice" {
 		t.Fatalf("the lattice is %+v, want cuts %v", g, want)
 	}
-	if fmt.Sprint(c.Targets) != "[0 3 6 9 12 15 18 21 24]" || c.AnchorMs != 0 || c.Num != 24000 || c.Den != 1001 || c.step() != 3 {
+	if fmt.Sprint(c.Targets) != "[0 3 6 9 12 15 18 21 24]" || c.AnchorMs != 0 || c.Num != 24000 || c.Den != 1001 || c.step() != 3 || c.SoundRunsOn {
 		t.Errorf("the converter would be told %+v", c)
 	}
 	// The cut asked for at 21 s is the one to watch. 21 s is 503.4965 frames
@@ -53,8 +53,16 @@ func TestLatticeEndsWithThePicture(t *testing.T) {
 	// Sound that runs on after the picture does not get chunks of its own:
 	// the list ends with the picture and its end stays the file's.
 	g, c = Lattice(0, 10958, 21021, 24, 1)
-	if fmt.Sprint(g.Cuts) != "[0 3000 6000 9000]" || g.EndMs != 21021 || len(c.Targets) != 4 || !g.Valid() {
-		t.Errorf("sound ten seconds longer than the picture: %+v", g)
+	if fmt.Sprint(g.Cuts) != "[0 3000 6000 9000]" || g.EndMs != 21021 || len(c.Targets) != 4 || !g.Valid() || !c.SoundRunsOn {
+		t.Errorf("sound ten seconds longer than the picture: %+v %+v", g, c)
+	}
+	// That the sound runs on is something the converter is told, and only
+	// when it does by seconds: every file ends a moment after its last
+	// frame, and one whose last frame was not found is not said to.
+	for last, want := range map[int64]bool{10958: false, 6000: false, 5999: true, 0: false} {
+		if _, c := Lattice(0, last, 11000, 24, 1); c.SoundRunsOn != want {
+			t.Errorf("a file that ends at 11 s with its last frame at %d ms: sound runs on %v, want %v", last, c.SoundRunsOn, want)
+		}
 	}
 	// Even when it runs on for longer than a chunk may be. The list then
 	// says less than the last chunk holds, and stays one that can be used.

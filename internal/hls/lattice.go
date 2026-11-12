@@ -44,6 +44,12 @@ const (
 // the file, a cut may be. A chunk shorter than this is not worth a request.
 const latticeTailMs = 500
 
+// soundRunsOnMs is how long after the picture's last frame a file may go
+// on before its sound is said to run on (see Convert.SoundRunsOn). It is
+// well under the ten seconds ffmpeg waits for a track that has nothing,
+// with room for the second or two of frames an encoder holds back.
+const soundRunsOnMs = 5000
+
 // latticeSlackMs is how far from its place in the list a converted chunk
 // may begin. The list is in whole milliseconds and a tick seldom is, which
 // accounts for half of one.
@@ -131,7 +137,7 @@ func Lattice(startMs, lastMs, endMs, num, den int64) (Grid, Convert) {
 	g := Grid{Cuts: []int64{tickMs(tick0, num, den)}, From: "lattice"}
 	g.StartMs = g.Cuts[0]
 	first := divCeil(startMs, 1000) // the whole second the count of steps starts from
-	c := Convert{Num: num, Den: den, AnchorMs: anchorMs, Targets: []int64{first}}
+	c := Convert{Num: num, Den: den, AnchorMs: anchorMs, Targets: []int64{first}, SoundRunsOn: endMs-lastMs > soundRunsOnMs}
 
 	// No cut later than this.
 	limit := min(lastMs, endMs) - latticeTailMs
