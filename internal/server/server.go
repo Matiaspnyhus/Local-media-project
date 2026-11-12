@@ -106,10 +106,15 @@ type Server struct {
 	newTMDB func(key string) *metadata.Client
 	capsMu  sync.Mutex
 	caps    map[string]*playback.Caps // by session; the database holds them too (see capsFor)
-	ctx     context.Context
-	stop    context.CancelFunc
-	handler http.Handler
-	routes  []Route
+	// converting is the file each open conversion reads, by chunk token.
+	// It is how the file's folder is taken out of anything the converter
+	// says about it before that is logged (see pathless).
+	convMu     sync.Mutex
+	converting map[string]string
+	ctx        context.Context
+	stop       context.CancelFunc
+	handler    http.Handler
+	routes     []Route
 }
 
 type ctxKey int
@@ -151,7 +156,9 @@ func New(cfg Config) (*Server, error) {
 		if s.hls, err = hls.New(cfg.FFmpeg, filepath.Join(cfg.DataDir, "cache", "chunks")); err != nil {
 			return nil, err
 		}
-		s.hls.Log = s.log.Printf
+		// The converter's own lines quote ffmpeg, which names files by
+		// their full path.
+		s.hls.Log = func(format string, args ...any) { s.log.Printf("%s", s.pathless(fmt.Sprintf(format, args...))) }
 	}
 	var users int
 	if err := s.db.QueryRow(`SELECT count(*) FROM users`).Scan(&users); err != nil {

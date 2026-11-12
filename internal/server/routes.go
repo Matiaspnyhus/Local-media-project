@@ -469,7 +469,13 @@ func (s *Server) handleSupportBundle(w http.ResponseWriter, r *http.Request) {
 	info["converter"] = map[string]any{"found": s.hls != nil, "inspectorFound": s.ffprobe != ""}
 	add("info.json", info)
 	add("not-found-online.json", unmatched)
-	add("playback-problems.json", s.events.all())
+	// What players and the converter reported is scrubbed like the log:
+	// either can quote an address or a link.
+	problems := s.events.all()
+	for i := range problems {
+		problems[i].Detail = string(redact([]byte(problems[i].Detail)))
+	}
+	add("playback-problems.json", problems)
 	add("devices.json", s.deviceReports())
 	if f, err := zw.Create("log.txt"); err == nil {
 		f.Write(s.log.tail(512 << 10))

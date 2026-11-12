@@ -472,6 +472,7 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 			Path: path, Grid: s.grid(r.Context(), fileID, path, size, mtime, durationMs),
 			VideoCodec: ft.media.Video[0].Codec, AudioTrack: plan.AudioTrack, AudioCopy: plan.AudioCopy, Owner: u.SessionID,
 		})
+		s.noteConversion(token, path)
 		out["url"] = "/hls/" + token + "/index.m3u8"
 		out["mimeType"] = "application/vnd.apple.mpegurl"
 		out["hls"] = token
@@ -598,10 +599,57 @@ func (s *Server) handleHLSSegment(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) hlsFailed(w http.ResponseWriter, what string, err error) {
 	if !errors.Is(err, hls.ErrNoSession) && !errors.Is(err, hls.ErrPastEnd) && !errors.Is(err, hls.ErrSuperseded) && !errors.Is(err, context.Canceled) {
-		s.log.Printf("converting: %s failed: %v", what, err)
-		s.events.add(clientEvent{Time: time.Now().UTC().Format(time.RFC3339), Kind: "convert-failed", Detail: what + ": " + err.Error()})
+		// The error quotes ffmpeg, which names files by their full path.
+		detail := s.pathless(what + ": " + err.Error())
+		s.log.Printf("converting: %s failed", detail)
+		s.events.add(clientEvent{Time: time.Now().UTC().Format(time.RFC3339), Kind: "convert-failed", Detail: detail})
 	}
 	hlsError(w, err)
+}
+
+// noteConversion remembers which file an open conversion reads (see
+// pathless), and forgets the ones whose conversion is over.
+func (s *Server) noteConversion(token, path string) {
+	s.convMu.Lock()
+	var known []string
+	for t := range s.converting {
+		known = append(known, t)
+	}
+	s.convMu.Unlock()
+	var over []string
+	for _, t := range known {
+		if s.hls.Owner(t) == "" { // asked without convMu held: the converter has a lock of its own
+			over = append(over, t)
+		}
+	}
+	s.convMu.Lock()
+	defer s.convMu.Unlock()
+	for _, t := range over {
+		delete(s.converting, t)
+	}
+	if s.converting == nil {
+		s.converting = map[string]string{}
+	}
+	s.converting[token] = path
+}
+
+// pathless takes folder names out of text that quotes the converter or the
+// operating system, before the text is logged or kept for the support
+// bundle. ffmpeg names a file it cannot open by its full path, and on the
+// owner's PC that path holds their account name, or the name or address of
+// their network drive. The file's own name stays, because it says which
+// film had the problem. The data folder, which is under the account's name
+// too, becomes a placeholder.
+func (s *Server) pathless(text string) string {
+	s.convMu.Lock()
+	for _, p := range s.converting {
+		text = strings.ReplaceAll(text, p, filepath.Base(p))
+	}
+	s.convMu.Unlock()
+	if dir := filepath.Clean(s.dataDir); len(dir) > 1 {
+		text = strings.ReplaceAll(text, dir, "[data folder]")
+	}
+	return text
 }
 
 // handleHLSStop ends a conversion at once when its viewer closes the player.
