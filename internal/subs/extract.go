@@ -45,6 +45,12 @@ var ErrNotExtracted = errors.New("the subtitles of this film have not been taken
 // ErrBusy means a run for the same folder is still going.
 var ErrBusy = errors.New("the subtitles of this film are being taken out right now")
 
+// ErrNotReadThrough means the film could not be read to its end: its file
+// stops before the film does (a copy that was broken off), or the drive it
+// is on stopped answering. Nothing is kept of such a run. It is worth
+// trying again later, when the file is whole or the drive is back.
+var ErrNotReadThrough = errors.New("the film could not be read to its end")
+
 // Each folder has one run at a time: two would write the same files.
 var (
 	busyMu sync.Mutex
@@ -63,8 +69,9 @@ var (
 //
 // When ctx ends, ffmpeg is stopped and nothing is kept. In every case
 // where an error is returned the folder has no index, and Load says
-// ErrNotExtracted: a run counts only when ffmpeg finished without
-// complaint and every file it was to write is there and complete.
+// ErrNotExtracted: a run counts only when ffmpeg read the film to its end
+// (ErrNotReadThrough if it could not), ended well, and every file it was
+// to write is there and complete.
 //
 // A caller that may already have the result asks Load first; Extract
 // always does the work.
@@ -219,6 +226,9 @@ func (e *extraction) run(ctx context.Context) (Result, error) {
 		busyMu.Unlock()
 	}()
 
+	if stopsEarly(film) {
+		return Result{}, fmt.Errorf("%w: its file ends before the film does", ErrNotReadThrough)
+	}
 	seen, err := inspect(ctx, e.tools.FFprobe, film)
 	if err != nil {
 		return Result{}, err
@@ -330,7 +340,7 @@ func (e *extraction) convert(ctx context.Context, j job, seen inventory, film, w
 	// Should anything keep ffmpeg's output open after it has been stopped,
 	// it is not waited for for ever.
 	cmd.WaitDelay = 10 * time.Second
-	said := &tail{}
+	said := &heard{}
 	cmd.Stderr = said
 	out, err := cmd.StdoutPipe()
 	if err != nil {
@@ -339,7 +349,8 @@ func (e *extraction) convert(ctx context.Context, j job, seen inventory, film, w
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("the converter could not be started: %w", err)
 	}
-	e.follow(out, seen, j.outputs() > 0)
+	reading := j.outputs() > 0 // otherwise only fonts are fetched, and none of the film is read
+	reachedMs, timed := e.follow(out, seen, reading)
 	err = cmd.Wait()
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -347,22 +358,46 @@ func (e *extraction) convert(ctx context.Context, j job, seen inventory, film, w
 	if err != nil {
 		return fmt.Errorf("the converter stopped before the subtitles were written: %v %s", err, pathless(said.String(), film))
 	}
+	// ffmpeg ends well even when it could not read the film to its end: it
+	// says what stopped it and makes do with what it has, and every file
+	// it wrote is in good form as far as it goes. So what it said is
+	// looked at.
+	if failure := said.readFailure(); failure != "" {
+		return fmt.Errorf("%w: %s", ErrNotReadThrough, pathless(failure, film))
+	}
+	// Its wording for that has changed before and will again. So a
+	// complaint of any kind counts as that one if the reading also stopped
+	// well short of the length the film says it has.
+	//
+	// The clock alone is not gone by. A film can be shorter than it says
+	// without anything being wrong with it: its length is that of its
+	// longest track, a single stray caption far past the end among them,
+	// and the clock is only one of its tracks.
+	if reading && timed && seen.durationMs > 0 && said.String() != "" {
+		if short := seen.durationMs - (reachedMs - seen.startMs); short > max(10000, seen.durationMs/50) {
+			return fmt.Errorf("%w: reading stopped %d seconds before the end: %s", ErrNotReadThrough, short/1000, pathless(said.String(), film))
+		}
+	}
 	return nil
 }
 
 // follow reads the clock to its end, which is when ffmpeg closes it, and
 // passes on how far through the film it has got. The numbers are the times
-// of the film's own clock in thousandths of a second.
-func (e *extraction) follow(out io.Reader, seen inventory, reading bool) {
+// of the film's own clock in thousandths of a second. It returns the
+// latest of them, if there was one.
+func (e *extraction) follow(out io.Reader, seen inventory, reading bool) (reachedMs int64, timed bool) {
 	last := -1
 	lines := bufio.NewScanner(out)
 	for lines.Scan() {
-		if e.progress == nil || !reading || seen.durationMs <= 0 {
-			continue // still read, so that ffmpeg is never kept waiting
-		}
 		ms, err := strconv.ParseInt(strings.TrimSpace(lines.Text()), 10, 64)
 		if err != nil {
 			continue // the heading
+		}
+		if !timed || ms > reachedMs {
+			reachedMs, timed = ms, true
+		}
+		if e.progress == nil || !reading || seen.durationMs <= 0 {
+			continue // still read, so that ffmpeg is never kept waiting
 		}
 		// 100 is kept for "finished and in place".
 		percent := int(min(max((ms-seen.startMs)*100/seen.durationMs, 0), 99))
@@ -373,6 +408,7 @@ func (e *extraction) follow(out io.Reader, seen inventory, reading bool) {
 	}
 	// Whatever is left if a line was too long to be one of these.
 	io.Copy(io.Discard, out)
+	return reachedMs, timed
 }
 
 // check looks at one file ffmpeg wrote for a track. It returns what the
@@ -606,28 +642,73 @@ func sized(dir, name string, size int64) bool {
 	return err == nil && st.Mode().IsRegular() && st.Size() == size
 }
 
-// tail keeps the last part of what ffmpeg wrote to its error output.
-type tail struct {
-	mu  sync.Mutex
-	b   []byte
-	cut bool // the beginning has been dropped
+// heard is what ffmpeg wrote to its error output: the last part of it, for
+// saying what went wrong, and whether any of it said that the film could
+// not be read.
+type heard struct {
+	mu     sync.Mutex
+	b      []byte
+	cut    bool   // the beginning has been dropped
+	line   []byte // the line that is being written
+	failed string // the first line that says reading failed
 }
 
-func (t *tail) Write(p []byte) (int, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.b = append(t.b, p...)
-	if len(t.b) > 4096 {
-		t.b, t.cut = t.b[len(t.b)-4096:], true
+// What ffmpeg says, at one place or another, when reading a film fails or
+// the file ends before it should. The first is said by ffmpeg itself
+// whatever the kind of file, with the reason after it ("Input/output
+// error", "Connection timed out"); the others by its readers of MKV and
+// MP4 files.
+var readFailures = []string{"error during demuxing", "error retrieving a packet from demuxer", "read error", "file ended prematurely", "partial file", "input/output error"}
+
+func (h *heard) Write(p []byte) (int, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.b = append(h.b, p...)
+	if len(h.b) > 4096 {
+		h.b, h.cut = h.b[len(h.b)-4096:], true
+	}
+	// Every line is looked at as it comes by: the one that matters may be
+	// followed by more than is kept.
+	for _, c := range p {
+		if c != '\n' && c != '\r' {
+			if len(h.line) < 512 {
+				h.line = append(h.line, c)
+			}
+			continue
+		}
+		h.look()
 	}
 	return len(p), nil
 }
 
-func (t *tail) String() string {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	b := t.b
-	if t.cut {
+// look takes in the line that has just been written.
+func (h *heard) look() {
+	if h.failed == "" {
+		low := strings.ToLower(string(h.line))
+		for _, words := range readFailures {
+			if strings.Contains(low, words) {
+				h.failed = strings.TrimSpace(string(h.line))
+				break
+			}
+		}
+	}
+	h.line = h.line[:0]
+}
+
+// readFailure returns the line in which ffmpeg said it could not read the
+// film, or "".
+func (h *heard) readFailure() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.look() // a last line that was not ended
+	return h.failed
+}
+
+func (h *heard) String() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	b := h.b
+	if h.cut {
 		// Only whole lines: the first is likely cut off at its beginning,
 		// and half a path cannot be told from a whole one by pathless.
 		_, rest, _ := bytes.Cut(b, []byte("\n"))

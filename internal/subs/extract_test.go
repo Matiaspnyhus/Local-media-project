@@ -542,8 +542,8 @@ func TestTheLongestCommandLineFitsOnWindows(t *testing.T) {
 
 // What follows uses the stand-in, and so runs everywhere.
 
-// A good run: the reports follow the stand-in's clock (0, 10, 50 and 99.9
-// seconds of a film of 100), and 100 comes only when all is in place.
+// A good run: the reports follow the stand-in's clock (0, 10, 50, 99.9 and
+// 100.5 seconds of a film of 100), and 100 comes only when all is in place.
 func TestProgressFollowsTheClock(t *testing.T) {
 	tl := standInTools(t, "ok")
 	dir, res, percents := extracted(t, tl, "any.mkv")

@@ -31,6 +31,12 @@ import (
 //	recording: the late film as a TV recording keeps it (MPEG-TS), with a
 //	        clock that starts ten hours in.
 //	phone:  6 seconds as MP4 with the kind of text track MP4 files have.
+//	streamed: the same as phone, with the list of what the file holds at
+//	        its beginning (as files made for playing over a network have
+//	        it), so that it can still be opened when its end is missing.
+//	live:   6 seconds with a styled track, as a program that records what
+//	        is being broadcast writes it: the file does not say how large
+//	        or how long it is.
 //	silent: 6 seconds of picture without sound, and two text tracks in the
 //	        two text formats MKV files mostly hold.
 //	bare:   6 seconds with no subtitles at all.
@@ -230,6 +236,18 @@ func madeFilm(t *testing.T, tl Tools, name string) string {
 		p = in(name + ".mp4")
 		recipe = join(both("6"), []string{"-i", in("b.srt"), "-map", "0:v", "-map", "1:a", "-map", "2:s"}, h264,
 			[]string{"-c:a", "aac", "-b:a", "64k", "-c:s", "mov_text", "-metadata:s:s:0", "language=fra", p})
+	case "streamed":
+		// An MP4 made to be played while it is still arriving: the list of
+		// what it holds is at its beginning, so half of it can be opened.
+		p = in(name + ".mp4")
+		recipe = join(both("6"), []string{"-i", in("b.srt"), "-map", "0:v", "-map", "1:a", "-map", "2:s"}, h264,
+			[]string{"-c:a", "aac", "-b:a", "64k", "-c:s", "mov_text", "-movflags", "+faststart", p})
+	case "live":
+		// ffmpeg cannot go back in what it hands over piece by piece, so
+		// the places where an MKV file says how large and how long it is
+		// stay empty.
+		recipe = join(both("6"), []string{"-i", in("a.ass"), "-map", "0:v", "-map", "1:a", "-map", "2:s"}, h264,
+			[]string{"-c:a", "aac", "-b:a", "64k", "-c:s", "ass", "-f", "matroska", "pipe:1"})
 	case "silent":
 		recipe = join(picture("6"), []string{"-i", in("b.srt"), "-map", "0:v", "-map", "1:s", "-map", "1:s"}, h264, []string{"-c:s:0", "subrip", "-c:s:1", "webvtt", p})
 	case "bare":
@@ -244,9 +262,20 @@ func madeFilm(t *testing.T, tl Tools, name string) string {
 	default:
 		t.Fatalf("no recipe for a film called %q", name)
 	}
-	out, err := exec.Command(tl.FFmpeg, append([]string{"-hide_banner", "-loglevel", "error", "-y"}, recipe...)...).CombinedOutput()
-	if err != nil {
-		t.Fatalf("could not make the test film %q: %v\n%s", name, err, out)
+	cmd := exec.Command(tl.FFmpeg, append([]string{"-hide_banner", "-loglevel", "error", "-y"}, recipe...)...)
+	var said bytes.Buffer
+	cmd.Stderr = &said
+	if recipe[len(recipe)-1] == "pipe:1" {
+		// The film is handed over as it is made, and kept as it arrives.
+		file, err := os.Create(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		cmd.Stdout = file
+	}
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("could not make the test film %q: %v\n%s", name, err, said.String())
 	}
 	films[name] = p
 	return p
@@ -352,7 +381,8 @@ const standInFilm = `{"format": {"start_time": "0.000000", "duration": "100.0000
 // standIn behaves as ffprobe when it is asked to describe a file, and
 // otherwise as ffmpeg: it writes the four files that go with standInFilm
 // into the folder it was started in, says on its clock that it has read 0,
-// 10, 50 and 99.9 seconds, and ends. how changes one thing about that:
+// 10, 50, 99.9 and 100.5 seconds, and ends. how changes one thing about
+// that:
 //
 //	ok           nothing
 //	hang         after the first two times on the clock it never ends
@@ -360,7 +390,11 @@ const standInFilm = `{"format": {"start_time": "0.000000", "duration": "100.0000
 //	cut-sup, cut-ass, cut-vtt, cut-font
 //	             that file is cut short (the font: is empty), and it ends well
 //	no-sup       that file is not written, and it ends well
+//	short:WORDS  it says WORDS as ffmpeg says what troubles it, stops
+//	             reading at 50 seconds, and ends well
+//	whole:WORDS  it says WORDS, reads to the end, and ends well
 func standIn(how string) {
+	how, words, _ := strings.Cut(how, ":")
 	args := os.Args[1:]
 	for _, a := range args {
 		if a == "-print_format" {
@@ -416,6 +450,15 @@ func standIn(how string) {
 		os.Exit(3)
 	}
 	fmt.Println(50000)
+	if words != "" {
+		fmt.Fprintln(os.Stderr, words)
+	}
+	if how == "short" {
+		os.Exit(0)
+	}
 	fmt.Println(99900)
+	// The last piece of sound often ends a little after the film is said
+	// to: that is still not "finished".
+	fmt.Println(100500)
 	os.Exit(0)
 }
