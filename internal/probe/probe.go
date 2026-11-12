@@ -102,6 +102,7 @@ func Run(ctx context.Context, ffprobe, path string) (Result, error) {
 
 type rawProbe struct {
 	Format struct {
+		Filename   string `json:"filename"`
 		FormatName string `json:"format_name"`
 		Duration   string `json:"duration"`
 		BitRate    string `json:"bit_rate"`
@@ -138,7 +139,7 @@ func Parse(out []byte) (Result, error) {
 	if err := json.Unmarshal(out, &raw); err != nil {
 		return Result{}, err
 	}
-	res := Result{Container: container(raw.Format.FormatName), BitRate: atoi64(raw.Format.BitRate)}
+	res := Result{BitRate: atoi64(raw.Format.BitRate)}
 	if d, err := strconv.ParseFloat(raw.Format.Duration, 64); err == nil {
 		res.DurationMs = int64(d * 1000)
 	}
@@ -179,14 +180,23 @@ func Parse(out []byte) (Result, error) {
 		}
 		res.Streams = append(res.Streams, st)
 	}
+	res.Container = container(raw.Format.FormatName, raw.Format.Filename, res.Streams)
 	return res, nil
 }
 
 // container names the file format in one word; ffprobe lists every name a
 // demuxer answers to ("mov,mp4,m4a,3gp,3g2,mj2", "matroska,webm").
-func container(formatName string) string {
+//
+// MKV and WebM share a name there, because WebM is a kind of MKV. Browsers
+// tell them apart: Firefox and Safari play WebM and not MKV. So a file is
+// called "webm" here when it is named .webm, or when it holds nothing but
+// what WebM may hold.
+func container(formatName, fileName string, streams []Stream) string {
 	switch {
 	case strings.Contains(formatName, "matroska"):
+		if strings.EqualFold(filepath.Ext(fileName), ".webm") || onlyWebM(streams) {
+			return "webm"
+		}
 		return "matroska"
 	case strings.Contains(formatName, "mp4"):
 		return "mp4"
@@ -195,6 +205,30 @@ func container(formatName string) string {
 		return formatName[:i]
 	}
 	return formatName
+}
+
+// onlyWebM reports whether a file has a picture and holds only what WebM
+// may hold: VP8, VP9 or AV1 picture, Opus or Vorbis sound, WebVTT subtitles.
+func onlyWebM(streams []Stream) bool {
+	picture := false
+	for _, s := range streams {
+		switch s.Kind {
+		case "video":
+			if s.Codec != "vp8" && s.Codec != "vp9" && s.Codec != "av1" {
+				return false
+			}
+			picture = true
+		case "audio":
+			if s.Codec != "opus" && s.Codec != "vorbis" {
+				return false
+			}
+		case "subtitle":
+			if s.Codec != "webvtt" {
+				return false
+			}
+		}
+	}
+	return picture
 }
 
 func tag(tags map[string]string, key string) string {

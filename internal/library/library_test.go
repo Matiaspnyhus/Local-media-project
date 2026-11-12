@@ -293,6 +293,51 @@ func TestProbePendingStoresTracksOnce(t *testing.T) {
 	}
 }
 
+// A file named .webm is stored as WebM, not as MKV (ffprobe has one name
+// for both). And a file an earlier version stored as MKV, which the
+// upgrade marked with a size that cannot match, is inspected again.
+func TestWebMIsStoredAsWebMAndMarkedFilesAreInspectedAgain(t *testing.T) {
+	ff := probe.Find()
+	if ff == "" {
+		if os.Getenv("LM_REQUIRE_FFMPEG") != "" {
+			t.Fatal("ffprobe was not found, and LM_REQUIRE_FFMPEG says it must be")
+		}
+		t.Skip("ffprobe is not installed here")
+	}
+	media := t.TempDir()
+	// Any Matroska file will do: what makes this one WebM is its name.
+	src, err := os.ReadFile(filepath.Join("..", "..", "e2e", "fixtures", "Dolby.Sound.Test.mkv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(media, "Web Clip.webm"), src, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	d := open(t)
+	lib, _ := Add(d, media)
+	Scan(d, lib)
+	stored := func() (container string) {
+		d.QueryRow(`SELECT container FROM files`).Scan(&container)
+		return container
+	}
+	if res, err := ProbePending(context.Background(), d, ff); err != nil || res.Inspected != 1 || stored() != "webm" {
+		t.Fatalf("inspected %+v %v, stored as %q; want webm", res, err, stored())
+	}
+	// As an earlier version left it. Nothing looks at the file again...
+	d.Exec(`UPDATE files SET container='matroska'`)
+	if res, _ := ProbePending(context.Background(), d, ff); res.Inspected != 0 || stored() != "matroska" {
+		t.Fatalf("an unmarked file was inspected again: %+v", res)
+	}
+	// ...until the upgrade marks it.
+	d.Exec(`UPDATE files SET probed_size=-1`)
+	if res, err := ProbePending(context.Background(), d, ff); err != nil || res.Inspected != 1 || stored() != "webm" {
+		t.Fatalf("a marked file: inspected %+v %v, stored as %q; want webm", res, err, stored())
+	}
+	if res, _ := ProbePending(context.Background(), d, ff); res.Inspected != 0 {
+		t.Fatalf("it was inspected a third time: %+v", res)
+	}
+}
+
 func TestListDirs(t *testing.T) {
 	root := t.TempDir()
 	os.Mkdir(filepath.Join(root, "b"), 0o755)

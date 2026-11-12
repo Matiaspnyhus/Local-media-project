@@ -449,7 +449,7 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		exp := time.Now().Add(linkLife).Unix()
 		sig := auth.SignLink(s.linkKey, fileID, exp, u.SessionID)
 		out["url"] = "/stream/" + fileID + "?e=" + strconv.FormatInt(exp, 10) + "&s=" + u.SessionID + "&g=" + sig
-		out["mimeType"] = mediaTypes[ext]
+		out["mimeType"] = mediaType(rel, container)
 	}
 	planOut := map[string]any{"playable": plan.Playable, "method": plan.Method, "reasons": plan.Reasons, "audioTrack": plan.AudioTrack, "audioCopy": plan.AudioCopy, "hasAudio": nil,
 		"deviceUnknown": plan.DeviceUnknown}

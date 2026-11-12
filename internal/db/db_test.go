@@ -114,6 +114,76 @@ func TestUpgradeBacksUpFirstAndFailureChangesNothing(t *testing.T) {
 	}
 }
 
+// Schema 6 changes what is stored about some files (WebM is no longer
+// called MKV). Files inspected before it that may be affected must be
+// marked for another inspection, and no others: inspecting a big library
+// again takes a while.
+func TestUpgradeToSchema6MarksFilesToInspectAgain(t *testing.T) {
+	dir := t.TempDir()
+	orig := migrations
+	defer func() { migrations = orig }()
+	migrations = orig[:5]
+	d, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	must := func(q string, args ...any) {
+		t.Helper()
+		if _, err := d.Exec(q, args...); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	must(`INSERT INTO libraries(id,name,path,created_at) VALUES('l','media','/sample/media',0)`)
+	must(`INSERT INTO items(id,library_id,kind,title,sort_title,created_at) VALUES('i','l','movie','x','x',0)`)
+	must(`INSERT INTO versions(id,item_id) VALUES('v','i')`)
+	files := []struct {
+		name, container string
+		probed          int
+		codecs          []string // picture first
+		again           bool
+	}{
+		{"Clip.webm", "matroska", 1, []string{"vp9", "opus"}, true},
+		{"NAMED.WEBM", "matroska", 1, []string{"h264", "aac"}, true},
+		{"Web Video.mkv", "matroska", 1, []string{"av1", "opus"}, true},
+		{"Film.mkv", "matroska", 1, []string{"h264", "ac3"}, false},
+		{"Clip.mp4", "mp4", 1, []string{"av1", "aac"}, false},
+		{"Not Inspected Yet.webm", "", 0, nil, false},
+		{"Unreadable.webm", "", 2, nil, false},
+	}
+	for _, f := range files {
+		must(`INSERT INTO files(id,version_id,library_id,rel_path,size,mtime,probed,probed_size,probed_mtime,container) VALUES(?,'v','l',?,1000,5,?,1000,5,?)`,
+			f.name, f.name, f.probed, f.container)
+		for i, codec := range f.codecs {
+			kind := "audio"
+			if i == 0 {
+				kind = "video"
+			}
+			must(`INSERT INTO streams(file_id,idx,kind,codec) VALUES(?,?,?,?)`, f.name, i, kind, codec)
+		}
+	}
+	d.Close()
+
+	migrations = orig
+	if d, err = Open(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	for _, f := range files {
+		var size int64
+		var container string
+		if err := d.QueryRow(`SELECT probed_size, container FROM files WHERE id=?`, f.name).Scan(&size, &container); err != nil {
+			t.Fatal(err)
+		}
+		// "Inspect again" is a remembered size that cannot match the file's.
+		if again := size != 1000; again != f.again {
+			t.Errorf("%s: marked for another inspection = %v, want %v", f.name, again, f.again)
+		}
+		if container != f.container {
+			t.Errorf("%s: the upgrade itself changed what is stored (%q), which is for the inspection to do", f.name, container)
+		}
+	}
+}
+
 func TestNewerDatabaseIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	d, err := Open(dir)

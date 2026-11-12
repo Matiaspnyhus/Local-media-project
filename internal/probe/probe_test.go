@@ -40,6 +40,57 @@ func TestParse(t *testing.T) {
 	}
 }
 
+// ffprobe gives MKV and WebM one name ("matroska,webm"). Browsers do not
+// treat them as one: Firefox and Safari play WebM and not MKV. So the two
+// are told apart here, by the file's name or by what is inside.
+func TestWebMIsToldApartFromMKV(t *testing.T) {
+	file := func(name string, streams ...string) []byte {
+		list := ""
+		for i, s := range streams {
+			kind := "audio"
+			switch s {
+			case "vp8", "vp9", "av1", "h264", "hevc":
+				kind = "video"
+			case "webvtt", "subrip", "ass":
+				kind = "subtitle"
+			}
+			if i > 0 {
+				list += ","
+			}
+			list += `{"index":` + string(rune('0'+i)) + `,"codec_name":"` + s + `","codec_type":"` + kind + `"}`
+		}
+		return []byte(`{"streams":[` + list + `],"format":{"filename":"/films/` + name + `","format_name":"matroska,webm","duration":"10.0"}}`)
+	}
+	for _, c := range []struct {
+		why  string
+		out  []byte
+		want string
+	}{
+		{"named .webm", file("Clip.webm", "vp9", "opus"), "webm"},
+		{"named .WEBM", file("CLIP.WEBM", "vp8", "vorbis"), "webm"},
+		{"named .webm, whatever is inside", file("Odd.webm", "h264", "aac"), "webm"},
+		{"an .mkv that holds only what WebM holds", file("Clip.mkv", "av1", "opus"), "webm"},
+		{"the same with WebM's own kind of subtitles", file("Clip.mkv", "vp9", "opus", "webvtt"), "webm"},
+		{"an ordinary .mkv", file("Film.mkv", "h264", "ac3"), "matroska"},
+		{"VP9 picture, but sound WebM cannot hold", file("Film.mkv", "vp9", "aac"), "matroska"},
+		{"VP9 and Opus, but subtitles WebM cannot hold", file("Film.mkv", "vp9", "opus", "subrip"), "matroska"},
+		{"sound only", file("Song.mka", "opus"), "matroska"},
+	} {
+		r, err := Parse(c.out)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.Container != c.want {
+			t.Errorf("%s: stored as %q, want %q", c.why, r.Container, c.want)
+		}
+	}
+	// A file that is not Matroska at all is not renamed by its extension.
+	r, _ := Parse([]byte(`{"streams":[{"index":0,"codec_name":"vp9","codec_type":"video"}],"format":{"filename":"x.webm","format_name":"mov,mp4,m4a,3gp,3g2,mj2"}}`))
+	if r.Container != "mp4" {
+		t.Errorf("an MP4 named .webm is stored as %q", r.Container)
+	}
+}
+
 func TestRunOnRealFiles(t *testing.T) {
 	ff := Find()
 	if ff == "" {

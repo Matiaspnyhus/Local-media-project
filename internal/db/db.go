@@ -224,6 +224,13 @@ ALTER TABLE track_memory ADD COLUMN audio_index INTEGER NOT NULL DEFAULT -1;  --
 ALTER TABLE track_memory ADD COLUMN audio_kind TEXT NOT NULL DEFAULT '';      -- '' ordinary sound, 'commentary'
 ALTER TABLE track_memory ADD COLUMN sub_key TEXT NOT NULL DEFAULT '';         -- the subtitle as the page names it, '' for none
 ALTER TABLE track_memory ADD COLUMN sub_kind TEXT NOT NULL DEFAULT '';        -- 'full', 'described', 'forced' or 'off'
+
+-- WebM files used to be stored as MKV, which Firefox and Safari do not
+-- open although they play WebM. Files that may be WebM are inspected again:
+-- an inspected size that cannot match marks them for the next round (see
+-- library.ProbePending). Until then they keep what was stored.
+UPDATE files SET probed_size = -1 WHERE probed = 1 AND container = 'matroska' AND (rel_path LIKE '%.webm'
+  OR id IN (SELECT file_id FROM streams WHERE kind = 'video' AND codec IN ('vp8','vp9','av1')));
 `,
 }
 

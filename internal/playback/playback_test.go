@@ -19,8 +19,8 @@ func caps(hls bool, containers, video, audio string) *Caps {
 
 // What the browsers this project targets report, as measured or documented.
 var devices = map[string]*Caps{
-	"chrome":      caps(true, "mp4 mov webm matroska", "h264 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
-	"chrome+hevc": caps(true, "mp4 mov webm matroska", "h264 hevc hevc10 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
+	"chrome":      caps(true, "mp4 mov webm matroska", "h264 h264-10 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
+	"chrome+hevc": caps(true, "mp4 mov webm matroska", "h264 h264-10 hevc hevc10 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
 	"safari":      caps(true, "mp4 mov", "h264 hevc hevc10", "aac mp3 ac3 eac3 flac"),
 	"firefox":     caps(true, "mp4 mov webm", "h264 vp9 vp8 av1", "aac mp3 opus flac vorbis"),
 	"old-tv":      caps(false, "mp4", "h264", "aac mp3"),
@@ -87,7 +87,19 @@ func TestDecide(t *testing.T) {
 		{"mkv h264 flac", "chrome", media("matroska", "h264", 8, "flac"), Direct, ""},
 		// FLAC plays in Safari but cannot be passed through when repackaging.
 		{"mkv h264 flac", "safari", media("matroska", "h264", 8, "flac"), Audio, "MKV"},
-		{"10-bit h264", "chrome", media("matroska", "h264", 10, "aac"), None, "10-bit H.264"},
+		// 10-bit H.264 (common in anime) plays in Chrome, which says so
+		// under the key "h264-10"; Safari and Firefox do not say so. This
+		// case used to demand that Chrome refuse it, which was the bug: the
+		// page never reported that key.
+		{"10-bit h264", "chrome", media("matroska", "h264", 10, "aac"), Direct, ""},
+		{"10-bit h264 with Dolby sound", "chrome", media("matroska", "h264", 10, "ac3"), Audio, "Dolby Digital"},
+		{"10-bit h264", "safari", media("mp4", "h264", 10, "aac"), None, "10-bit H.264"},
+		{"10-bit h264", "firefox", media("mp4", "h264", 10, "aac"), None, "10-bit H.264"},
+		// WebM is not MKV: Firefox plays it although it does not open MKV.
+		{"webm vp9 opus", "firefox", media("webm", "vp9", 8, "opus"), Direct, ""},
+		{"webm av1 opus", "firefox", media("webm", "av1", 8, "opus"), Direct, ""},
+		// And where it cannot be opened, it is called by its own name.
+		{"a .webm on a device without WebM", "safari", media("webm", "h264", 8, "aac"), Remux, "packaged as WebM"},
 	}
 	for _, c := range cases {
 		dev := devices[c.device]

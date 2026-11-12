@@ -235,6 +235,36 @@ func TestAChoiceCarriesToTheNextEpisode(t *testing.T) {
 	}
 }
 
+// A file found to be WebM plays in a browser that plays WebM and not MKV
+// (Firefox, Safari), and is sent as WebM even when it is named .mkv.
+func TestAWebMFilePlaysWhereMKVDoesNot(t *testing.T) {
+	e := filmWith(t, []string{`0,'video','vp9',1,0,0,0,'',''`, `1,'audio','opus',1,0,0,0,'eng',''`}, nil)
+	e.do("POST", "/api/capabilities", remote, e.c, map[string]any{"containers": map[string]bool{"mp4": true, "webm": true},
+		"video": map[string]bool{"h264": true, "vp9": true}, "audio": map[string]bool{"aac": true, "opus": true}, "hls": true})
+	play := func() (p struct {
+		URL, MimeType string
+		Plan          struct {
+			Playable, Method string
+			Reasons          []string
+		}
+	}) {
+		decode(t, e.do("POST", "/api/items/"+e.film+"/play", remote, e.c, nil), &p)
+		return p
+	}
+	// Stored as an earlier version stored every such file: as MKV.
+	if p := play(); p.Plan.Playable != "no" || !strings.Contains(strings.Join(p.Plan.Reasons, " "), "MKV") {
+		t.Fatalf("stored as MKV: %+v", p)
+	}
+	e.s.db.Exec(`UPDATE files SET container='webm' WHERE id=?`, e.fileID)
+	p := play()
+	if p.Plan.Playable != "yes" || p.Plan.Method != "direct" || p.MimeType != "video/webm" {
+		t.Fatalf("stored as WebM: %+v", p)
+	}
+	if w := e.do("GET", p.URL, remote, nil, nil); w.Code != 200 || w.Header().Get("Content-Type") != "video/webm" {
+		t.Errorf("the file itself: %d, sent as %q", w.Code, w.Header().Get("Content-Type"))
+	}
+}
+
 // needFFmpeg returns the converter, or skips the test where there is none
 // (unless LM_REQUIRE_FFMPEG says there must be).
 func needFFmpeg(t *testing.T) string {

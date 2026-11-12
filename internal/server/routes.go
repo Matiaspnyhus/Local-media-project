@@ -394,8 +394,8 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "This link is not valid any more.")
 		return
 	}
-	var libPath, rel string
-	err = s.db.QueryRow(`SELECT l.path, f.rel_path FROM files f JOIN libraries l ON l.id=f.library_id WHERE f.id=?`, fileID).Scan(&libPath, &rel)
+	var libPath, rel, container string
+	err = s.db.QueryRow(`SELECT l.path, f.rel_path, f.container FROM files f JOIN libraries l ON l.id=f.library_id WHERE f.id=?`, fileID).Scan(&libPath, &rel, &container)
 	if err != nil {
 		writeErr(w, http.StatusNotFound, "Not found.")
 		return
@@ -407,7 +407,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 	s.lastStream.Store(time.Now().Unix())
-	if ct := mediaTypes[strings.ToLower(filepath.Ext(rel))]; ct != "" {
+	if ct := mediaType(rel, container); ct != "" {
 		w.Header().Set("Content-Type", ct)
 	} else {
 		w.Header().Set("Content-Type", "application/octet-stream")
