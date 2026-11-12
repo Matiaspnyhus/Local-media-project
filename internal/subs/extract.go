@@ -191,10 +191,16 @@ func (e *extraction) run(ctx context.Context) (Result, error) {
 		return Result{}, errors.New("ffmpeg is not available")
 	}
 	// ffmpeg is started in another folder, where a path that is not whole
-	// would lead somewhere else.
+	// would lead somewhere else: the film's, and ffmpeg's own if it was
+	// given as a path and not as a bare name to look up.
 	film, err := filepath.Abs(e.film)
 	if err != nil {
 		return Result{}, err
+	}
+	if filepath.Base(e.tools.FFmpeg) != e.tools.FFmpeg {
+		if e.tools.FFmpeg, err = filepath.Abs(e.tools.FFmpeg); err != nil {
+			return Result{}, err
+		}
 	}
 	dir, err := filepath.Abs(e.dir)
 	if err != nil {

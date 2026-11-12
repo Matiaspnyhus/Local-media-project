@@ -509,6 +509,31 @@ func TestProgressFollowsTheClock(t *testing.T) {
 	}
 }
 
+// ffmpeg is started inside the folder it writes into. A film, a folder or
+// a converter given by a path that starts from where this program is must
+// still be found from there.
+func TestPathsThatAreNotWholeStillLead(t *testing.T) {
+	tl := standInTools(t, "ok")
+	here, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := t.TempDir()
+	t.Chdir(base)
+	rel, err := filepath.Rel(base, tl.FFmpeg)
+	if err != nil {
+		t.Skipf("the test program cannot be reached from the temporary folder by a relative path: %v", err) // another drive, on Windows
+	}
+	tl.FFmpeg = rel
+	res, err := Extract(context.Background(), tl, filepath.Join("films", "any.mkv"), filepath.Join("cache", "subs"), nil)
+	if err != nil || len(res.Tracks) != 3 {
+		t.Fatalf("with paths that are not whole: %+v, %v", res, err)
+	}
+	if _, err := Load(filepath.Join(base, "cache", "subs")); err != nil {
+		t.Errorf("the result is not where it was asked for (the test began in %s): %v", here, err)
+	}
+}
+
 // nothingKept fails the test unless the folder is as a run that did not
 // finish must leave it: no index, nothing of the making, and Load saying
 // so.
