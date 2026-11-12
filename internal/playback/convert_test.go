@@ -776,6 +776,11 @@ func TestPictureSizes(t *testing.T) {
 		{1080, 1920, 720, 720, 1280},
 		{2160, 3840, 1080, 1080, 1920},
 		{886, 1920, 480, 394, 854},
+		// H.264 wants an even number of pixels each way, also from a
+		// picture that fits as it is.
+		{853, 479, 480, 852, 478},
+		{1279, 719, 1080, 1278, 718},
+		{479, 853, 480, 478, 852},
 	} {
 		if w, h := fit(c.width, c.height, c.lines); w != c.wantW || h != c.wantH {
 			t.Errorf("%dx%d into %d lines: %dx%d, want %dx%d", c.width, c.height, c.lines, w, h, c.wantW, c.wantH)
@@ -786,12 +791,19 @@ func TestPictureSizes(t *testing.T) {
 		want          Size
 		word          string
 	}{
-		{854, 480, Size480, "480p"}, {640, 360, Size480, "480p"}, {720, 576, Size720, "720p"}, {1280, 720, Size720, "720p"},
+		{854, 480, Size480, "480p"}, {1280, 720, Size720, "720p"},
 		{1280, 536, Size720, "720p"}, {1280, 400, Size720, "720p"}, {1920, 800, Size1080, "1080p"}, {1920, 700, Size1080, "1080p"},
 		{1920, 1080, Size1080, "1080p"}, {1920, 1088, Size1080, "1080p"},
 		{1440, 1080, Size1080, "1080p"}, {2560, 1440, Size4K, "1440p"}, {3840, 1600, Size4K, "4K"}, {3840, 2160, Size4K, "4K"},
 		{0, 2160, Size4K, "4K"}, {0, 0, "", ""},
 		{1080, 1920, Size1080, "1080p"}, {720, 1280, Size720, "720p"}, {480, 854, Size480, "480p"}, {2160, 3840, Size4K, "4K"}, {1440, 2560, Size4K, "1440p"},
+		// Films with their black bars cut off, a few pixels short of the frame.
+		{1916, 796, Size1080, "1080p"}, {1276, 532, Size720, "720p"}, {704, 480, Size480, "480p"}, {640, 480, Size480, "480p"},
+		// Sizes that fill none of the frames go by their numbers: calling
+		// a DVD's 576 lines "720p", or 1200 lines "1440p", would be untrue.
+		{720, 576, Size720, "720x576"}, {1024, 576, Size720, "1024x576"}, {640, 360, Size480, "640x360"}, {352, 288, Size480, "352x288"},
+		{1920, 1200, Size4K, "1920x1200"}, {2048, 858, Size4K, "2048x858"}, {1998, 1080, Size4K, "1998x1080"}, {2560, 1080, Size4K, "2560x1080"},
+		{1200, 1920, Size4K, "1200x1920"}, {0, 576, Size720, "576p"}, {0, 1200, Size4K, "1200p"},
 	} {
 		if got := sizeOf(c.width, c.height); got != c.want {
 			t.Errorf("%dx%d is %q, want %q", c.width, c.height, got, c.want)
@@ -930,6 +942,15 @@ func TestWhatIsLost(t *testing.T) {
 			[]string{"4K picture shown as 720p.", "Dolby Vision shown as normal colour."}},
 		{"1080p made lighter by two steps", film("mp4", "h264", 8, "aac", sizes[1], colours[0], ""), "chrome", Want{Audio: -1, Subtitle: -1, Lower: 3}, able,
 			[]string{"1080p picture shown as 720p."}},
+		// A picture with an odd number of lines loses one to H.264. That
+		// is not "shown smaller": nothing is said.
+		{"an odd-sized film that fits its rung", film("avi", "mpeg4", 8, "mp3", pictureSize{"853x479", 853, 479}, colours[0], ""), "chrome", Want{Audio: -1, Subtitle: -1, Lower: 5}, able,
+			[]string{}},
+		// Sizes that have no name of their own are named by their numbers.
+		{"a DVD made lighter", film("avi", "mpeg4", 8, "mp3", pictureSize{"a PAL DVD", 720, 576}, colours[0], ""), "chrome", Want{Audio: -1, Subtitle: -1, Lower: 5}, able,
+			[]string{"720x576 picture shown as 480p."}},
+		{"a 1920x1200 film on a fast PC", film("avi", "mpeg4", 8, "mp3", pictureSize{"1920x1200", 1920, 1200}, colours[0], ""), "chrome",
+			Want{Audio: -1, Subtitle: -1}, fast, []string{"1920x1200 picture shown as 1080p."}},
 	} {
 		p := DecideFor(c.m, newDevices[c.dev], c.w, c.l)
 		if !sameStrings(p.Lost, c.want) {

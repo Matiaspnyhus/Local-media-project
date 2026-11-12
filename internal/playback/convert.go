@@ -484,7 +484,7 @@ func converted(p Plan, why []string, m Media, a *Track, c *Caps, w Want, l Limit
 	p.Video = Video{Rung: rung, Height: height, Encoder: encoderName(l.Encoder), HDRToSDR: hdr, Class: class}
 	p.Picture = PictureKind{Codec: "h264", BitDepth: 8, Size: sizeOf(width, height)}
 	p.Lost = []string{}
-	if v.Height > 0 && height < v.Height {
+	if v.Height > 0 && !fits(v.Width, v.Height, r.Height) {
 		p.Lost = append(p.Lost, sizeWord(v.Width, v.Height)+" picture shown as "+strconv.Itoa(r.Height)+"p.")
 	}
 	switch {
@@ -668,8 +668,9 @@ func fits(width, height, lines int) bool {
 }
 
 // fit is the size a picture has once it is made to fit the frame that is
-// lines tall: shrunk if it has to be, never enlarged. A picture of unknown
-// size is taken to fill the frame.
+// lines tall: shrunk if it has to be, never enlarged, and with an even
+// number of pixels each way, as H.264 wants (a picture of 853x479 comes
+// out as 852x478). A picture of unknown size is taken to fill the frame.
 func fit(width, height, lines int) (int, int) {
 	if height <= 0 {
 		return 0, lines
@@ -677,6 +678,7 @@ func fit(width, height, lines int) (int, int) {
 	w, h, upright := lying(width, height)
 	switch {
 	case fits(w, h, lines):
+		w, h = w&^1, h&^1
 	case w*9 <= h*16:
 		// No wider than the frame's shape: the height decides.
 		w, h = (w*lines/h)&^1, lines
@@ -708,15 +710,41 @@ func sizeOf(width, height int) Size {
 	return Size480
 }
 
-// sizeWord names a picture's size the way people know it.
+// sizeWord names a picture's size the way people know it: "1080p" for a
+// picture that fills the 1080p frame from side to side or from top to
+// bottom (a wide film of 1920x800 is a 1080p film), "4K" for the large
+// ones. A picture that fills none of the frames is named by its own
+// numbers, "720x576" or "1920x1200", since any of the names would say
+// something untrue about it.
 func sizeWord(width, height int) string {
-	s := sizeOf(width, height)
-	width, height, _ = lying(width, height)
-	switch {
-	case s == Size4K && (height > 1440 || width > 2560):
-		return "4K"
-	case s == Size4K:
-		return "1440p"
+	w, h, _ := lying(width, height)
+	frame := 0
+	switch sizeOf(width, height) {
+	case "":
+		return ""
+	case Size4K:
+		if h > 1440 || w > 2560 {
+			return "4K"
+		}
+		// What lies between 1080p and 4K is called 1440p only by its
+		// lines: 2560x1080 is a wide screen's 1080p, not 1440p.
+		if h*20 >= 1440*19 {
+			return "1440p"
+		}
+	case Size1080:
+		frame = 1080
+	case Size720:
+		frame = 720
+	case Size480:
+		frame = 480
 	}
-	return string(s)
+	// A film with its black bars cut off is often a few pixels short of
+	// the frame; within a twentieth it still goes by the frame's name.
+	if frame > 0 && (h*20 >= frame*19 || w*20 >= wide(frame)*19) {
+		return strconv.Itoa(frame) + "p"
+	}
+	if w <= 0 {
+		return strconv.Itoa(h) + "p"
+	}
+	return strconv.Itoa(width) + "x" + strconv.Itoa(height)
 }
