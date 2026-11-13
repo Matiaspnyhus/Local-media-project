@@ -4,15 +4,7 @@ import type { Caps } from './api'
 // guessed from the browser's name. The known cases where a browser claims
 // more than it delivers are corrected afterwards: most by the server, and
 // one here, where the page already knows whose browser it is running in.
-export async function measureCaps(): Promise<Caps> {
-  const caps = askedDirectly()
-  const tall = await measureTall(caps.video)
-  if (tall) caps.tall = tall
-  return caps
-}
-
-// What the browser answers at once.
-function askedDirectly(): Caps {
+export function measureCaps(): Caps {
   const v = document.createElement('video')
   const can = (...types: string[]) => types.some((t) => v.canPlayType(t) !== '')
   const mp4 = can('video/mp4')
@@ -46,9 +38,6 @@ function askedDirectly(): Caps {
       av1: can('video/mp4; codecs="av01.0.08M.08"'),
       vp9: can('video/webm; codecs="vp9"', 'video/mp4; codecs="vp09.00.40.08"'),
       vp8: can('video/webm; codecs="vp8"'),
-      // Dolby Vision of the kind (profile 5) that looks green and purple
-      // on a device that plays it as ordinary HEVC.
-      dovi5: can('video/mp4; codecs="dvh1.05.06"'),
     },
     audio: {
       aac: can('audio/mp4; codecs="mp4a.40.2"'),
@@ -59,55 +48,7 @@ function askedDirectly(): Caps {
       flac: can('audio/flac', 'audio/mp4; codecs="flac"'),
       vorbis: can('audio/webm; codecs="vorbis"', 'audio/ogg; codecs="vorbis"'),
     },
-    pageFullscreen: pageFullscreen(),
   }
-}
-
-// pageFullscreen: the page itself can fill the screen, so whatever it draws
-// over a film is still there in fullscreen. An iPhone lets only the video
-// do that.
-function pageFullscreen(): boolean {
-  const d = document as unknown as { fullscreenEnabled?: boolean; webkitFullscreenEnabled?: boolean }
-  return !!(d.fullscreenEnabled || d.webkitFullscreenEnabled)
-}
-
-// The picture formats, each as a 4K film of that format would be labelled.
-const tallTypes: Record<string, string[]> = {
-  h264: ['video/mp4; codecs="avc1.640033"'],
-  'h264-10': ['video/mp4; codecs="avc1.6E0033"'],
-  hevc: ['video/mp4; codecs="hvc1.1.6.L153.90"', 'video/mp4; codecs="hev1.1.6.L153.90"'],
-  hevc10: ['video/mp4; codecs="hvc1.2.4.L153.90"', 'video/mp4; codecs="hev1.2.4.L153.90"'],
-  av1: ['video/mp4; codecs="av01.0.12M.08"'],
-  vp9: ['video/webm; codecs="vp09.00.50.08"', 'video/mp4; codecs="vp09.00.50.08"'],
-  vp8: ['video/webm; codecs="vp8"'],
-}
-
-// measureTall asks the browser, for each picture format it plays, whether
-// it would play a 4K film of that format smoothly. A phone or an old PC
-// may open such a film and then stutter through it; the PC can make a
-// 1080p picture for it instead. The answer is undefined when the browser
-// has no way to ask, or does not answer in a few seconds.
-async function measureTall(video: Record<string, boolean>): Promise<Record<string, boolean> | undefined> {
-  const mc = (navigator as unknown as { mediaCapabilities?: MediaCapabilities }).mediaCapabilities
-  if (!mc || typeof mc.decodingInfo !== 'function') return undefined
-  const smooth = async (contentType: string) => {
-    try {
-      const r = await mc.decodingInfo({ type: 'file', video: { contentType, width: 3840, height: 2160, bitrate: 25_000_000, framerate: 24 } })
-      return r.supported && r.smooth
-    } catch {
-      return false // a format the browser does not know the name of
-    }
-  }
-  const all = (async () => {
-    const tall: Record<string, boolean> = {}
-    for (const [key, types] of Object.entries(tallTypes)) {
-      if (!video[key]) continue
-      tall[key] = (await Promise.all(types.map(smooth))).some(Boolean)
-    }
-    return tall
-  })()
-  const late = new Promise<undefined>((done) => setTimeout(() => done(undefined), 4000))
-  return Promise.race([all, late])
 }
 
 // nativeHLS: the browser plays a list of chunks by itself (Safari, and

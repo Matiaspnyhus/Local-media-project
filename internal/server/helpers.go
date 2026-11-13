@@ -67,16 +67,12 @@ type helpers struct {
 	// the rest of what the server holds in memory about films being played
 	// (see playerClocks).
 	clocks playerClocks
-
-	// convert is what converting pictures needs kept (see convert.go).
-	convert *conversion
 }
 
 func newHelpers() *helpers {
 	return &helpers{
 		subJobs: map[string]*subtitleJob{}, subSlots: make(chan struct{}, maxSubtitleJobs),
 		cutRuns: map[string]*cutSearch{}, cutFails: map[string]cutFailure{}, cutSlots: make(chan struct{}, maxCutSearches),
-		convert: newConversion(),
 	}
 }
 

@@ -57,29 +57,23 @@ type fileTracks struct {
 
 func (s *Server) loadTracks(fileID string, probed bool, container string) (fileTracks, error) {
 	ft := fileTracks{media: playback.Media{Probed: probed, Container: container}}
-	// How many bits a second the file spends: only a lesson about a slow
-	// connection asks, and a file that does not say is treated carefully.
-	s.db.QueryRow(`SELECT bit_rate FROM files WHERE id=?`, fileID).Scan(&ft.media.BitRate)
-	rows, err := s.db.Query(`SELECT kind, codec, codec_tag, bit_depth, channels, language, title, is_default, is_forced, is_commentary, is_hearing_impaired,
-		width, height, frame_rate, color_transfer, side_data
+	rows, err := s.db.Query(`SELECT kind, codec, codec_tag, bit_depth, channels, language, title, is_default, is_forced, is_commentary, is_hearing_impaired
 		FROM streams WHERE file_id=? ORDER BY idx`, fileID)
 	if err != nil {
 		return ft, err
 	}
 	nSub := 0
 	for rows.Next() {
-		var kind, frameRate, transfer, sideData string
+		var kind string
 		var t playback.Track
-		var def, forced, com, hi, width, height int
-		if err := rows.Scan(&kind, &t.Codec, &t.Tag, &t.BitDepth, &t.Channels, &t.Language, &t.Title, &def, &forced, &com, &hi,
-			&width, &height, &frameRate, &transfer, &sideData); err != nil {
+		var def, forced, com, hi int
+		if err := rows.Scan(&kind, &t.Codec, &t.Tag, &t.BitDepth, &t.Channels, &t.Language, &t.Title, &def, &forced, &com, &hi); err != nil {
 			rows.Close()
 			return ft, err
 		}
 		t.Default, t.Forced, t.Commentary, t.HearingImpaired = def != 0, forced != 0, com != 0, hi != 0
 		switch kind {
 		case "video":
-			pictureOf(&t, width, height, frameRate, transfer, sideData)
 			ft.media.Video = append(ft.media.Video, t)
 		case "audio":
 			ft.media.Audio = append(ft.media.Audio, t)
@@ -395,12 +389,26 @@ func (s *Server) clockAhead(sessionID, itemID string) int64 {
 	return c.ahead[sessionID+" "+itemID]
 }
 
-// playCaps is what this device says it can play. What this PC can do for
-// it (repackage, convert) is a separate matter: see limits.
+// playCaps is what this device can do here and now: what it reported, less
+// repackaging when this PC has no converter to do it with.
 func (s *Server) playCaps(u *User) *playback.Caps {
-	return s.capsFor(u)
+	c := s.capsFor(u)
+	if c == nil || s.hls != nil || !c.HLS {
+		return c
+	}
+	without := *c
+	without.HLS = false
+	return &without
 }
 
+// handlePlay decides how this device gets the file and hands the player an
+// address for it.
+//
+// When the original can be played as it is, the address is a signed link to
+// the file: it works without the session cookie, so players that fetch
+// media themselves can use it, and it stops working when the session is
+// signed out or the link expires. Otherwise the address is a list of chunks
+// (see package hls) reachable only through a random token.
 func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	u := currentUser(r)
 	itemID := chi.URLParam(r, "id")
@@ -410,15 +418,9 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	}
 	var in struct {
 		Audio *int `json:"audio"`
-		// Lower asks for a lighter picture: the number of the best setting
-		// that may be used (see playback.Want.Lower).
-		Lower int `json:"lower"`
 	}
 	if r.Body != nil {
 		json.NewDecoder(io.LimitReader(r.Body, 4<<10)).Decode(&in) // the body is optional
-	}
-	if in.Lower < 0 || in.Lower > playback.NumRungs+1 {
-		in.Lower = 0 // nonsense is ignored, not obeyed
 	}
 	// Of several copies of the film, the one this device plays best: the
 	// same one the lists judged it by.
@@ -455,44 +457,16 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	if in.Audio != nil && *in.Audio >= 0 && *in.Audio < len(ft.media.Audio) {
 		choice.Audio = *in.Audio
 	}
-	caps, limits := s.playCaps(u), s.limits(u)
-	// The viewer picked the sound for this play only if the request names
-	// it; otherwise it comes from their settings or an earlier pick.
-	want := playback.Want{Audio: choice.Audio, AudioAuto: in.Audio == nil, Subtitle: -1, Lower: in.Lower}
-	plan := withLength(playback.DecideFor(ft.media, caps, want, limits), durationMs)
+	caps := s.playCaps(u)
+	plan := withLength(playback.Decide(ft.media, caps, choice.Audio), durationMs)
 	if plan.Playable == playback.No {
 		// The preferred sound track may be what stands in the way (it takes
 		// repackaging to switch, which a file that does not say how long it
 		// is cannot have). The file's own main track is better than nothing.
-		// This second plan is the one the copy was judged by (see judge),
-		// with this viewer's wish for a lighter picture and the PC as busy
-		// as it is now, so a copy the lists say plays is not refused here
-		// for its sound.
-		main := want
-		main.Audio, main.AudioAuto = -1, false
-		if alt := withLength(playback.DecideFor(ft.media, caps, main, limits), durationMs); alt.Playable != playback.No {
+		// This second plan is the one the copy was judged by (see judge), so
+		// a copy the lists say plays is never refused here.
+		if alt := withLength(playback.Decide(ft.media, caps, -1), durationMs); alt.Playable != playback.No {
 			plan = alt
-		}
-	}
-
-	path := filepath.Join(libPath, filepath.FromSlash(rel))
-	var grid hls.Grid
-	var convert *hls.Convert
-	if plan.Method == playback.Convert {
-		// Converting starts from a few facts about the picture (where its
-		// clock stands, how fast its frames come, what shape they are),
-		// found by a short look at the file the first time.
-		facts, err := s.pictureFacts(r.Context(), fileID, path, size, mtime)
-		if err == nil {
-			grid, convert, err = convertSpec(facts, plan.Video)
-		}
-		if err != nil {
-			if r.Context().Err() != nil {
-				return // the viewer has gone
-			}
-			s.log.Printf("%s cannot be converted: %s", filepath.Base(path), s.pathless(strings.ReplaceAll(err.Error(), path, filepath.Base(path))))
-			plan = unplayable(plan, "This PC could not work out how to convert this film's picture.")
-			plan.PCCannot = true
 		}
 	}
 
@@ -505,18 +479,17 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 		"container":  strings.TrimPrefix(ext, "."),
 		"explain":    plan.Explain(),
 	}
-	if plan.Method == playback.Remux || plan.Method == playback.Audio || plan.Method == playback.Convert {
+	if plan.Method == playback.Remux || plan.Method == playback.Audio {
 		f, _, err := openMedia(libPath, rel) // confirms the file is a real file inside its library
 		if err != nil {
 			writeErr(w, http.StatusNotFound, "That file is not available right now.")
 			return
 		}
 		f.Close()
-		if convert == nil {
-			grid = s.grid(r.Context(), fileID, path, size, mtime, durationMs)
-		}
+		path := filepath.Join(libPath, filepath.FromSlash(rel))
+		grid := s.grid(r.Context(), fileID, path, size, mtime, durationMs)
 		spec := hls.Spec{Path: path, Grid: grid, VideoCodec: ft.media.Video[0].Codec,
-			AudioTrack: plan.AudioTrack, AudioCopy: plan.AudioCopy, Owner: u.SessionID, Convert: convert}
+			AudioTrack: plan.AudioTrack, AudioCopy: plan.AudioCopy, Owner: u.SessionID}
 		if plan.AudioTrack >= 0 && plan.AudioTrack < len(ft.media.Audio) {
 			// The converter treats some sound differently when it is passed
 			// on untouched (AAC out of a TV recording needs rewrapping).
@@ -556,7 +529,12 @@ func (s *Server) handlePlay(w http.ResponseWriter, r *http.Request) {
 	// For the page, should it ever need the film's own time from its
 	// player's clock: it is the player's time less this.
 	out["clockAheadMs"] = subtitleShift
-	out["plan"] = viewOf(plan, ft.media.Probed)
+	planOut := map[string]any{"playable": plan.Playable, "method": plan.Method, "reasons": plan.Reasons, "audioTrack": plan.AudioTrack, "audioCopy": plan.AudioCopy, "hasAudio": nil,
+		"deviceUnknown": plan.DeviceUnknown}
+	if ft.media.Probed {
+		planOut["hasAudio"] = plan.HasAudio
+	}
+	out["plan"] = planOut
 
 	audio := []audioView{}
 	for i, t := range ft.media.Audio {
