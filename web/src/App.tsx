@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react'
 import { api, ApiError, type Folders, type Home, type Item, type Diagnostics, type PlayInfo, type Prefs, type Season, type Settings, type Show, type State, type UpdateStatus } from './api'
 import { builtInChunks, measureCaps } from './caps'
+import { OpenElsewhere } from './OpenElsewhere'
 
 type Screen = { name: 'library' } | { name: 'watch'; id: string } | { name: 'show'; id: string }
 
@@ -43,8 +44,8 @@ export function App() {
   const [capsSent, setCapsSent] = useState(false)
   useEffect(() => {
     if (!signedIn) return setCapsSent(false)
-    api
-      .capabilities(measureCaps())
+    measureCaps()
+      .then((caps) => api.capabilities(caps))
       .catch(() => undefined)
       .then(() => setCapsSent(true))
   }, [signedIn])
@@ -217,7 +218,7 @@ function containerLabel(c: string): string {
   return names[c] || c.toUpperCase()
 }
 
-const NEEDS = 'Needs converting, which arrives in a later version'
+const NEEDS = 'Does not play on this device'
 
 function itemLabel(it: Item, withShow: boolean): string {
   if (it.kind !== 'episode') return it.title + (it.year ? ` (${it.year})` : '')
@@ -1059,6 +1060,23 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
     report('play-error', `${info?.container} ${info?.plan.method} ${mediaErrors[code] || 'code ' + code} ${v?.error?.message || ''}`.trim())
   }
 
+  // "Open in another player" is offered under the player and where a film
+  // is said not to play here. Another player starts the film where it is
+  // on this page, or where it was last stopped if it is not playing here;
+  // and once it has the film, the film stops here.
+  const elsewhere = (
+    <OpenElsewhere
+      key={id}
+      id={id}
+      position={() => {
+        const v = videoRef.current
+        return v && v.currentTime > 0 ? v.currentTime : (info?.positionMs || 0) / 1000
+      }}
+      onLeave={() => videoRef.current?.pause()}
+      onSignedOut={onSignedOut}
+    />
+  )
+
   return (
     <main>
       <div className="bar">
@@ -1069,14 +1087,15 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       {problem && <p className="note" role="alert" data-testid="play-problem">{problem}</p>}
       {info && info.plan.playable === 'no' && !tryAnyway && (
         <div className="card" role="alert" data-testid="play-problem">
-          <p>This browser cannot play this file yet.</p>
+          <p>{info.explain}</p>
           <ul>
             {info.plan.reasons.map((r) => (
               <li key={r}>{r}</li>
             ))}
           </ul>
-          <p className="dim">Another browser or device may be able to play it today.</p>
+          {!info.plan.pcCannot && <p className="dim">Another browser or device may be able to play it today.</p>}
           <button onClick={() => setTryAnyway(true)}>Try anyway</button>
+          {elsewhere}
         </div>
       )}
       {info && showPlayer && (
@@ -1088,6 +1107,7 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
             playsInline
             preload="metadata"
             data-method={info.plan.method}
+            data-rung={info.plan.method === 'convert' ? info.plan.video.rung : undefined}
             onLoadedMetadata={onLoaded}
             onPlaying={onPlaying}
             onResize={onResize}
@@ -1146,7 +1166,18 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
                 </ul>
               </>
             )}
+            {info.plan.lost.length > 0 && (
+              <>
+                <p className="dim">What is different from the original:</p>
+                <ul data-testid="how-lost">
+                  {info.plan.lost.map((r) => (
+                    <li key={r}>{r}</li>
+                  ))}
+                </ul>
+              </>
+            )}
           </details>
+          {elsewhere}
         </>
       )}
     </main>

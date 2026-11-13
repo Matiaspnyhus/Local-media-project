@@ -170,6 +170,7 @@ func New(cfg Config) (*Server, error) {
 		// The converter's own lines quote ffmpeg, which names files by
 		// their full path.
 		s.hls.Log = func(format string, args ...any) { s.log.Printf("%s", s.pathless(fmt.Sprintf(format, args...))) }
+		s.askConverterSoon()
 	}
 	var users int
 	if err := s.db.QueryRow(`SELECT count(*) FROM users`).Scan(&users); err != nil {

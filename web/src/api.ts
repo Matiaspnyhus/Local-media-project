@@ -132,17 +132,46 @@ export interface PlayInfo {
   // perhaps with its sound converted) rather than as the original file.
   hls?: string
   explain: string
-  plan: {
-    playable: 'yes' | 'no' | 'unknown'
-    method: 'direct' | 'remux' | 'audio' | 'none'
-    reasons: string[]
-    hasAudio: boolean | null
-    audioTrack: number
-    audioCopy: boolean
-  }
+  plan: PlayPlan
   audio: AudioTrack[]
   subtitles: SubtitleTrack[]
   pictureSubtitles: number
+}
+// How a film reaches this device, as the PC decided it. The PC sends
+// exactly these fields (a test on the PC's side holds the two lists
+// together).
+export interface PlayPlan {
+  playable: 'yes' | 'no' | 'unknown'
+  // direct: the original file. remux: repackaged, nothing converted.
+  // audio: repackaged with the sound converted. convert: the picture is
+  // converted too. none: it cannot be played here.
+  method: 'direct' | 'remux' | 'audio' | 'convert' | 'none'
+  // Why the original file is not simply sent.
+  reasons: string[]
+  // null: the file has not been inspected, so nobody knows yet.
+  hasAudio: boolean | null
+  audioTrack: number
+  audioCopy: boolean
+  deviceUnknown: boolean
+  // The answer is no only because this PC converts slower than the film plays.
+  tooSlow: boolean
+  // The answer is no because of this PC, not this device.
+  pcCannot: boolean
+  // What the picture is converted to; only meaningful for method convert.
+  video: PlayVideo
+  subtitles: 'none' | 'track' | 'draw' | 'burn'
+  subtitleKind: '' | 'text' | 'styled' | 'picture'
+  // What the viewer does not get compared with the original, in plain words.
+  lost: string[]
+  // The kind of picture this device is asked to show.
+  picture: { codec: string; bitDepth: number; size: string }
+}
+export interface PlayVideo {
+  rung: number // the setting, 1 (best picture) to 5 (lightest)
+  height: number
+  encoder: string
+  hdrToSdr: boolean
+  class: string
 }
 export interface Prefs {
   audioLang: string
@@ -157,6 +186,20 @@ export interface Diagnostics {
   open: number
   userAgent: string
 }
+// What the PC gives a film's way out to another player (see OpenElsewhere).
+export interface Handoff {
+  // A complete address for the film's original file. It plays without
+  // signing in, so a video player outside the browser can use it.
+  url: string
+  expiresAt: number // when the link stops working, in Unix seconds
+  validSeconds: number // how long a link lasts from the moment it is made
+  thisPC: boolean // this browser is on the PC that runs Local Media
+}
+// vlcFile is the address of a small playlist file for VLC that plays one
+// film, starting at the given second.
+export function vlcFile(id: string, atSeconds: number): string {
+  return `/api/items/${id}/handoff.xspf` + (atSeconds > 0 ? `?at=${Math.floor(atSeconds)}` : '')
+}
 export interface Scan {
   added: number
   moved: number
@@ -168,6 +211,13 @@ export interface Caps {
   video: Record<string, boolean>
   audio: Record<string, boolean>
   hls: boolean
+  // Which of the picture formats this device plays smoothly when the
+  // picture is larger than 1080p (4K). Left out when the browser has no
+  // way to ask; the PC then takes the device at its word for any size.
+  tall?: Record<string, boolean>
+  // The page itself can fill the screen (not so on an iPhone, where only
+  // the video can).
+  pageFullscreen?: boolean
 }
 
 export const api = {
@@ -193,8 +243,10 @@ export const api = {
   setAutoUpdate: (on: boolean) => call<{ ok: boolean }>('PUT', '/api/settings/auto-update', { on }),
   health: () => call<{ status: string; version: string }>('GET', '/health'),
   capabilities: (c: Caps) => call<{ ok: boolean }>('POST', '/api/capabilities', c),
-  play: (id: string, audio?: number) =>
-    call<PlayInfo>('POST', `/api/items/${id}/play`, audio === undefined ? {} : { audio }),
+  // lower asks for a lighter picture: the number of the best setting that
+  // may be used (see PlayVideo.rung).
+  play: (id: string, audio?: number, lower?: number) =>
+    call<PlayInfo>('POST', `/api/items/${id}/play`, { ...(audio === undefined ? {} : { audio }), ...(lower ? { lower } : {}) }),
   // What the viewer picked while watching. The tracks themselves are sent
   // (audioIndex, -1 for none; subKey, '' for off) as well as their
   // languages: the same film is opened again with exactly those tracks,
@@ -212,6 +264,10 @@ export const api = {
       keepalive: true,
     }).catch(() => undefined)
   },
+  handoff: (id: string) => call<Handoff>('GET', `/api/items/${id}/handoff`),
+  // Opens the film in the video player of the PC that runs Local Media.
+  // The PC only does this for the browser on the PC itself.
+  openLocal: (id: string) => call<{ ok: boolean }>('POST', `/api/items/${id}/open-local`),
   prefs: () => call<Prefs>('GET', '/api/prefs'),
   setPrefs: (p: Prefs) => call<Prefs>('PUT', '/api/prefs', p),
   diagnostics: () => call<Diagnostics>('GET', '/api/diagnostics'),

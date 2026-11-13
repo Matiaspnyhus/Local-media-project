@@ -2,6 +2,7 @@ package playback
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -125,15 +126,24 @@ func TestDecide(t *testing.T) {
 	}
 }
 
-// Every combination of package, picture, sound and device must obey the
-// rules below, whatever the answer is. This is where most of the cases are.
-func TestDecideRulesHoldForEveryCombination(t *testing.T) {
-	containers := []string{"mp4", "mov", "matroska", "webm", "avi", "mpegts"}
-	videos := []struct {
+// The packages, pictures and sounds that M3's table of combinations was
+// built from. With the five devices they make 1,890 combinations. The
+// table has since grown by size, colour, subtitles and surface (see
+// TestRulesHoldForEveryCombination in convert_test.go).
+var (
+	oldContainers = []string{"mp4", "mov", "matroska", "webm", "avi", "mpegts"}
+	oldVideos     = []struct {
 		codec string
 		depth int
 	}{{"h264", 8}, {"h264", 10}, {"hevc", 8}, {"hevc", 10}, {"av1", 8}, {"vp9", 8}, {"mpeg4", 8}}
-	audios := []string{"", "aac", "ac3", "eac3", "dts", "truehd", "flac", "opus", "mp3"}
+	oldAudios = []string{"", "aac", "ac3", "eac3", "dts", "truehd", "flac", "opus", "mp3"}
+)
+
+// Every combination of package, picture, sound and device must obey the
+// rules below, whatever the answer is. This is M3's table, for a PC that
+// cannot convert pictures.
+func TestDecideRulesHoldForEveryCombination(t *testing.T) {
+	containers, videos, audios := oldContainers, oldVideos, oldAudios
 	n := 0
 	for dname, dev := range devices {
 		for _, cont := range containers {
@@ -345,6 +355,113 @@ func TestTheMainSoundTrackIsNotTheFirst(t *testing.T) {
 		m.Audio = audio
 		if p := Decide(m, devices["chrome"], -1); p.Method != Direct || p.AudioTrack != 0 || len(p.Reasons) != 0 {
 			t.Errorf("%s: %+v; want the original sent with its first track", name, p)
+		}
+	}
+}
+
+// "You chose a sound track..." is said only to someone who chose one. When
+// the app picked the track itself, from the viewer's language settings or
+// from what they picked earlier in the show, the reason says that. Nothing
+// else about the answer differs.
+func TestWhoChoseTheSoundTrack(t *testing.T) {
+	m := Media{Probed: true, Container: "mp4", Video: []Track{{Codec: "h264", BitDepth: 8}},
+		Audio: []Track{{Codec: "aac", Default: true, Language: "eng"}, {Codec: "aac", Language: "jpn"}}}
+	byHand := DecideFor(m, devices["chrome"], Want{Audio: 1, Subtitle: -1}, Limits{})
+	byApp := DecideFor(m, devices["chrome"], Want{Audio: 1, AudioAuto: true, Subtitle: -1}, Limits{})
+	if want := []string{"You chose a sound track other than the one a browser plays by itself."}; byHand.Method != Remux || !sameStrings(byHand.Reasons, want) {
+		t.Errorf("a track chosen by hand: %s %q", byHand.Method, byHand.Reasons)
+	}
+	if want := []string{"The sound track picked for you, from your language settings or from what you chose before, is not the one a browser plays by itself."}; !sameStrings(byApp.Reasons, want) {
+		t.Errorf("a track chosen by the app: %q", byApp.Reasons)
+	}
+	byApp.Reasons = byHand.Reasons
+	if !reflect.DeepEqual(byApp, byHand) {
+		t.Errorf("who chose the track changed more than the words: %+v, %+v", byApp, byHand)
+	}
+	// Where the file itself is why (its main track is not its first),
+	// nobody chose anything and the sentence about the file stands.
+	m.Audio[0].Default, m.Audio[1].Default = false, true
+	for _, auto := range []bool{false, true} {
+		p := DecideFor(m, devices["chrome"], Want{Audio: -1, AudioAuto: auto, Subtitle: -1}, Limits{})
+		if !has(p.Reasons, "The sound track this file marks as its main one is not its first") || has(p.Reasons, "chose") || has(p.Reasons, "picked for you") {
+			t.Errorf("a main track that is not the first (picked by the app: %v): %q", auto, p.Reasons)
+		}
+	}
+	// And where the track is the one a browser plays anyway, nothing is said.
+	m.Audio[0].Default, m.Audio[1].Default = true, false
+	if p := DecideFor(m, devices["chrome"], Want{Audio: 0, AudioAuto: true, Subtitle: -1}, Limits{}); p.Method != Direct || len(p.Reasons) != 0 {
+		t.Errorf("the first track, picked by the app: %s %q", p.Method, p.Reasons)
+	}
+}
+
+// A PC without a converter cannot repackage anything. The answer then
+// names the PC, not the browser, which may well play repackaged video.
+// (Before, the server hid the missing converter by telling the planner
+// that the device takes no repackaged video, and the viewer was told
+// "This browser cannot play repackaged video either.")
+func TestAPCWithoutAConverterIsNamed(t *testing.T) {
+	none := Limits{NoConverter: true}
+	pcCannot := "This device cannot play this file as it is, and this PC cannot convert it for the device."
+	mkv := media("matroska", "h264", 8, "aac")
+
+	p := DecideFor(mkv, devices["safari"], Want{Audio: -1, Subtitle: -1}, none)
+	want := []string{"It is packaged as MKV, which this browser cannot open.", "This PC has no converter, so the file cannot be repackaged for this device."}
+	if p.Playable != No || !sameStrings(p.Reasons, want) || !p.PCCannot || p.TooSlow || p.Explain() != pcCannot {
+		t.Errorf("an MKV on an iPhone, no converter: %+v, explained as %q", p, p.Explain())
+	}
+	// A device that takes no repackaged video is still told so itself,
+	// with or without a converter on the PC.
+	for _, l := range []Limits{{}, none} {
+		p = DecideFor(mkv, devices["old-tv"], Want{Audio: -1, Subtitle: -1}, l)
+		if p.Playable != No || !has(p.Reasons, "This browser cannot play repackaged video either.") || p.PCCannot || p.Explain() != "This browser cannot play this file yet." {
+			t.Errorf("an MKV on a device that takes no repackaged video (%+v): %+v", l, p)
+		}
+	}
+	// A picture the device cannot show: it is the PC that cannot convert
+	// it, and nothing is promised for a later version.
+	p = DecideFor(media("avi", "mpeg4", 8, "mp3"), devices["chrome"], Want{Audio: -1, Subtitle: -1}, none)
+	want = []string{"Its picture is MPEG-4 (DivX/Xvid), which this browser cannot play.", "It is packaged as AVI, which this browser cannot open.",
+		"This PC has no converter, so the picture cannot be converted for this device."}
+	if p.Playable != No || !sameStrings(p.Reasons, want) || !p.PCCannot || p.Explain() != pcCannot {
+		t.Errorf("DivX in Chrome, no converter: %+v, explained as %q", p, p.Explain())
+	}
+	// Having no converter wins over a claim to convert pictures.
+	if q := DecideFor(media("avi", "mpeg4", 8, "mp3"), devices["chrome"], Want{Audio: -1, Subtitle: -1}, Limits{NoConverter: true, Convert: true, ToneMap: true}); !reflect.DeepEqual(q, p) {
+		t.Errorf("no converter, and a claim to convert pictures: %+v", q)
+	}
+	// Whatever plays as it is still plays, and a sound track that only
+	// repackaging could reach gives way to the one the browser plays, as
+	// it does on a device that takes no repackaged video.
+	if p = DecideFor(media("mp4", "h264", 8, "aac"), devices["chrome"], Want{Audio: -1, Subtitle: -1}, none); p.Method != Direct || len(p.Reasons) != 0 {
+		t.Errorf("an MP4 in Chrome, no converter: %+v", p)
+	}
+	two := Media{Probed: true, Container: "matroska", Video: []Track{{Codec: "h264", BitDepth: 8}},
+		Audio: []Track{{Codec: "aac", Language: "jpn"}, {Codec: "aac", Language: "eng", Default: true}}}
+	if p = DecideFor(two, devices["chrome"], Want{Audio: -1, Subtitle: -1}, none); p.Method != Direct || p.Playable != Yes || len(p.Reasons) != 0 {
+		t.Errorf("a main track that is not the first, no converter: %+v; want the original sent", p)
+	}
+	// For every one of M3's combinations the answer is the one the server
+	// used to get by hiding the device's word on repackaged video, except
+	// for who is named.
+	for dname, dev := range devices {
+		hidden := *dev
+		hidden.HLS = false
+		for _, cont := range oldContainers {
+			for _, v := range oldVideos {
+				for _, a := range oldAudios {
+					m := media(cont, v.codec, v.depth)
+					if a != "" {
+						m = media(cont, v.codec, v.depth, a)
+					}
+					got, old := DecideFor(m, dev, Want{Audio: -1, Subtitle: -1}, none), Decide(m, &hidden, -1)
+					if got.Playable != old.Playable || got.Method != old.Method || got.AudioTrack != old.AudioTrack || got.AudioCopy != old.AudioCopy {
+						t.Errorf("%s %s/%d %s on %s: %s with no converter, %s with repackaging hidden", cont, v.codec, v.depth, a, dname, got.Method, old.Method)
+					}
+					if got.Playable == No && dev.HLS && (!got.PCCannot || has(got.Reasons, "later version") || has(got.Reasons, "This browser cannot play repackaged video")) {
+						t.Errorf("%s %s/%d %s on %s, no converter: %q", cont, v.codec, v.depth, a, dname, got.Reasons)
+					}
+				}
+			}
 		}
 	}
 }
