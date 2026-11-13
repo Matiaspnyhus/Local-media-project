@@ -143,12 +143,53 @@ func TestAFilmNoBrowserPlaysIsConverted(t *testing.T) {
 	if got := described(t, joined, "codec_name,width,height"); len(got) != 2 || got[0] != "h264,320,180" || got[1] != "aac" {
 		t.Errorf("the stream holds %q, want H.264 at the film's own size and AAC sound", got)
 	}
-	// While it runs it counts as work the PC is doing, for every other
-	// viewer and not for this one.
+	// (That it counts as work the PC is doing while it runs is held by
+	// TestAFilmBeingConvertedCountsForOtherViewersOnly, with a film long
+	// enough to be still running when it is asked: this one is converted
+	// to its end within half a second of its second chunk.)
+	e.do("POST", "/api/hls/"+p.HLS+"/stop", remote, c, nil)
+
+	// A device that plays Dolby gets the film's own sound beside the new
+	// picture.
+	withDolby := map[string]any{"containers": map[string]bool{"mp4": true, "matroska": true}, "video": map[string]bool{"h264": true},
+		"audio": map[string]bool{"aac": true, "ac3": true}, "hls": true}
+	e.do("POST", "/api/capabilities", remote, c, withDolby)
+	p = convertedAnswer{}
+	decode(t, e.do("POST", "/api/items/"+film+"/play", remote, c, nil), &p)
+	if p.Plan.Method != "convert" || !p.Plan.AudioCopy {
+		t.Fatalf("play on a device with Dolby: %+v", p.Plan)
+	}
+	if got := described(t, streamOf(t, e, p.URL, "seg-0.m4s"), "codec_name"); len(got) != 2 || got[0] != "h264" || got[1] != "ac3" {
+		t.Errorf("the stream holds %q, want H.264 and the untouched Dolby sound", got)
+	}
+	e.do("POST", "/api/hls/"+p.HLS+"/stop", remote, c, nil)
+}
+
+// While a film's picture is being converted it counts as work the PC is
+// doing: for every other viewer, and not for the one watching it, nor for
+// the lists.
+func TestAFilmBeingConvertedCountsForOtherViewersOnly(t *testing.T) {
+	e := convertEnv(t)
+	// A film long enough that its conversion is still under way when the
+	// questions below are asked, however fast or slow this machine is: the
+	// converter is made to wait once it is two minutes ahead of the viewer,
+	// and is then left waiting for over a minute.
+	makeFilm(t, filepath.Join(e.media, "Long Old Film (1999).mkv"), "160x90", "25", 200)
+	c := e.setup()
+	e.s.InspectNow()
+	film := e.firstItem(c, "Long Old Film")
+	e.do("POST", "/api/capabilities", remote, c, chromeLike)
+	var p convertedAnswer
+	w := e.do("POST", "/api/items/"+film+"/play", remote, c, nil)
+	decode(t, w, &p)
+	if p.Plan.Method != "convert" || p.Plan.Video.Rung != 1 || p.HLS == "" {
+		t.Fatalf("play: %s", w.Body)
+	}
+	streamOf(t, e, p.URL, "seg-0.m4s")
 	var sessionID string
 	e.s.db.QueryRow(`SELECT id FROM sessions LIMIT 1`).Scan(&sessionID)
 	if all, others := e.s.hls.Converting(""), e.s.hls.Converting(sessionID); all != 1 || others != 0 {
-		t.Errorf("conversions counted: %d in all and %d of other viewers, want 1 and 0", all, others)
+		t.Fatalf("conversions counted: %d in all and %d of other viewers, want 1 and 0", all, others)
 	}
 	// So when this viewer presses Play again (to change the sound, say) the
 	// film is still made at the best setting, while a film started from
@@ -178,23 +219,11 @@ func TestAFilmNoBrowserPlaysIsConverted(t *testing.T) {
 	if err != nil || len(copies) != 1 || copies[0].plan.Method != playback.Convert || copies[0].plan.Video.Rung != 1 {
 		t.Errorf("the lists judge the film for a second viewer as %+v (%v), want converted at setting 1", copies, err)
 	}
+	if n := e.s.hls.Converting(""); n != 1 {
+		t.Errorf("%d conversions are under way at the end, so the answers above were not given while exactly one was", n)
+	}
 	e.do("POST", "/api/hls/"+again.HLS+"/stop", remote, c, nil)
 	e.do("POST", "/api/hls/"+other.HLS+"/stop", remote, guest, nil)
-	e.do("POST", "/api/hls/"+p.HLS+"/stop", remote, c, nil)
-
-	// A device that plays Dolby gets the film's own sound beside the new
-	// picture.
-	withDolby := map[string]any{"containers": map[string]bool{"mp4": true, "matroska": true}, "video": map[string]bool{"h264": true},
-		"audio": map[string]bool{"aac": true, "ac3": true}, "hls": true}
-	e.do("POST", "/api/capabilities", remote, c, withDolby)
-	p = convertedAnswer{}
-	decode(t, e.do("POST", "/api/items/"+film+"/play", remote, c, nil), &p)
-	if p.Plan.Method != "convert" || !p.Plan.AudioCopy {
-		t.Fatalf("play on a device with Dolby: %+v", p.Plan)
-	}
-	if got := described(t, streamOf(t, e, p.URL, "seg-0.m4s"), "codec_name"); len(got) != 2 || got[0] != "h264" || got[1] != "ac3" {
-		t.Errorf("the stream holds %q, want H.264 and the untouched Dolby sound", got)
-	}
 	e.do("POST", "/api/hls/"+p.HLS+"/stop", remote, c, nil)
 }
 
