@@ -846,6 +846,11 @@ try {
     assert.ok(file.download, 'the file is offered as a download')
     await page.keyboard.press(TAB)
     assert.ok(await hasFocus(page, '[data-testid=elsewhere-link]'), 'the keyboard goes on to the link')
+    // (Safari's engine selects a moment after the box takes the keyboard.)
+    await page.waitForFunction(() => {
+      const el = document.activeElement
+      return el.selectionStart === 0 && el.selectionEnd === el.value.length
+    }, null, { timeout: 3000 }).catch(() => {})
     const link = await page.evaluate(() => {
       const el = document.activeElement
       return { value: el.value, from: el.selectionStart, to: el.selectionEnd, readOnly: el.readOnly, label: el.labels[0]?.textContent || '' }

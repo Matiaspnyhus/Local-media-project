@@ -165,10 +165,18 @@ export function OpenElsewhere({
 
   // Reaching the link, by keyboard, mouse or finger, selects all of it,
   // ready to copy. (setSelectionRange is for browsers on phones, where
-  // select alone has not always been enough.)
+  // select alone has not always been enough. And Safari puts the caret
+  // where it likes once the box has taken the keyboard, which undoes a
+  // selection made at that moment; so it is made again a moment later.)
   const selectAll = (el: HTMLTextAreaElement) => {
-    el.select()
-    el.setSelectionRange(0, el.value.length)
+    const all = () => {
+      el.select()
+      el.setSelectionRange(0, el.value.length)
+    }
+    all()
+    window.setTimeout(() => {
+      if (document.activeElement === el) all()
+    }, 0)
   }
 
   return (
