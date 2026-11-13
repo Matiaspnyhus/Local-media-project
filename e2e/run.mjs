@@ -7,6 +7,7 @@
 //
 // Needs the program built at ./localmedia (or LOCALMEDIA_BIN).
 import { spawn, spawnSync } from 'node:child_process'
+import { request as httpRequest } from 'node:http'
 import { mkdtempSync, cpSync, rmSync, existsSync, mkdirSync, copyFileSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir, networkInterfaces } from 'node:os'
 import { join, dirname, resolve } from 'node:path'
@@ -247,6 +248,32 @@ try {
       assert.equal((await fetch(remote + '/api/movies')).status, 403)
     })
   }
+
+  // A website somewhere else can make a name of its own point at this
+  // computer once its page is open in a browser here. Its requests then
+  // arrive from the PC itself, but under that name, which the browser
+  // sends along.
+  const underName = (name, path, method = 'GET') => new Promise((resolve, reject) => {
+    const req = httpRequest({ host: '127.0.0.1', port, path, method, headers: { Host: `${name}:${port}`, Origin: `http://${name}:${port}`, 'X-Requested-With': 'localmedia', 'Content-Type': 'application/json' } }, (res) => {
+      let body = ''
+      res.on('data', (d) => (body += d))
+      res.on('end', () => resolve({ status: res.statusCode, body }))
+    })
+    req.on('error', reject)
+    req.end(method === 'GET' ? undefined : JSON.stringify({ name: 'someone', password: 'someone else 1', folder: media }))
+  })
+  await step('before setup, a page under a name that is not the PC\'s gets nothing, even from the PC itself', async () => {
+    for (const name of ['evil.example', 'localhost.evil.example']) {
+      const page = await underName(name, '/')
+      assert.equal(page.status, 403)
+      assert.match(page.body, /does not answer to this address/)
+      assert.equal((await underName(name, '/api/setup/folders?path=/')).status, 403, 'the folders of the PC are not listed')
+      assert.equal((await underName(name, '/api/setup', 'POST')).status, 403, 'the server cannot be claimed')
+    }
+    assert.equal((await (await fetch(local + '/api/state')).json()).setupDone, false)
+    // The PC's own address for itself is still answered.
+    assert.equal((await underName('localhost', '/api/setup/folders')).status, 200)
+  })
 
   const pc = await browser.newContext()
   const setupPage = await pc.newPage()
@@ -798,8 +825,12 @@ try {
     }, seconds, { timeout: 20000 }))
     await stopAt(7)
     await focusByText(page, 'Open in another player')
+    // On another device the button opens and closes an offer, and says so
+    // to a screen reader from the start, not only once it has been pressed.
+    assert.equal(await page.getAttribute('[data-testid=open-elsewhere]', 'aria-expanded'), 'false', 'before it is pressed, the button says its offer is closed')
     await page.keyboard.press('Enter')
     await page.waitForSelector('[data-testid=elsewhere-offer]')
+    assert.equal(await page.getAttribute('[data-testid=open-elsewhere]', 'aria-expanded'), 'true')
     assert.ok(await hasFocus(page, '[data-testid=open-elsewhere]'), 'the keyboard is still on the button that was pressed')
     assert.equal(await page.locator('[data-testid=elsewhere-problem]').count(), 0, `nothing went wrong, yet the page says: ${await page.locator('[data-testid=elsewhere-problem]').allTextContents()}`)
 
@@ -808,7 +839,10 @@ try {
     assert.ok(await hasFocus(page, '[data-testid=elsewhere-vlc]'), 'the keyboard goes on to the file for VLC')
     const file = await page.evaluate(() => ({ text: document.activeElement.textContent, href: document.activeElement.getAttribute('href'), download: document.activeElement.hasAttribute('download') }))
     assert.equal(file.text, 'Download a file for VLC')
-    assert.match(file.href, /^\/api\/items\/[0-9a-f]{32}\/handoff\.xspf\?at=7$/)
+    // The file is asked for from the eighth second, with a link that ends
+    // when the link shown on the page does.
+    assert.match(file.href, /^\/api\/items\/[0-9a-f]{32}\/handoff\.xspf\?at=7&until=\d+$/)
+    const until = Number(file.href.replace(/.*until=/, ''))
     assert.ok(file.download, 'the file is offered as a download')
     await page.keyboard.press(TAB)
     assert.ok(await hasFocus(page, '[data-testid=elsewhere-link]'), 'the keyboard goes on to the link')
@@ -819,10 +853,22 @@ try {
     assert.ok(link.value.startsWith(base + '/stream/'), `the link is a whole address, at the address this device uses: ${link.value.replace(/[?].*/, '')}`)
     assert.ok(link.readOnly && link.from === 0 && link.to === link.value.length, 'reaching the link selects all of it, ready to copy')
     assert.match(link.label, /copy this link/)
-    // What the link is good for is said, with the lifetime the PC gave.
+    // What the link is good for is said, with the end the PC gave: a time
+    // on the clock and a day, for the link and for the file alike.
     const life = await page.evaluate(async (path) => (await (await fetch(path)).json()).validSeconds, file.href.replace(/\.xspf.*/, ''))
     assert.equal(life, 12 * 3600, 'a link lasts twelve hours')
-    assert.match(await page.textContent('[data-testid=elsewhere-terms]'), /plays this one film without signing in, for 12 hours, and stops working when you sign out/)
+    assert.equal(new URL(link.value).searchParams.get('e'), String(until), 'the file is asked for with the end of the link that is shown')
+    assert.ok(Math.abs(until - (Date.now() / 1000 + 12 * 3600)) < 600, 'and that end is twelve hours away')
+    const terms = await page.textContent('[data-testid=elsewhere-terms]')
+    const said = terms.match(/^The link and the downloaded file play this one film without signing in\. Both stop working at (.+) on (Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday), or as soon as you sign out\. Until then, anyone who has them can watch the film with them\.$/)
+    assert.ok(said, `what the page says about the link and the file: ${terms}`)
+    // The time is this device's own way of writing the end. (A minute
+    // either way: the page and the PC each looked at a clock.)
+    const ways = await page.evaluate((end) => [end - 60, end, end + 60].map((s) => {
+      const d = new Date(s * 1000)
+      return d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) + ' on ' + ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][d.getDay()]
+    }), until)
+    assert.ok(ways.includes(`${said[1]} on ${said[2]}`), `the page says "${said[1]} on ${said[2]}"; the link ends at one of ${ways.join(' / ')}`)
     assert.equal((await fetch(link.value, { headers: { Range: 'bytes=0-9' } })).status, 206, 'the link plays with no sign-in')
     handedLink = link.value
 
@@ -837,6 +883,7 @@ try {
     assert.match(list, /<vlc:option>start-time=7<\/vlc:option>/)
     const inList = (list.match(/<location>([^<]+)<\/location>/) || [])[1]?.replace(/&amp;/g, '&')
     assert.ok(inList && inList.startsWith(base + '/stream/'), 'the playlist holds a whole address')
+    assert.equal(new URL(inList).searchParams.get('e'), String(until), 'the link in the playlist ends when the page says it does')
     assert.equal((await fetch(inList, { headers: { Range: 'bytes=0-9' } })).status, 206, 'the link in the playlist plays with no sign-in')
     assert.equal((await fetch(base + file.href)).status, 401, 'the playlist itself is only given to someone signed in')
 
@@ -850,6 +897,19 @@ try {
       assert.equal(download.suggestedFilename(), 'Test Clip.xspf')
       assert.match(readFileSync(await download.path(), 'utf8'), /<vlc:option>start-time=9<\/vlc:option>/)
       assert.ok(await hasFocus(page, '[data-testid=elsewhere-vlc]'), 'the keyboard is still on the download after it was pressed')
+      // It looks like a button, so Space presses it too, and does not
+      // scroll the page as Space on an ordinary link would.
+      await stopAt(11)
+      const scrolled = () => page.evaluate(() => window.scrollY)
+      const before = await scrolled()
+      const [again] = await Promise.all([
+        page.waitForEvent('download', { timeout: 20000 }).catch(() => assert.fail('Space on "Download a file for VLC" downloaded nothing')),
+        page.keyboard.press('Space'),
+      ])
+      assert.equal(again.suggestedFilename(), 'Test Clip.xspf')
+      assert.match(readFileSync(await again.path(), 'utf8'), /<vlc:option>start-time=11<\/vlc:option>/)
+      assert.equal(await scrolled(), before, 'Space on the download did not scroll the page')
+      assert.ok(await hasFocus(page, '[data-testid=elsewhere-vlc]'), 'the keyboard is still on the download after Space')
     }
 
     // Only the browser on the PC may start the PC's video player.
@@ -884,14 +944,39 @@ try {
     await setupPage.waitForSelector('[data-testid=play-problem]')
     assert.equal(await setupPage.locator('video').count(), 0, 'there is no player on the page')
     await focusByText(setupPage, 'Open in another player')
-    await setupPage.keyboard.press('Enter')
+    // On the PC the button acts at once; it has no offer to open or close.
+    assert.equal(await setupPage.getAttribute('[data-testid=open-elsewhere]', 'aria-expanded'), null)
+    let asked = 0
+    const count = (r) => { if (r.method() === 'POST' && r.url().endsWith('/open-local')) asked++ }
+    setupPage.on('request', count)
+    // Enter is pressed and held, as a hand resting on the key does: the
+    // keyboard then repeats it many times a second. That is one press.
+    const pressed = Date.now()
+    for (let i = 0; i < 20; i++) {
+      await setupPage.keyboard.down('Enter')
+      await new Promise((r) => setTimeout(r, 25))
+    }
+    await setupPage.keyboard.up('Enter')
     await setupPage.waitForFunction(() => /Opened in this PC's video player/.test(document.querySelector('[data-testid=elsewhere-said]')?.textContent || ''), null, { timeout: 20000 })
       .catch(async () => assert.fail(`the page did not say the film was opened; it says: ${await setupPage.textContent('[data-testid=elsewhere]')}`))
+    assert.match(await setupPage.textContent('[data-testid=elsewhere-said]'), /starts from the beginning/, 'the page says where the film starts in the other player')
     assert.ok(await hasFocus(setupPage, '[data-testid=open-elsewhere]'), 'the keyboard is still on the button that was pressed')
     // On the PC there is nothing to download or copy: the film is open.
     assert.equal(await setupPage.locator('[data-testid=elsewhere-offer]').count(), 0)
-    // What the PC was asked to open: the film's own file, and nothing else.
+    // What the PC was asked to open: the film's own file, once, and
+    // nothing else.
+    assert.equal(asked, 1, `a held key asked the PC to open the film ${asked} times`)
     assert.equal(readFileSync(openedInPlayer, 'utf8'), join(media, 'Test Clip.mp4') + '\n')
+    // A second press right away (this time with Space) opens nothing
+    // more: a player takes a moment to appear, and the page says so.
+    await setupPage.keyboard.press('Space')
+    if (Date.now() - pressed < 4000) {
+      await setupPage.waitForFunction(() => /was opened in this PC's video player a moment ago/.test(document.querySelector('[data-testid=elsewhere-said]')?.textContent || ''), null, { timeout: 20000 })
+        .catch(async () => assert.fail(`pressed again at once, the page says: ${await setupPage.textContent('[data-testid=elsewhere]')}`))
+      assert.equal(asked, 1, 'a second press right away asked the PC again')
+      assert.equal(readFileSync(openedInPlayer, 'utf8'), join(media, 'Test Clip.mp4') + '\n')
+    } else console.log('  --  this machine took over four seconds for one press, so what a second press right away does was not checked')
+    setupPage.off('request', count)
     // Back to a browser that says what it really plays.
     await setupPage.goto(local)
     await setupPage.waitForSelector('text=Films (4)')

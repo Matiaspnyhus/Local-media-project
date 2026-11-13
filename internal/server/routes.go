@@ -420,7 +420,40 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
 	noStore(w)
-	http.ServeContent(w, r, "", st.ModTime(), f)
+	http.ServeContent(&watchedStream{ResponseWriter: w, s: s, sessionID: sessionID, checked: time.Now()}, r, "", st.ModTime(), f)
+}
+
+// streamCheckEvery is how often a file that is being sent looks up whether
+// its sign-in still stands. It is a variable so that tests need not wait.
+var streamCheckEvery = 5 * time.Second
+
+// watchedStream is the answer to one request for an original file. A
+// player outside the browser may read a whole film in a single request
+// that lasts for hours, and the sign-in is otherwise looked at only when a
+// request begins. So it is looked at again every few seconds while the file
+// is being sent: once the sign-in has been signed out or has run out, the
+// connection is cut, and the player is refused when it asks again.
+//
+// The same moments say that somebody is still watching, which is what
+// keeps an update from restarting the program under them (see IdleFor).
+type watchedStream struct {
+	http.ResponseWriter
+	s         *Server
+	sessionID string
+	checked   time.Time
+}
+
+func (w *watchedStream) Write(p []byte) (int, error) {
+	if now := time.Now(); now.Sub(w.checked) >= streamCheckEvery {
+		w.checked = now
+		if !w.s.signInAlive(w.sessionID) {
+			// How a handler tells the server to drop the connection at
+			// once, without this counting as a fault of the program.
+			panic(http.ErrAbortHandler)
+		}
+		w.s.lastStream.Store(now.Unix())
+	}
+	return w.ResponseWriter.Write(p)
 }
 
 // handleSupportBundle builds the one file the owner sends back after a

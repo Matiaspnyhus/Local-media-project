@@ -64,6 +64,9 @@ func (e *env) do(method, target, from string, cookie *http.Cookie, body any) *ht
 	r := httptest.NewRequest(method, target, rd)
 	r.RemoteAddr = from
 	r.Host = "192.168.1.10:8177"
+	if from == local {
+		r.Host = "localhost:8177" // what the browser on the PC itself calls the server
+	}
 	if method != "GET" && method != "HEAD" {
 		r.Header.Set("X-Requested-With", "localmedia")
 		r.Header.Set("Content-Type", "application/json")
@@ -198,6 +201,139 @@ func TestBeforeSetupOnlyThePCIsAnswered(t *testing.T) {
 	}
 }
 
+// namedPC gives the PC a name of its own on the network, whatever machine
+// runs the test. It must come before newEnv.
+func namedPC(t *testing.T, name string) {
+	t.Helper()
+	before := pcName
+	pcName = func() (string, error) { return name, nil }
+	t.Cleanup(func() { pcName = before })
+}
+
+// A browser sends along the name in the address it was given. A name that
+// is not this server's own means the page talking may be somebody else's:
+// the owner of a name on the internet can point it at a PC at home, or at
+// "this computer", after their page has loaded. Such a request gets
+// nothing, wherever it comes from and whatever it carries.
+func TestANameThatIsNotTheServersOwnIsAnsweredWithNothing(t *testing.T) {
+	namedPC(t, "MediaPC")
+	e := newEnv(t)
+	c := e.setup()
+	id := e.firstItem(c, "clip")
+	var p playOut
+	decode(t, e.do("POST", "/api/items/"+id+"/play", remote, c, nil), &p)
+
+	for _, host := range []string{
+		"192.168.1.10:8177", "192.168.1.10", "10.0.0.5:9999", "127.0.0.1:8177", "[::1]:8177", "[fd00::1]:8177", "[fd00::1]",
+		"localhost:8177", "localhost", "LocalHost:8177",
+		"mediapc:8177", "MEDIAPC:8177", "mediapc", "mediapc.local:8177", "MediaPC.Local:8177",
+	} {
+		if w := e.ask("GET", "/api/state", remote, host, nil, nil, ""); w.Code != 200 {
+			t.Errorf("sent to %q, one of the server's own addresses: %d %s", host, w.Code, w.Body)
+		}
+		if w := e.ask("GET", "/api/movies", remote, host, c, nil, ""); w.Code != 200 {
+			t.Errorf("signed in, sent to %q: %d %s", host, w.Code, w.Body)
+		}
+	}
+	for _, host := range []string{
+		"evil.example:8177", "evil.example", "mediapc.evil.example:8177", "mediapc.local.evil.example:8177", "mediapc.lan:8177",
+		"localhost.evil.example:8177", "127.0.0.1.evil.example:8177", "192.168.1.10.evil.example", "notmediapc:8177", "local:8177",
+		"localhost.:8177", "", ":8177", "localhost:8177:8177", "127.0.0.1:8177@evil.example", "127.0.0.1:x", "[evil.example]:8177", "2130706433:8177", "127.1:8177", "0x7f.0.0.1:8177",
+	} {
+		for _, from := range []string{remote, local} {
+			page := fromPage(host)
+			asked := []*httptest.ResponseRecorder{
+				e.ask("GET", "/", from, host, c, nil, ""),
+				e.ask("GET", "/assets/app.js", from, host, c, nil, ""),
+				e.ask("GET", "/health", from, host, nil, nil, ""),
+				e.ask("GET", "/api/state", from, host, c, nil, ""),
+				e.ask("GET", "/api/movies", from, host, c, nil, ""),
+				e.ask("GET", "/api/items/"+id+"/handoff", from, host, c, nil, ""),
+				e.ask("POST", "/api/items/"+id+"/play", from, host, c, page, "{}"),
+				e.ask("POST", "/api/login", from, host, nil, page, `{"name":"owner","password":"a good password"}`),
+				e.ask("GET", p.URL, from, host, nil, nil, ""),
+			}
+			for i, w := range asked {
+				if w.Code != 403 {
+					t.Errorf("sent to %q from %s, request %d: %d %s", host, from, i, w.Code, w.Body)
+				}
+				if sessionCookie(w) != nil {
+					t.Errorf("sent to %q from %s, request %d: a sign-in was handed out", host, from, i)
+				}
+				// The answer says how to get here, and nothing about the PC.
+				for _, told := range []string{"192.168", "mediapc", "MediaPC", "owner", "clip", "/stream/"} {
+					if strings.Contains(w.Body.String(), told) {
+						t.Errorf("sent to %q, request %d: the refusal mentions %q: %s", host, i, told, w.Body)
+					}
+				}
+			}
+		}
+	}
+	// Refused in words a person can act on, as a page or as the page's
+	// script expects it.
+	if w := e.ask("GET", "/", remote, "mediapc.lan:8177", nil, nil, ""); !strings.Contains(w.Body.String(), "does not answer to this address") || !strings.Contains(w.Body.String(), "http://localhost:8177") || !strings.HasPrefix(w.Header().Get("Content-Type"), "text/html") {
+		t.Errorf("the page for a wrong name: %q %s", w.Header().Get("Content-Type"), w.Body)
+	}
+	var said map[string]string
+	decode(t, e.ask("GET", "/api/state", remote, "mediapc.lan:8177", nil, nil, ""), &said)
+	if !strings.Contains(said["error"], "does not answer to this address") {
+		t.Errorf("the answer to a script for a wrong name: %v", said)
+	}
+	// None of that signed anybody out or in.
+	if w := e.do("GET", "/api/movies", remote, c, nil); w.Code != 200 {
+		t.Errorf("the owner's own sign-in afterwards: %d", w.Code)
+	}
+}
+
+// Before setup, whoever is "on the PC" becomes the owner. So it has to be
+// the PC for real: not a page under a foreign name that points at this
+// computer, and not somebody a program on the PC lets in from outside.
+func TestBeforeSetupOnlyThePCsOwnAddressCanClaimTheServer(t *testing.T) {
+	e := newEnv(t)
+	body := `{"name":"evil","password":"evil password 1","folder":` + strconv.Quote(e.media) + `}`
+	with := func(host string, more map[string]string) map[string]string {
+		h := fromPage(host)
+		for k, v := range more {
+			h[k] = v
+		}
+		return h
+	}
+	for _, c := range []struct {
+		name, host string
+		more       map[string]string
+	}{
+		{"a foreign name that points at this computer", "evil.example:8177", nil},
+		{"the PC's home address, arriving from the PC (a port passed on by a program on it)", "192.168.1.10:8177", nil},
+		{"passed on by a proxy on the PC", "localhost:8177", map[string]string{"X-Forwarded-For": "203.0.113.9"}},
+		{"passed on by a proxy on the PC that says so the standard way", "localhost:8177", map[string]string{"Forwarded": "for=203.0.113.9"}},
+		{"passed on by a proxy that only names itself", "localhost:8177", map[string]string{"Via": "1.1 tunnel"}},
+	} {
+		if w := e.ask("GET", "/api/setup/folders?path=/", local, c.host, nil, with(c.host, c.more), ""); w.Code != 403 || strings.Contains(w.Body.String(), `"dirs"`) {
+			t.Errorf("%s: the folder list answered %d %s", c.name, w.Code, w.Body)
+		}
+		if w := e.ask("GET", "/", local, c.host, nil, with(c.host, c.more), ""); w.Code != 403 {
+			t.Errorf("%s: the page answered %d", c.name, w.Code)
+		}
+		w := e.ask("POST", "/api/setup", local, c.host, nil, with(c.host, c.more), body)
+		if w.Code != 403 || sessionCookie(w) != nil {
+			t.Errorf("%s: setup answered %d %s", c.name, w.Code, w.Body)
+		}
+	}
+	var users int
+	e.s.db.QueryRow(`SELECT count(*) FROM users`).Scan(&users)
+	if users != 0 || e.s.setupDone.Load() {
+		t.Fatalf("the server was claimed: %d users, setup done %v", users, e.s.setupDone.Load())
+	}
+	// The browser on the PC, at the PC's address for itself, in each of
+	// its spellings.
+	for _, host := range []string{"127.0.0.1:8177", "[::1]:8177", "localhost:8177"} {
+		if w := e.ask("GET", "/api/setup/folders", local, host, nil, map[string]string{"Origin": "http://" + host}, ""); w.Code != 200 {
+			t.Errorf("the folder list on the PC at %s: %d %s", host, w.Code, w.Body)
+		}
+	}
+	e.setup()
+}
+
 type playOut struct {
 	URL        string `json:"url"`
 	PositionMs int64  `json:"positionMs"`
@@ -238,7 +374,7 @@ func TestPlayStreamResumeAndSignOut(t *testing.T) {
 
 	// The link works with no cookie at all (AirPlay, external players)...
 	r := httptest.NewRequest("GET", p.URL, nil)
-	r.RemoteAddr = remote
+	r.RemoteAddr, r.Host = remote, "192.168.1.10:8177" // a player uses the address the page was opened at
 	r.Header.Set("Range", "bytes=10-14")
 	rec := httptest.NewRecorder()
 	e.s.ServeHTTP(rec, r)

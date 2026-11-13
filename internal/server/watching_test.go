@@ -109,7 +109,7 @@ func TestWhoIsWatching(t *testing.T) {
 
 	// A piece of the file, fetched with the link alone as a player does.
 	r := httptest.NewRequest("GET", p.URL, nil)
-	r.RemoteAddr = remote
+	r.RemoteAddr, r.Host = remote, "192.168.1.10:8177" // an address of the PC's own: any other name is refused
 	r.Header.Set("Range", "bytes=10-14")
 	rec := httptest.NewRecorder()
 	e.s.ServeHTTP(rec, r)
