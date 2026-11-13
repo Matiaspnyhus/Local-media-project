@@ -160,14 +160,16 @@ export interface Handoff {
   // A complete address for the film's original file. It plays without
   // signing in, so a video player outside the browser can use it.
   url: string
-  expiresAt: number // when the link stops working, in Unix seconds
-  validSeconds: number // how long a link lasts from the moment it is made
+  expiresAt: number // when the link stops working, in Unix seconds by the PC's clock
+  validSeconds: number // how long that is from now: twelve hours, or less if the sign-in runs out sooner
   thisPC: boolean // this browser is on the PC that runs Local Media
 }
 // vlcFile is the address of a small playlist file for VLC that plays one
-// film, starting at the given second.
-export function vlcFile(id: string, atSeconds: number): string {
-  return `/api/items/${id}/handoff.xspf` + (atSeconds > 0 ? `?at=${Math.floor(atSeconds)}` : '')
+// film, starting at the given second. The link inside the file stops
+// working at `until` (Unix seconds by the PC's clock): the moment the page
+// has told the viewer, however much later the file is downloaded.
+export function vlcFile(id: string, atSeconds: number, until: number): string {
+  return `/api/items/${id}/handoff.xspf?` + (atSeconds > 0 ? `at=${Math.floor(atSeconds)}&` : '') + `until=${Math.floor(until)}`
 }
 export interface Scan {
   added: number

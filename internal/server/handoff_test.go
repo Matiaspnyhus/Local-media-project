@@ -12,7 +12,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -174,6 +176,95 @@ func TestOpenLocalOnlyFromTheBrowserOnThePC(t *testing.T) {
 	}
 }
 
+// "The PC's own browser" is a connection from the PC, to the PC's address
+// for itself, that nobody passed on. A page under a foreign name that
+// points at the PC arrives from the PC too; so does everything a tunnel or
+// a proxy on the PC lets in from outside.
+func TestOnlyThePCsOwnAddressCountsAsThePC(t *testing.T) {
+	namedPC(t, "MediaPC")
+	e := newEnv(t)
+	c := e.setup()
+	homeAt(t, "http://"+phoneHost)
+	opened := recordOpens(t)
+	id := e.firstItem(c, "clip")
+	target := "/api/items/" + id + "/open-local"
+	with := func(host string, more map[string]string) map[string]string {
+		h := fromPage(host)
+		for k, v := range more {
+			h[k] = v
+		}
+		return h
+	}
+
+	// A foreign name that points at this computer. Its page cannot even
+	// sign in, and the owner's own sign-in would not help it.
+	const evil = "evil.example:8177"
+	w := e.ask("POST", "/api/login", local, evil, nil, fromPage(evil), `{"name":"owner","password":"a good password"}`)
+	if w.Code != 403 || sessionCookie(w) != nil {
+		t.Errorf("sign-in under a foreign name, from the PC: %d %s", w.Code, w.Body)
+	}
+	if w := e.ask("POST", target, local, evil, c, fromPage(evil), "{}"); w.Code != 403 {
+		t.Errorf("open-local under a foreign name, from the PC: %d %s", w.Code, w.Body)
+	}
+	if w := e.ask("GET", "/api/items/"+id+"/handoff", local, evil, c, map[string]string{"Origin": "http://" + evil}, ""); w.Code != 403 || strings.Contains(w.Body.String(), "thisPC") || strings.Contains(w.Body.String(), "/stream/") {
+		t.Errorf("handoff under a foreign name, from the PC: %d %s", w.Code, w.Body)
+	}
+
+	// From the PC, to one of the server's own addresses, but not the PC's
+	// address for itself; or passed on by something.
+	for _, k := range []struct {
+		name, host string
+		more       map[string]string
+	}{
+		{"the PC's home address (a port passed on by a program on the PC)", phoneHost, nil},
+		{"the PC's own name", "mediapc.local:8177", nil},
+		{"the PC's own short name", "mediapc:8177", nil},
+		{"passed on: X-Forwarded-For", pcHost, map[string]string{"X-Forwarded-For": "203.0.113.9"}},
+		{"passed on: X-Forwarded-For that claims to be the PC", pcHost, map[string]string{"X-Forwarded-For": "127.0.0.1"}},
+		{"passed on: Forwarded", pcHost, map[string]string{"Forwarded": "for=203.0.113.9;host=localhost"}},
+		{"passed on: X-Forwarded-Host", pcHost, map[string]string{"X-Forwarded-Host": "films.example.com"}},
+		{"passed on: X-Forwarded-Proto", pcHost, map[string]string{"X-Forwarded-Proto": "https"}},
+		{"passed on: X-Real-IP", pcHost, map[string]string{"X-Real-IP": "203.0.113.9"}},
+		{"passed on: Via", pcHost, map[string]string{"Via": "1.1 tunnel"}},
+		{"passed on: any other X-Forwarded header", pcHost, map[string]string{"x-forwarded-port": "443"}},
+		{"passed on: a tunnel's own header", pcHost, map[string]string{"CF-Connecting-IP": "203.0.113.9"}},
+		{"passed on: True-Client-IP", pcHost, map[string]string{"True-Client-IP": "203.0.113.9"}},
+		{"passed on: an empty X-Forwarded-For", pcHost, map[string]string{"X-Forwarded-For": ""}},
+	} {
+		if w := e.ask("POST", target, local, k.host, c, with(k.host, k.more), "{}"); w.Code != 403 || !strings.Contains(w.Body.String(), "from the browser on that PC") {
+			t.Errorf("%s: open-local answered %d %s", k.name, w.Code, w.Body)
+		}
+		get := map[string]string{"Origin": "http://" + k.host}
+		for key, v := range k.more {
+			get[key] = v
+		}
+		w := e.ask("GET", "/api/items/"+id+"/handoff", local, k.host, c, get, "")
+		var h handoffAnswer
+		decode(t, w, &h)
+		if w.Code != 200 || h.ThisPC || h.URL == "" {
+			t.Errorf("%s: handoff answered %d %+v, want the link and the file for VLC, as for any other device", k.name, w.Code, h)
+		}
+	}
+	if len(*opened) != 0 {
+		t.Fatalf("a request that was not the PC's own browser opened %q", *opened)
+	}
+
+	// The PC's address for itself, in every spelling a browser uses.
+	for _, k := range []struct{ from, host string }{
+		{local, "localhost:8177"}, {local, "LOCALHOST:8177"}, {local, "127.0.0.1:8177"}, {"[::1]:50000", "[::1]:8177"},
+		{"[::1]:50000", "localhost:8177"}, {local, "localhost"}, {"127.0.0.2:50000", "127.0.0.2:8177"},
+	} {
+		*opened = (*opened)[:0]
+		var h handoffAnswer
+		decode(t, e.ask("GET", "/api/items/"+id+"/handoff", k.from, k.host, c, nil, ""), &h)
+		w := e.ask("POST", target, k.from, k.host, c, fromPage(k.host), "{}")
+		if !h.ThisPC || w.Code != 200 || len(*opened) != 1 {
+			t.Errorf("from %s to %s: handoff says this PC %v; open-local %d %s; opened %q", k.from, k.host, h.ThisPC, w.Code, w.Body, *opened)
+		}
+		later(e, time.Minute)
+	}
+}
+
 func TestOpenLocalOpensOnlyVideosInsideTheLibrary(t *testing.T) {
 	e := newEnv(t)
 	c := e.setup()
@@ -217,6 +308,57 @@ func TestOpenLocalOpensOnlyVideosInsideTheLibrary(t *testing.T) {
 			}
 		}
 	}
+	// A link put where a film was. The scan lists no links, so this takes
+	// somebody who can write into the library after the scan. Inside the
+	// library a link's bytes may be sent like any film's, but the link is
+	// never handed to the operating system: what "open" does then is
+	// decided by what it points at.
+	os.WriteFile(filepath.Join(e.media, "run.command"), []byte("#!/bin/sh\necho run\n"), 0o755)
+	os.MkdirAll(filepath.Join(e.media, "Real"), 0o755)
+	os.WriteFile(filepath.Join(e.media, "Real", "inside.mkv"), []byte("mkvdata"), 0o644)
+	links := map[string]string{ // the link's place in the library: what it points at
+		"script.mkv":        "run.command",
+		"batch.mp4":         "run.bat",
+		"other-film.mkv":    filepath.Join("Films", "Some.Movie.mkv"),
+		"full-path.mkv":     filepath.Join(e.media, "Films", "Some.Movie.mkv"),
+		"Linked":            "Real", // a folder that is a link: the film in it is real
+		"link-to-link.mkv":  "script.mkv",
+		"Films/climbs.mkv":  filepath.Join("..", "run.command"),
+		"Films/dangles.mkv": "nothing-there.mkv",
+	}
+	linked := []string{}
+	for at, to := range links {
+		if os.Symlink(to, filepath.Join(e.media, filepath.FromSlash(at))) == nil { // not everywhere, see above
+			if at == "Linked" {
+				at = "Linked/inside.mkv"
+			}
+			linked = append(linked, at)
+		}
+	}
+	for _, rel := range linked {
+		if _, err := e.s.db.Exec(`UPDATE files SET rel_path=? WHERE version_id IN (SELECT id FROM versions WHERE item_id=?)`, rel, id); err != nil {
+			t.Fatal(err)
+		}
+		if w := open(id); w.Code != 404 {
+			t.Errorf("a film that is reached through a link (%q): %d %s", rel, w.Code, w.Body)
+		}
+	}
+	// The same film by its real place is opened (and a name with ".." in
+	// it, which no scan writes, is not).
+	e.s.db.Exec(`UPDATE files SET rel_path='Films/../clip.mp4' WHERE version_id IN (SELECT id FROM versions WHERE item_id=?)`, id)
+	if w := open(id); w.Code != 404 {
+		t.Errorf("a file row with .. in it: %d %s", w.Code, w.Body)
+	}
+	if len(*opened) != 0 {
+		t.Fatalf("opened %q", *opened)
+	}
+	e.s.db.Exec(`UPDATE files SET rel_path='Real/inside.mkv' WHERE version_id IN (SELECT id FROM versions WHERE item_id=?)`, id)
+	if w := open(id); w.Code != 200 || len(*opened) != 1 || (*opened)[0] != filepath.Join(e.media, "Real", "inside.mkv") {
+		t.Fatalf("the film in its real folder: %d %s, opened %q", w.Code, w.Body, *opened)
+	}
+	*opened = (*opened)[:0]
+	later(e, time.Minute)
+
 	// A file the library has marked as gone.
 	e.s.db.Exec(`UPDATE files SET rel_path='clip.mp4', missing=1 WHERE version_id IN (SELECT id FROM versions WHERE item_id=?)`, id)
 	if w := open(id); w.Code != 404 {
@@ -228,6 +370,158 @@ func TestOpenLocalOpensOnlyVideosInsideTheLibrary(t *testing.T) {
 	e.s.db.Exec(`UPDATE files SET missing=0 WHERE version_id IN (SELECT id FROM versions WHERE item_id=?)`, id)
 	if w := open(id); w.Code != 200 || len(*opened) != 1 {
 		t.Fatalf("the film itself, put back: %d %s, opened %q", w.Code, w.Body, *opened)
+	}
+}
+
+// later moves the clock by which the server limits how often the PC's
+// video player is started.
+func later(e *env, d time.Duration) {
+	e.s.opens.mu.Lock()
+	defer e.s.opens.mu.Unlock()
+	now := e.s.opens.now
+	e.s.opens.now = func() time.Time { return now().Add(d) }
+}
+
+// stopClock makes that clock stand still, so that a test of the limits
+// gives the same answers on a slow machine; later still moves it.
+func stopClock(e *env) {
+	e.s.opens.mu.Lock()
+	defer e.s.opens.mu.Unlock()
+	at := time.Now()
+	e.s.opens.now = func() time.Time { return at }
+}
+
+// One press of the button starts the PC's video player once. A key held
+// down, an impatient finger or a script must not start it again and again.
+func TestThePlayerIsNotStartedOverAndOver(t *testing.T) {
+	e := newEnv(t)
+	for _, name := range []string{"Second.Film.mkv", "Third.Film.mkv", "Fourth.Film.mkv"} {
+		os.WriteFile(filepath.Join(e.media, "Films", name), []byte("mkvdata"), 0o644)
+	}
+	c := e.setup()
+	stopClock(e)
+	var mu sync.Mutex
+	var started []string
+	hold := make(chan struct{}) // closed: the operating system answers at once
+	close(hold)
+	before := openInPlayer
+	openInPlayer = func(path string) error {
+		mu.Lock()
+		started = append(started, filepath.Base(path))
+		wait := hold
+		mu.Unlock()
+		<-wait
+		return nil
+	}
+	t.Cleanup(func() { openInPlayer = before })
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(started)
+	}
+	open := func(item string) *httptest.ResponseRecorder {
+		return e.ask("POST", "/api/items/"+item+"/open-local", local, pcHost, c, fromPage(pcHost), "{}")
+	}
+	held := func(w *httptest.ResponseRecorder, words string) bool {
+		t.Helper()
+		var said map[string]string
+		decode(t, w, &said)
+		wait, err := strconv.Atoi(w.Header().Get("Retry-After"))
+		return w.Code == 429 && strings.Contains(said["error"], words) && err == nil && wait >= 1 && wait <= 10
+	}
+	clip, second, third, fourth := e.firstItem(c, "clip"), e.firstItem(c, "Second Film"), e.firstItem(c, "Third Film"), e.firstItem(c, "Fourth Film")
+
+	// A hundred requests for one film at the same moment, as a held key or
+	// a script sends them.
+	answers := together(100, func(int) *httptest.ResponseRecorder { return open(clip) })
+	ok := 0
+	for _, w := range answers {
+		if w.Code == 200 {
+			ok++
+		} else if !held(w, "was opened in this PC's video player a moment ago") {
+			t.Errorf("a request that was held back answered %d %q %s", w.Code, w.Header().Get("Retry-After"), w.Body)
+		}
+	}
+	if ok != 1 || count() != 1 {
+		t.Fatalf("100 requests at once: %d were told the film was opened, and the player was started %d times; want once", ok, count())
+	}
+	// A second press a moment later, and a third.
+	for i := 0; i < 2; i++ {
+		if w := open(clip); !held(w, "a moment ago") || count() != 1 {
+			t.Fatalf("pressed again at once: %d %s, player started %d times", w.Code, w.Body, count())
+		}
+	}
+	// Refused requests cost nothing: they are not openings.
+	for i := 0; i < 20; i++ {
+		open(ids.New())
+		e.ask("POST", "/api/items/"+second+"/open-local", remote, phoneHost, c, fromPage(phoneHost), "{}")
+	}
+	// Other films may follow, but only a few in a short while.
+	for i, item := range []string{second, third} {
+		if w := open(item); w.Code != 200 || count() != i+2 {
+			t.Fatalf("film %d within the same few seconds: %d %s, player started %d times", i+2, w.Code, w.Body, count())
+		}
+	}
+	if w := open(fourth); !held(w, "asked to open films several times") || count() != 3 {
+		t.Fatalf("a fourth film within the same few seconds: %d %s, player started %d times", w.Code, w.Body, count())
+	}
+	// A hundred requests across all the films change nothing either.
+	together(100, func(i int) *httptest.ResponseRecorder { return open([]string{clip, second, third, fourth}[i%4]) })
+	if count() != 3 {
+		t.Fatalf("a burst across four films started the player %d times in all, want 3", count())
+	}
+
+	// Once the same-film wait has passed, the film may be opened again
+	// (the viewer closed the player and wants it back); the few-in-a-
+	// short-while limit still stands until its own time has passed.
+	later(e, sameFilmWait)
+	if w := open(clip); !held(w, "asked to open films several times") {
+		t.Fatalf("after %s, with three films just opened: %d %s", sameFilmWait, w.Code, w.Body)
+	}
+	later(e, openWindow)
+	if w := open(clip); w.Code != 200 || count() != 4 {
+		t.Fatalf("after the wait: %d %s, player started %d times", w.Code, w.Body, count())
+	}
+
+	// While the operating system has not yet answered for one film, no
+	// other is handed to it.
+	later(e, time.Minute)
+	mu.Lock()
+	hold = make(chan struct{})
+	mu.Unlock()
+	slow := make(chan *httptest.ResponseRecorder, 1)
+	go func() { slow <- open(second) }()
+	for i := 0; count() != 5; i++ { // until the first one is with the operating system
+		if i > 6000 {
+			t.Fatal("the film was never handed to the operating system")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if w := open(third); !held(w, "still opening another film") || count() != 5 {
+		t.Errorf("a second film while the first is still being opened: %d %s, player started %d times", w.Code, w.Body, count())
+	}
+	close(hold)
+	if w := <-slow; w.Code != 200 {
+		t.Errorf("the film that was being opened: %d %s", w.Code, w.Body)
+	}
+	if w := open(third); w.Code != 200 || count() != 6 {
+		t.Errorf("once the first has been opened: %d %s, player started %d times", w.Code, w.Body, count())
+	}
+
+	// Every start is in the log, with who asked and which film, and
+	// without the film's folder. What was held back is not there as a start.
+	written, _ := os.ReadFile(e.s.log.path)
+	log := string(written)
+	if n := strings.Count(log, "owner is opening "); n != 6 {
+		t.Errorf("the log has %d lines for 6 starts:\n%s", n, log)
+	}
+	for _, line := range []string{"owner is opening clip.mp4 in this PC's video player", "owner is opening Second.Film.mkv in this PC's video player", "owner is opening Third.Film.mkv in this PC's video player"} {
+		if !strings.Contains(log, line) {
+			t.Errorf("the log lacks %q:\n%s", line, log)
+		}
+	}
+	if strings.Contains(log, e.media) || strings.Contains(log, "Fourth.Film") {
+		t.Errorf("the log names the films' folder, or a film that was never opened:\n%s", log)
 	}
 }
 
@@ -255,6 +549,19 @@ func TestAPlayerThatWillNotStartIsSaidInPlainWords(t *testing.T) {
 	if strings.Contains(log, path) || strings.Contains(log, e.media) {
 		t.Errorf("the log names the film's folder: %s", log)
 	}
+	// A try that failed does not hold the film back: the viewer may press
+	// again as soon as they have put right what was wrong. It is still one
+	// of the few tries the PC allows in a short while.
+	stopClock(e)
+	later(e, time.Minute)
+	for i := 1; i <= openMost; i++ {
+		if w := e.ask("POST", "/api/items/"+id+"/open-local", local, pcHost, c, fromPage(pcHost), "{}"); w.Code != 500 {
+			t.Fatalf("try %d after a failure: %d %s", i, w.Code, w.Body)
+		}
+	}
+	if w := e.ask("POST", "/api/items/"+id+"/open-local", local, pcHost, c, fromPage(pcHost), "{}"); w.Code != 429 || !strings.Contains(w.Body.String(), "several times just now") {
+		t.Fatalf("one try too many in a short while: %d %s", w.Code, w.Body)
+	}
 }
 
 // With the test switch set, the program writes down what it would open
@@ -272,6 +579,9 @@ func TestTheSwitchThatOnlyRecords(t *testing.T) {
 		if w := e.ask("POST", "/api/items/"+id+"/open-local", local, pcHost, c, fromPage(pcHost), "{}"); w.Code != 200 {
 			t.Fatalf("%d %s", w.Code, w.Body)
 		}
+		// The same film is not opened twice in a row (see
+		// TestThePlayerIsNotStartedOverAndOver), so time passes in between.
+		later(e, time.Minute)
 	}
 	got, err := os.ReadFile(record)
 	line := filepath.Join(e.media, "clip.mp4") + "\n"
@@ -396,6 +706,92 @@ func TestHandoffLinkWorksUntilItsSignInEnds(t *testing.T) {
 	}
 }
 
+// What the page is told about how long a link lasts is what the viewer
+// reads, so it has to be true: a link dies with its sign-in, and a sign-in
+// can have less left than a link's usual twelve hours.
+func TestALinkNeverClaimsToOutliveItsSignIn(t *testing.T) {
+	e := newEnv(t)
+	c := e.setup()
+	homeAt(t, "http://"+phoneHost)
+	id := e.firstItem(c, "clip")
+	var sid string
+	e.s.db.QueryRow(`SELECT id FROM sessions ORDER BY rowid DESC LIMIT 1`).Scan(&sid)
+	ends := time.Now().Add(time.Hour).Unix() // the sign-in has one hour left
+	if _, err := e.s.db.Exec(`UPDATE sessions SET created_at=? WHERE id=?`, time.Unix(ends, 0).Add(-sessionLife).Unix(), sid); err != nil {
+		t.Fatal(err)
+	}
+	endOf := func(link string) int64 {
+		t.Helper()
+		u, err := url.Parse(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		end, err := strconv.ParseInt(u.Query().Get("e"), 10, 64)
+		if err != nil {
+			t.Fatalf("the link %q does not say when it ends", link)
+		}
+		return end
+	}
+	inPlaylist := func(query string) (*httptest.ResponseRecorder, string) {
+		t.Helper()
+		w := e.ask("GET", "/api/items/"+id+"/handoff.xspf"+query, remote, phoneHost, c, nil, "")
+		if w.Code != 200 {
+			return w, ""
+		}
+		return w, readXSPF(t, w.Body.Bytes()).Tracks[0].Location
+	}
+
+	var h handoffAnswer
+	decode(t, e.ask("GET", "/api/items/"+id+"/handoff", remote, phoneHost, c, nil, ""), &h)
+	if h.ExpiresAt != ends || h.ValidSeconds > 3600 || h.ValidSeconds < 3600-120 || endOf(h.URL) != ends {
+		t.Errorf("a sign-in with an hour left (until %d) was told: %+v", ends, h)
+	}
+	if w := e.fetchLink(h.URL); w.Code != 206 {
+		t.Errorf("the link itself: %d", w.Code)
+	}
+	if _, link := inPlaylist(""); endOf(link) != ends {
+		t.Errorf("the link in the file for VLC ends at %d, the sign-in at %d", endOf(link), ends)
+	}
+
+	// With a full sign-in again, a link lasts its usual time, and the file
+	// for VLC ends when the page says the link it shows does: the page
+	// passes that moment on.
+	e.s.db.Exec(`UPDATE sessions SET created_at=? WHERE id=?`, time.Now().Unix(), sid)
+	now := time.Now().Unix()
+	usual := int64(linkLife / time.Second)
+	decode(t, e.ask("GET", "/api/items/"+id+"/handoff", remote, phoneHost, c, nil, ""), &h)
+	if h.ValidSeconds != usual || h.ExpiresAt < now+usual || h.ExpiresAt > now+usual+60 {
+		t.Errorf("a fresh sign-in was told: %+v", h)
+	}
+	soon := now + 600
+	w, link := inPlaylist("?at=5&until=" + strconv.FormatInt(soon, 10))
+	if w.Code != 200 || endOf(link) != soon {
+		t.Fatalf("asked for a file whose link ends at %d: %d, ends at %d", soon, w.Code, endOf(link))
+	}
+	if w := e.fetchLink(link); w.Code != 206 {
+		t.Errorf("that link: %d", w.Code)
+	}
+	// It can shorten a link's life, never lengthen it.
+	for _, far := range []int64{now + usual + 3600, now + 400*24*3600, 1 << 62} {
+		w, link := inPlaylist("?until=" + strconv.FormatInt(far, 10))
+		if w.Code != 200 || endOf(link) > time.Now().Unix()+usual {
+			t.Errorf("asked for a link until %d: %d, ends at %d, more than the usual time away", far, w.Code, endOf(link))
+		}
+	}
+	// A moment that has passed gives no file with a dead link in it; the
+	// viewer is told to ask again.
+	for _, past := range []int64{now - 1, now - 3600, 1} {
+		if w, _ := inPlaylist("?until=" + strconv.FormatInt(past, 10)); w.Code != 410 || !strings.Contains(w.Body.String(), "has run out") {
+			t.Errorf("until=%d, which has passed: %d %s", past, w.Code, w.Body)
+		}
+	}
+	for _, bad := range []string{"abc", "0", "-5", "12.5", "1e12", "99999999999999999999", "+" + strconv.FormatInt(soon, 10) + "x", strconv.FormatInt(soon, 10) + "%20"} {
+		if w, _ := inPlaylist("?until=" + bad); w.Code != 400 {
+			t.Errorf("until=%s: %d %s", bad, w.Code, w.Body)
+		}
+	}
+}
+
 func TestHandoffAddressIsAlwaysOneOfTheServersOwn(t *testing.T) {
 	e := newEnv(t)
 	req := func(from, host string, arrivedAt net.Addr) *http.Request {
@@ -419,6 +815,16 @@ func TestHandoffAddressIsAlwaysOneOfTheServersOwn(t *testing.T) {
 		{"a made-up Host is never repeated", two, req(remote, "evil.example", nil), "http://10.0.0.5:8177", true},
 		{"the right address on another port", two, req(remote, "192.168.1.10:9999", nil), "http://10.0.0.5:8177", true},
 		{"from the PC itself", two, req(local, "localhost:8177", nil), "http://10.0.0.5:8177", true},
+		// A device that came by the PC's name is given the address its
+		// connection arrived at, which it can certainly reach; the first of
+		// the list may belong to a network connection a phone cannot use.
+		{"by name: the address the connection arrived at", two, req(remote, "mediapc.local:8177", &net.TCPAddr{IP: net.ParseIP("192.168.1.10"), Port: 8177}), "http://192.168.1.10:8177", true},
+		{"by name, arriving at an address the list lacks", two, req("[fd00::7]:40000", "mediapc.local:8177", &net.TCPAddr{IP: net.ParseIP("fd00::1"), Port: 8177}), "http://[fd00::1]:8177", true},
+		{"the address in use wins over where the connection arrived", two, req(remote, "10.0.0.5:8177", &net.TCPAddr{IP: net.ParseIP("192.168.1.10"), Port: 8177}), "http://10.0.0.5:8177", true},
+		{"from the PC itself, arriving at the PC's address for itself", two, req(local, "localhost:8177", &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8177}), "http://10.0.0.5:8177", true},
+		{"from the PC itself over IPv6", two, req("[::1]:50000", "localhost:8177", &net.TCPAddr{IP: net.ParseIP("::1"), Port: 8177}), "http://10.0.0.5:8177", true},
+		{"arriving at an address that works on one network connection only", two, req("[fe80::7%eth0]:40000", "mediapc.local:8177", &net.TCPAddr{IP: net.ParseIP("fe80::1"), Port: 8177, Zone: "eth0"}), "http://10.0.0.5:8177", true},
+		{"arriving nowhere in particular", two, req(remote, "mediapc.local:8177", &net.TCPAddr{IP: net.IPv4zero, Port: 8177}), "http://10.0.0.5:8177", true},
 		{"no home address: where the connection arrived", nil, req("169.254.7.7:40000", "169.254.1.2:8177", &net.TCPAddr{IP: net.ParseIP("169.254.1.2"), Port: 8177}), "http://169.254.1.2:8177", true},
 		{"no home address, an IPv6 connection", nil, req("[fd00::7]:40000", "[fd00::1]:8177", &net.TCPAddr{IP: net.ParseIP("fd00::1"), Port: 8177}), "http://[fd00::1]:8177", true},
 		{"no home address, on the PC", nil, req(local, "localhost:8177", nil), "http://127.0.0.1:8177", true},
@@ -439,6 +845,104 @@ func TestHandoffAddressIsAlwaysOneOfTheServersOwn(t *testing.T) {
 		if w := e.do("GET", "/api/items/"+id+way, remote, c, nil); w.Code != 404 || !strings.Contains(w.Body.String(), "No home network address") {
 			t.Errorf("%s with no address to give: %d %s", way, w.Code, w.Body)
 		}
+	}
+}
+
+// A player outside the browser reads a film in one long request. Signing
+// out has to end that too, not only the next request.
+func TestAFilmBeingSentStopsWhenItsSignInEnds(t *testing.T) {
+	e := newEnv(t)
+	// Far more than a network connection holds on its way: the film
+	// cannot have "already arrived" when the sign-out comes.
+	const size = 96 << 20
+	film, err := os.Create(filepath.Join(e.media, "Long Film (2001).mkv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := film.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	film.Close()
+	c := e.setup()
+	every := streamCheckEvery
+	streamCheckEvery = 0 // looked up with every piece that is sent, so the test waits for nothing
+	t.Cleanup(func() { streamCheckEvery = every })
+	srv := httptest.NewServer(e.s)
+	// Closed last of all, after every film still being read has been let
+	// go of (see begin): closing waits for requests that are under way.
+	t.Cleanup(srv.Close)
+	homeAt(t, srv.URL)
+	id := e.firstItem(c, "Long Film")
+	signIn := func() *http.Cookie {
+		c := sessionCookie(e.do("POST", "/api/login", remote, nil, map[string]string{"name": "owner", "password": "a good password"}))
+		if c == nil {
+			t.Fatal("could not sign in")
+		}
+		return c
+	}
+	link := func(c *http.Cookie) string {
+		var h handoffAnswer
+		decode(t, e.ask("GET", "/api/items/"+id+"/handoff", remote, strings.TrimPrefix(srv.URL, "http://"), c, nil, ""), &h)
+		if !strings.HasPrefix(h.URL, srv.URL+"/stream/") {
+			t.Fatalf("the link is %q", h.URL)
+		}
+		return h.URL
+	}
+	begin := func(link string) *http.Response {
+		res, err := http.Get(link)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { res.Body.Close() })
+		if res.StatusCode != 200 || res.ContentLength != size {
+			t.Fatalf("the film: %d, %d bytes", res.StatusCode, res.ContentLength)
+		}
+		if _, err := io.ReadFull(res.Body, make([]byte, 1<<20)); err != nil {
+			t.Fatalf("the first megabyte: %v", err)
+		}
+		return res
+	}
+
+	// While the sign-in stands, all of the film arrives, and the server
+	// knows the whole time that somebody is watching.
+	phone := signIn()
+	res := begin(link(phone))
+	e.s.lastStream.Store(0)
+	n, err := io.Copy(io.Discard, res.Body)
+	if err != nil || n != size-1<<20 {
+		t.Fatalf("with the sign-in standing, %d more bytes arrived (%v), want the rest of %d", n, err, size)
+	}
+	if e.s.lastStream.Load() == 0 {
+		t.Errorf("a film in the middle of being sent did not count as somebody watching")
+	}
+
+	// Signed out with the film under way: the rest never arrives.
+	tablet := signIn()
+	other := begin(link(tablet)) // another sign-in's film, which must go on
+	res = begin(link(phone))
+	if w := e.do("POST", "/api/logout", remote, phone, nil); w.Code != 200 {
+		t.Fatalf("sign-out: %d", w.Code)
+	}
+	n, err = io.Copy(io.Discard, res.Body)
+	if err == nil || n >= size-1<<20 {
+		t.Fatalf("after sign-out the film went on to its end: %d more bytes, error %v", n, err)
+	}
+	if again, err := http.Get(res.Request.URL.String()); err != nil || again.StatusCode != 403 {
+		t.Errorf("asking again with the signed-out link: %v %v", again, err)
+	} else {
+		again.Body.Close()
+	}
+	if n, err := io.Copy(io.Discard, other.Body); err != nil || n != size-1<<20 {
+		t.Errorf("signing out on the phone cut the tablet's film: %d more bytes, %v", n, err)
+	}
+
+	// And the same when the sign-in runs out by itself.
+	res = begin(link(tablet))
+	if _, err := e.s.db.Exec(`UPDATE sessions SET created_at=? WHERE revoked_at IS NULL`, time.Now().Add(-sessionLife-time.Hour).Unix()); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := io.Copy(io.Discard, res.Body); err == nil || n >= size-1<<20 {
+		t.Fatalf("after the sign-in ran out the film went on to its end: %d more bytes, error %v", n, err)
 	}
 }
 
@@ -633,10 +1137,30 @@ func TestDownloadNamesAreSafeOnEverySystem(t *testing.T) {
 		`<>:"/\|?*`:                        "film",
 		" . ":                              "film",
 		long:                               strings.Repeat("Å", 80),
+		// The rest of what Windows keeps for devices.
+		"COM0":        "film",
+		"lpt0":        "film",
+		"COM¹":        "film", // COM¹: the small raised digits count as digits there
+		"LPT².2019":   "film",
+		"com³ ":       "film",
+		"CONIN$":      "film",
+		"conout$.cut": "film",
+		"Clock$":      "film",
+		"COM10":       "COM10",
+		"COM":         "COM",
+		"Conin":       "Conin",
+		// Most systems count a name's length in bytes, 255 at most, and a
+		// letter can take four of them.
+		strings.Repeat("🎬", 200):       strings.Repeat("🎬", 50),
+		strings.Repeat("日", 300):       strings.Repeat("日", 66),
+		"a" + strings.Repeat("🎬", 200): "a" + strings.Repeat("🎬", 49),
 	} {
 		got := downloadName(title)
 		if got != want {
-			t.Errorf("%q became %q, want %q", title, got, want)
+			t.Errorf("%.60q became %.60q (%d bytes), want %.60q (%d bytes)", title, got, len(got), want, len(want))
+		}
+		if len(got) > 200 {
+			t.Errorf("%.60q became a name of %d bytes", title, len(got))
 		}
 		// Whatever the title, the header that carries the name can be
 		// written and read back.

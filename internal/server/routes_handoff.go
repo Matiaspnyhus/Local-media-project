@@ -12,8 +12,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 
@@ -75,19 +77,133 @@ func recordOpen(record, path string) error {
 var homeAddresses = (*Server).LANURLs
 
 // fromThisPC reports whether a request was made by a browser on the PC the
-// server runs on, showing the server's own page: the two checks that also
-// guard setup (see guard).
+// server runs on, showing the server's own page: the checks that also
+// guard setup (see onThisPC and guard).
 func fromThisPC(r *http.Request) bool {
-	return isLoopback(r) && sameOrigin(r)
+	return onThisPC(r) && sameOrigin(r)
+}
+
+// The PC's video player is started by one press of a button. Nothing
+// should be able to start it over and over: not a key held down, not an
+// impatient second press, not a script.
+const (
+	sameFilmWait = 5 * time.Second  // a film just opened is not opened again this soon
+	openWindow   = 10 * time.Second // in any stretch this long...
+	openMost     = 3                // ...at most this many films are opened
+)
+
+// openLimiter holds what has been opened lately, for every viewer
+// together: the PC has one screen.
+type openLimiter struct {
+	mu      sync.Mutex
+	opening bool                 // the operating system is being asked right now
+	films   map[string]time.Time // by file: when it was last opened
+	recent  []time.Time          // every opening within openWindow
+	now     func() time.Time
+}
+
+func newOpenLimiter() *openLimiter {
+	return &openLimiter{films: map[string]time.Time{}, now: time.Now}
+}
+
+// begin asks whether a film may be opened now. If so, the try counts from
+// this moment, and the caller must call done when the operating system has
+// answered. If not, it says why in words for the viewer, and how long to
+// wait.
+func (l *openLimiter) begin(fileID string) (why string, wait time.Duration) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	kept := l.recent[:0]
+	for _, t := range l.recent {
+		if now.Sub(t) < openWindow {
+			kept = append(kept, t)
+		}
+	}
+	l.recent = kept
+	for id, t := range l.films {
+		if now.Sub(t) >= sameFilmWait {
+			delete(l.films, id)
+		}
+	}
+	if t, ok := l.films[fileID]; ok {
+		return "This film was opened in this PC's video player a moment ago. If no player appeared, wait a few seconds and press the button again.", sameFilmWait - now.Sub(t)
+	}
+	if l.opening {
+		return "This PC is still opening another film. Wait a few seconds and try again.", openWait
+	}
+	if len(l.recent) >= openMost {
+		return "This PC was asked to open films several times just now. Wait a few seconds and try again.", openWindow - now.Sub(l.recent[0])
+	}
+	l.opening = true
+	l.films[fileID] = now
+	l.recent = append(l.recent, now)
+	return "", 0
+}
+
+// done ends a try. One that failed does not hold its film back: the viewer
+// may press again as soon as they have put right what was wrong. It still
+// counts as one of the few tries in a short while, since each try starts
+// something on the PC.
+func (l *openLimiter) done(fileID string, opened bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.opening = false
+	if !opened {
+		delete(l.films, fileID)
+	}
+}
+
+// oneLine keeps a name from starting a line of its own in the log.
+func oneLine(s string) string {
+	return strings.Map(func(c rune) rune {
+		if c < ' ' || c == 0x7f {
+			return ' '
+		}
+		return c
+	}, s)
 }
 
 // handedFile is the file behind an item, once it is known to be a real
 // video file inside its library.
 type handedFile struct {
 	id         string // the file's, not the item's
+	library    string // the library folder it is in
+	rel        string // its place in that folder, as the database has it
 	path       string // where it is on this PC
 	title      string
 	durationMs int64
+}
+
+// plainFile reports whether every step from a library folder down to one
+// of its files is what it seems: real folders, then a real file, with no
+// link among them.
+//
+// The scan lists no links, so a link here was put in a film's place
+// afterwards. Sending a film's bytes through one is harmless as long as it
+// stays inside the library (openMedia sees to that). Handing one to the
+// operating system to "open" is not: what then happens is decided by what
+// the link points at, which may be a script lying beside the films.
+func plainFile(libPath, rel string) bool {
+	at := libPath
+	steps := strings.Split(rel, "/")
+	for i, step := range steps {
+		if step == "" || step == "." || step == ".." {
+			return false
+		}
+		at = filepath.Join(at, step)
+		st, err := os.Lstat(at) // Lstat: the thing itself, not what it points at
+		if err != nil {
+			return false
+		}
+		if i == len(steps)-1 {
+			return st.Mode().IsRegular()
+		}
+		if !st.IsDir() {
+			return false
+		}
+	}
+	return false
 }
 
 // fileToHand finds the file an item plays from. Which file that is comes
@@ -120,6 +236,7 @@ func (s *Server) fileToHand(w http.ResponseWriter, r *http.Request) (handedFile,
 		return f, false
 	}
 	file.Close()
+	f.library, f.rel = libPath, rel
 	f.path = filepath.Join(libPath, filepath.FromSlash(rel))
 	if views, _ := s.loadItems(currentUser(r), `i.id = ?`, "", itemID); len(views) == 1 {
 		f.title = views[0].Display()
@@ -142,12 +259,31 @@ func (s *Server) handleOpenLocal(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if err := openInPlayer(f.path); err != nil {
-		// The file's own name stays in the log, because it says which film
-		// had the problem; its folder does not (see pathless).
-		why := strings.ReplaceAll(err.Error(), f.path, filepath.Base(f.path))
-		s.log.Printf("could not open %s in this PC's video player: %s", filepath.Base(f.path), s.pathless(why))
-		writeErr(w, http.StatusInternalServerError, "This PC could not open the film in a video player. It may have no program set up for this kind of file. VLC is a free player that plays almost anything.")
+	if !plainFile(f.library, f.rel) {
+		writeErr(w, http.StatusNotFound, "That file is not available right now.")
+		return
+	}
+	if why, wait := s.opens.begin(f.id); why != "" {
+		w.Header().Set("Retry-After", strconv.Itoa(max(1, int((wait+time.Second-1)/time.Second)))) // whole seconds, rounded up
+		writeErr(w, http.StatusTooManyRequests, why)
+		return
+	}
+	// Who opened what on the PC's screen is written down every time, not
+	// only when it fails. The film's own name is in the log, its folder is
+	// not (see pathless).
+	name := oneLine(filepath.Base(f.path))
+	s.log.Printf("%s is opening %s in this PC's video player", oneLine(currentUser(r).Name), name)
+	err := func() (err error) {
+		opened := false // also when the launcher does not come back at all
+		defer func() { s.opens.done(f.id, opened) }()
+		err = openInPlayer(f.path)
+		opened = err == nil
+		return err
+	}()
+	if err != nil {
+		why := strings.ReplaceAll(err.Error(), f.path, name)
+		s.log.Printf("could not open %s in this PC's video player: %s", name, s.pathless(why))
+		writeErr(w, http.StatusInternalServerError, "This PC could not open the film in a video player. It may have no program set up for this kind of file.")
 		return
 	}
 	if os.Getenv(openRecordEnv) != "" {
@@ -160,11 +296,21 @@ func (s *Server) handleOpenLocal(w http.ResponseWriter, r *http.Request) {
 
 // signedStream makes a fresh link to an original file for one sign-in, the
 // same kind handlePlay hands to the page's own player, and says when it
-// runs out.
-func (s *Server) signedStream(fileID, sessionID string) (link string, expires int64) {
-	expires = time.Now().Add(linkLife).Unix()
-	sig := auth.SignLink(s.linkKey, fileID, expires, sessionID)
-	return "/stream/" + fileID + "?e=" + strconv.FormatInt(expires, 10) + "&s=" + sessionID + "&g=" + sig, expires
+// runs out: after linkLife, or when the sign-in itself runs out if that is
+// sooner (the link dies with its sign-in either way, and the page tells the
+// viewer how long they have), or at until, if the caller wants it sooner
+// still (0 for no such wish).
+func (s *Server) signedStream(fileID string, u *User, until int64) (link string, expires, validSeconds int64) {
+	now := time.Now()
+	expires = now.Add(linkLife).Unix()
+	if u.SignInEnds > 0 && u.SignInEnds < expires {
+		expires = u.SignInEnds
+	}
+	if until > 0 && until < expires {
+		expires = until
+	}
+	sig := auth.SignLink(s.linkKey, fileID, expires, u.SessionID)
+	return "/stream/" + fileID + "?e=" + strconv.FormatInt(expires, 10) + "&s=" + u.SessionID + "&g=" + sig, expires, expires - now.Unix()
 }
 
 // handoffBase is the address a player outside the browser should use for
@@ -179,13 +325,24 @@ func (s *Server) handoffBase(r *http.Request) (string, bool) {
 			return u, true
 		}
 	}
+	// A device that came by the PC's name, not by an address in the list:
+	// the address its connection arrived at is one it can certainly reach,
+	// which the first of the list may not be (a PC can have network
+	// connections that lead nowhere a phone can go). Not for the PC's own
+	// browser, whose connection arrives at an address that means the PC
+	// only to itself; and not an address that works on one network
+	// connection only, which a link cannot say.
+	arrived, _ := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr)
+	if arrived != nil && len(arrived.IP) > 0 && !arrived.IP.IsUnspecified() && !arrived.IP.IsLoopback() && arrived.Zone == "" {
+		return "http://" + net.JoinHostPort(arrived.IP.String(), strconv.Itoa(arrived.Port)), true
+	}
 	if len(urls) > 0 {
 		return urls[0], true // the address the QR code shows
 	}
 	// No home network address is known (see LANURLs for which count). The
 	// address this very connection arrived at still works for whoever is
 	// asking.
-	if a, ok := r.Context().Value(http.LocalAddrContextKey).(*net.TCPAddr); ok && len(a.IP) > 0 && !a.IP.IsUnspecified() {
+	if a := arrived; a != nil && len(a.IP) > 0 && !a.IP.IsUnspecified() {
 		return "http://" + net.JoinHostPort(a.IP.String(), strconv.Itoa(a.Port)), true
 	}
 	if isLoopback(r) {
@@ -194,15 +351,16 @@ func (s *Server) handoffBase(r *http.Request) (string, bool) {
 	return "", false
 }
 
-// handoffLink is a complete, freshly signed address for a film's file.
-func (s *Server) handoffLink(w http.ResponseWriter, r *http.Request, f handedFile) (link string, expires int64, ok bool) {
+// handoffLink is a complete, freshly signed address for a film's file (see
+// signedStream for until, and for how long the link lasts).
+func (s *Server) handoffLink(w http.ResponseWriter, r *http.Request, f handedFile, until int64) (link string, expires, validSeconds int64, ok bool) {
 	base, ok := s.handoffBase(r)
 	if !ok {
 		writeErr(w, http.StatusNotFound, "No home network address was found for this PC, so there is no link to give to another player.")
-		return "", 0, false
+		return "", 0, 0, false
 	}
-	link, expires = s.signedStream(f.id, currentUser(r).SessionID)
-	return base + link, expires, true
+	link, expires, validSeconds = s.signedStream(f.id, currentUser(r), until)
+	return base + link, expires, validSeconds, true
 }
 
 // handleHandoff gives the page a link to show as text, for pasting into a
@@ -212,14 +370,16 @@ func (s *Server) handleHandoff(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	link, expires, ok := s.handoffLink(w, r, f)
+	link, expires, validSeconds, ok := s.handoffLink(w, r, f, 0)
 	if !ok {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"url":          link,
-		"expiresAt":    expires, // Unix seconds
-		"validSeconds": int64(linkLife / time.Second),
+		"url":       link,
+		"expiresAt": expires, // Unix seconds
+		// How long that is from now: linkLife, or less when the sign-in
+		// itself runs out sooner.
+		"validSeconds": validSeconds,
 		// Whether open-local would be allowed for this browser, so the page
 		// knows which of the two ways out to offer.
 		"thisPC": fromThisPC(r),
@@ -240,11 +400,27 @@ func (s *Server) handleHandoffXSPF(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The page says when the link it shows stops working, and that the
+	// file stops then too. So the page passes that moment on, and the link
+	// in the file ends at it, however much later the file is asked for.
+	// This can only shorten a link's life, never lengthen it.
+	until := int64(0)
+	if v := r.URL.Query().Get("until"); v != "" {
+		var err error
+		if until, err = strconv.ParseInt(v, 10, 64); err != nil || until <= 0 {
+			writeErr(w, http.StatusBadRequest, "The time the link should stop working could not be read.")
+			return
+		}
+		if until <= time.Now().Unix() {
+			writeErr(w, http.StatusGone, "This offer has run out. Press \"Open in another player\" again for a new one.")
+			return
+		}
+	}
 	f, ok := s.fileToHand(w, r)
 	if !ok {
 		return
 	}
-	link, _, ok := s.handoffLink(w, r, f)
+	link, _, _, ok := s.handoffLink(w, r, f, until)
 	if !ok {
 		return
 	}
@@ -292,13 +468,20 @@ func xspf(title, link string, durationMs, startSeconds int64) []byte {
 
 // reservedNames cannot begin a file name on Windows, whatever follows the
 // first dot: "nul.xspf" and "nul.2019.xspf" both mean a device, not a file.
-var reservedNames = map[string]bool{"con": true, "prn": true, "aux": true, "nul": true,
-	"com1": true, "com2": true, "com3": true, "com4": true, "com5": true, "com6": true, "com7": true, "com8": true, "com9": true,
-	"lpt1": true, "lpt2": true, "lpt3": true, "lpt4": true, "lpt5": true, "lpt6": true, "lpt7": true, "lpt8": true, "lpt9": true}
+// The digits of COM and LPT include 0 and the small raised 1, 2 and 3.
+var reservedNames = func() map[string]bool {
+	names := map[string]bool{"con": true, "prn": true, "aux": true, "nul": true, "conin$": true, "conout$": true, "clock$": true}
+	for _, digit := range "0123456789¹²³" {
+		names["com"+string(digit)], names["lpt"+string(digit)] = true, true
+	}
+	return names
+}()
 
 // downloadName turns a film's title into a file name (without its ending)
 // that Windows, macOS and Linux all accept: no path separators, none of
-// the characters Windows forbids, nothing invisible, not too long.
+// the characters Windows forbids, nothing invisible, not too long. "Too
+// long" is counted both ways: in letters, for the eye, and in bytes, which
+// is how most systems count their limit of 255 (a letter can take four).
 func downloadName(title string) string {
 	var b strings.Builder
 	n, space := 0, true // as if a space came before: none is kept at the start
@@ -312,7 +495,7 @@ func downloadName(title string) string {
 		if c == ' ' && space {
 			continue // never two spaces in a row
 		}
-		if n++; n > 80 {
+		if n++; n > 80 || b.Len()+utf8.RuneLen(c) > 200 {
 			break
 		}
 		space = c == ' '

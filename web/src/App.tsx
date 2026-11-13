@@ -1022,9 +1022,11 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
   }
 
   // "Open in another player" is offered under the player and where a film
-  // is said not to play here. Another player starts the film where it is
-  // on this page, or where it was last stopped if it is not playing here;
-  // and once it has the film, the film stops here.
+  // is said not to play here. The file for VLC starts the film where it is
+  // on this page, or where it was last stopped if it is not playing here.
+  // (The PC's own player and a copied link cannot be told a place: they
+  // start from the beginning.) Once another player has the film, it stops
+  // here.
   const elsewhere = (
     <OpenElsewhere
       key={id}
@@ -1047,14 +1049,19 @@ function Watch({ id, onBack, onSignedOut }: { id: string; onBack: () => void; on
       {error && <p className="error" role="alert">{error}</p>}
       {problem && <p className="note" role="alert" data-testid="play-problem">{problem}</p>}
       {info && info.plan.playable === 'no' && !tryAnyway && (
-        <div className="card" role="alert" data-testid="play-problem">
-          <p>This browser cannot play this file yet.</p>
-          <ul>
-            {info.plan.reasons.map((r) => (
-              <li key={r}>{r}</li>
-            ))}
-          </ul>
-          <p className="dim">Another browser or device may be able to play it today.</p>
+        <div className="card" data-testid="play-problem">
+          {/* Only the words are read out as an alert. The controls sit
+              outside it: what they say when used is theirs to announce,
+              and must not make a screen reader read the whole card again. */}
+          <div role="alert">
+            <p>This browser cannot play this file yet.</p>
+            <ul>
+              {info.plan.reasons.map((r) => (
+                <li key={r}>{r}</li>
+              ))}
+            </ul>
+            <p className="dim">Another browser or device may be able to play it today.</p>
+          </div>
           <button onClick={() => setTryAnyway(true)}>Try anyway</button>
           {elsewhere}
         </div>
