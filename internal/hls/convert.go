@@ -43,10 +43,11 @@ type Convert struct {
 	// MaxRateK the most the picture may take, in thousands of bits a second.
 	Preset   Preset
 	MaxRateK int
-	// SoundRunsOn says that the file goes on for seconds after the
-	// picture's last frame: sound, with nothing to see. ffmpeg is then told
-	// to wait for the picture however long it takes (see convertArgs).
-	SoundRunsOn bool
+	// SoundLasts says which of the film's sound tracks are known to go on
+	// to the picture's last frame or near enough: one bit for each, as in
+	// PictureFacts.SoundLasts. Beside such a track ffmpeg is told to wait
+	// for the picture however long it takes (see convertArgs).
+	SoundLasts uint64
 }
 
 // Preset is how much work the encoder puts into each frame: more work
@@ -221,24 +222,29 @@ func convertArgs(spec Spec, startSeg, readRate, burst int) []string {
 			a = append(a, "-c:a", "aac", "-ac", "2", "-b:a", "192k")
 		}
 	}
-	// Picture and sound are written in the order of their times, and when
-	// one of them has nothing for a while ffmpeg waits for it: until the
-	// other is ten seconds ahead, and then it goes on without.
+	// ffmpeg writes picture and sound in the order of their times, and a
+	// chunk is whatever it has written when the chunk's key frame comes. So
+	// the sound has to wait for the picture, which arrives later than the
+	// sound that goes with it: by the frames the decoder and the encoder
+	// hold back (most of a second), and by any stretch in which the file has
+	// no new frame at all, since the frames that fill it can only be made
+	// once the next one has been read. By itself ffmpeg waits until one
+	// track is ten seconds ahead of the other, and then goes on without. A
+	// still picture of nine or ten seconds is enough for that: the sound is
+	// written before the picture catches up, and what belongs after the next
+	// cut lands in the chunk before it. (A sound track that runs on after
+	// the picture's last frame does the same to the last chunk.) Told to
+	// wait as long as it takes, ffmpeg never does that.
 	//
-	// That is right for a film whose sound stops before its picture does
-	// (many do, by a second or two; a commentary may by minutes): what is
-	// made after the sound has stopped is sent ten seconds of film late, and
-	// then steadily. Told to wait for ever, ffmpeg sends nothing more until
-	// it has converted the film to its end, and whoever is watching waits
-	// with it.
-	//
-	// It is wrong for the opposite film, whose sound runs on after the
-	// picture. There the last frames are still inside the encoder when the
-	// sound gets ten seconds ahead, the sound is sent on without them, and
-	// lands in the chunk before the one it belongs to. For that film alone,
-	// ffmpeg is told to wait as long as it takes: its sound is not going to
-	// stop early.
-	if c.SoundRunsOn {
+	// It then also waits for the sound as long as it takes, and that is only
+	// safe when the sound lasts. A sound track that stops before the picture
+	// does (a commentary may by minutes) leaves nothing to wait for: ffmpeg
+	// would send nothing more until it had converted the film to its end,
+	// and whoever is watching would wait with it. So it is told to wait only
+	// beside a sound track known to go on to the picture's last frame.
+	// Beside any other it keeps its ten seconds: what is made after the
+	// sound has stopped is sent ten seconds of film late, and then steadily.
+	if lasts(c.SoundLasts, spec.AudioTrack) {
 		a = append(a, "-max_interleave_delta", "0")
 	}
 	return append(a, outputArgs(g)...)

@@ -11,9 +11,10 @@ import (
 	"strings"
 )
 
-// PictureFacts is what has to be known about a film's picture before it can
-// be converted: where its clock stands, how fast its frames come and what
-// shape they are. ffprobe finds it with two short looks at the file (see
+// PictureFacts is what has to be known about a film before its picture can
+// be converted: where its clock stands, how fast its frames come, what
+// shape they are, and which of its sound tracks last as long as the
+// picture. ffprobe finds it with three short looks at the file (see
 // ProbePicture). It does not change while the file does not, so it is
 // worth keeping.
 type PictureFacts struct {
@@ -54,6 +55,26 @@ type PictureFacts struct {
 	// minute of the picture. It is only looked for in files where a jump
 	// does not land on a key frame (see Indexed), and is 0 otherwise.
 	KeyGapMs int64 `json:"keyGap,omitempty"`
+	// SoundLasts says which of the film's sound tracks go on to the
+	// picture's last frame, or to within a few seconds of it (soundLastsMs):
+	// one bit for each track, the lowest for the first, counted as ffmpeg
+	// counts them. A track whose bit is not set stops earlier, or it could
+	// not be found out. The converter is told to wait for the picture
+	// however long it takes only beside a sound track that lasts (see
+	// convertArgs).
+	SoundLasts uint64 `json:"soundLasts,omitempty"`
+}
+
+// soundLastsMs is how long before the picture's last frame a sound track may
+// stop and still be said to last as long as the picture. Well under the ten
+// seconds ffmpeg waits by itself for a track that has nothing.
+const soundLastsMs = 5000
+
+// lasts reads one track's bit out of PictureFacts.SoundLasts: whether sound
+// track n, counted from 0, is known to go on to the picture's last frame or
+// near enough. It is not for a track that is not there (-1 is "no sound").
+func lasts(bits uint64, n int) bool {
+	return n >= 0 && n < 64 && bits>>uint(n)&1 == 1
 }
 
 // Indexed reports whether the file is of a kind that lists its own key
@@ -94,7 +115,7 @@ func (f PictureFacts) LeadMs() int64 {
 // the picture is to be (see Size).
 func (f PictureFacts) Lattice() (Grid, Convert) {
 	g, c := Lattice(f.StartMs, f.LastMs, f.EndMs, f.RateNum, f.RateDen)
-	c.ContainerStartMs, c.LeadMs = f.ContainerStartMs, f.LeadMs()
+	c.ContainerStartMs, c.LeadMs, c.SoundLasts = f.ContainerStartMs, f.LeadMs(), f.SoundLasts
 	return g, c
 }
 
@@ -187,6 +208,7 @@ func snapRate(avg, base float64) (num, den int64) {
 type probedPicture struct {
 	Packets []probedPacket `json:"packets"`
 	Streams []struct {
+		Index      int    `json:"index"`
 		Width      int    `json:"width"`
 		Height     int    `json:"height"`
 		Sar        string `json:"sample_aspect_ratio"`
@@ -211,8 +233,10 @@ type probedPicture struct {
 }
 
 type probedPacket struct {
-	Time  string `json:"pts_time"`
-	Flags string `json:"flags"`
+	Time     string `json:"pts_time"`
+	Flags    string `json:"flags"`
+	Stream   int    `json:"stream_index"`
+	Duration string `json:"duration_time"`
 }
 
 // millis reads a time in seconds, as ffprobe prints it, into milliseconds.
@@ -340,6 +364,37 @@ func parsePackets(out []byte) (times []int64, keys []bool, err error) {
 	return times, keys, nil
 }
 
+// parseSound reads ffprobe's list of the sound tracks and of their packets
+// near the end of the film, and returns which tracks last (see
+// PictureFacts.SoundLasts): those with sound that ends at or after untilMs.
+func parseSound(out []byte, untilMs int64) (uint64, error) {
+	var p probedPicture
+	if err := json.Unmarshal(out, &p); err != nil {
+		return 0, fmt.Errorf("ffprobe's answer could not be read: %w", err)
+	}
+	// ffprobe numbers the tracks through the whole file; ffmpeg is told
+	// which sound track by its place among the sound tracks.
+	place := map[int]int{}
+	for n, s := range p.Streams {
+		place[s.Index] = n
+	}
+	var bits uint64
+	for _, k := range p.Packets {
+		n, ok := place[k.Stream]
+		at, timed := millis(k.Time)
+		if !ok || !timed || n >= 64 {
+			continue
+		}
+		if d, ok := millis(k.Duration); ok && d > 0 {
+			at += d
+		}
+		if at >= untilMs {
+			bits |= 1 << uint(n)
+		}
+	}
+	return bits, nil
+}
+
 // keyGapWindowMs is how much of the start of a film is looked at for how
 // far apart its key frames are.
 const keyGapWindowMs = 60000
@@ -368,17 +423,18 @@ func keyGap(startMs int64, times []int64, keys []bool) int64 {
 const tailMs = 8000
 
 // ProbePicture asks ffprobe for the facts about a film's picture. It looks
-// at the file twice: once for what the file says about itself, and once at
-// its last few seconds for the last frame (and, where it matters, at its
-// first minute for how far apart the key frames are). Neither look reads
-// the film through, unless the film is a few seconds long or does not say
-// how long it is.
+// at the file three times: once for what the file says about itself, once
+// at its last few seconds for the last frame (and, where it matters, at its
+// first minute for how far apart the key frames are), and once more at
+// those last seconds for which sound tracks are still going there. No look
+// reads the film through, unless the film is a few seconds long or does not
+// say how long it is.
 func ProbePicture(ctx context.Context, ffprobe, path string) (PictureFacts, error) {
 	if ffprobe == "" {
 		return PictureFacts{}, errors.New("ffprobe is not available")
 	}
-	run := func(a ...string) ([]byte, error) {
-		cmd := exec.CommandContext(ctx, ffprobe, append(append([]string{"-v", "error", "-select_streams", "v:0"}, a...), "-of", "json", path)...)
+	look := func(tracks string, a ...string) ([]byte, error) {
+		cmd := exec.CommandContext(ctx, ffprobe, append(append([]string{"-v", "error", "-select_streams", tracks}, a...), "-of", "json", path)...)
 		hideWindow(cmd)
 		out, err := cmd.Output()
 		if err != nil {
@@ -386,6 +442,7 @@ func ProbePicture(ctx context.Context, ffprobe, path string) (PictureFacts, erro
 		}
 		return out, nil
 	}
+	run := func(a ...string) ([]byte, error) { return look("v:0", a...) }
 	const entries = "packet=pts_time:stream=width,height,sample_aspect_ratio,field_order,color_space,r_frame_rate,avg_frame_rate,start_time,duration" +
 		":stream_tags=DURATION:format=format_name,start_time,duration"
 	out, err := run("-read_intervals", "%+#1", "-show_entries", entries+":stream_side_data=rotation")
@@ -459,6 +516,27 @@ func ProbePicture(ctx context.Context, ffprobe, path string) (PictureFacts, erro
 			break
 		}
 		to = from
+	}
+	// Which sound tracks are still going when the picture ends: the ones
+	// with sound in the last few seconds before its last frame, or after it.
+	// Only those seconds are read. Where the picture's end is not known at
+	// all (the file does not say how long it is, and its last frame was not
+	// found), no track is said to last.
+	last := f.LastMs
+	if last <= 0 {
+		last = f.EndMs // the last frame was not found: the picture is taken to run to the end
+	}
+	if last > 0 {
+		interval := "%" + clock(last+1000)
+		if from := last - soundLastsMs - 1000; from > f.ContainerStartMs {
+			interval = clock(from) + interval
+		}
+		out, err := look("a", "-show_entries", "packet=stream_index,pts_time,duration_time:stream=index", "-read_intervals", interval)
+		if err == nil {
+			f.SoundLasts, _ = parseSound(out, last-soundLastsMs)
+		} else if ctx.Err() != nil {
+			return f, ctx.Err()
+		}
 	}
 	return f, nil
 }

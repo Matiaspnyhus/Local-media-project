@@ -44,12 +44,6 @@ const (
 // the file, a cut may be. A chunk shorter than this is not worth a request.
 const latticeTailMs = 500
 
-// soundRunsOnMs is how long after the picture's last frame a file may go
-// on before its sound is said to run on (see Convert.SoundRunsOn). It is
-// well under the ten seconds ffmpeg waits for a track that has nothing,
-// with room for the second or two of frames an encoder holds back.
-const soundRunsOnMs = 5000
-
 // latticeSlackMs is how far from its place in the list a converted chunk
 // may begin. The list is in whole milliseconds and a tick seldom is, which
 // accounts for half of one.
@@ -111,11 +105,12 @@ func anchor(startMs, num, den int64) (anchorMs, tick0 int64) {
 // to, one of the usual ones.
 //
 // It returns the list of cuts, and in Convert what the converter has to be
-// told to cut exactly there: the rate, the anchor, the whole seconds at
-// which key frames are asked for, and whether the sound runs on after the
-// picture. The caller adds how large and how good the picture is to be. If
-// the numbers make no sense the grid returned is not valid (see
-// Grid.Valid), and there is nothing to convert by.
+// told to cut exactly there: the rate, the anchor and the whole seconds at
+// which key frames are asked for. The caller adds how large and how good
+// the picture is to be, and which sound tracks last as long as the picture
+// (PictureFacts.Lattice does the second). If the numbers make no sense the
+// grid returned is not valid (see Grid.Valid), and there is nothing to
+// convert by.
 //
 // The list ends with the picture. Sound that carries on after the last
 // frame, as it does in some films for many seconds, sits in the last chunk:
@@ -138,7 +133,7 @@ func Lattice(startMs, lastMs, endMs, num, den int64) (Grid, Convert) {
 	g := Grid{Cuts: []int64{tickMs(tick0, num, den)}, From: "lattice"}
 	g.StartMs = g.Cuts[0]
 	first := divCeil(startMs, 1000) // the whole second the count of steps starts from
-	c := Convert{Num: num, Den: den, AnchorMs: anchorMs, Targets: []int64{first}, SoundRunsOn: endMs-lastMs > soundRunsOnMs}
+	c := Convert{Num: num, Den: den, AnchorMs: anchorMs, Targets: []int64{first}}
 
 	// No cut later than this.
 	limit := min(lastMs, endMs) - latticeTailMs
