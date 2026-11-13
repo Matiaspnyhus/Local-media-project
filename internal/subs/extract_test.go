@@ -1,0 +1,1114 @@
+package subs
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+)
+
+// ownNames is every name this package may give a file or folder.
+var ownNames = regexp.MustCompile(`^(index\.json|fonts|f[0-9]+|[st][0-9]+\.(ass|vtt)|p[0-9]+\.(sup|mks))$`)
+
+// onlyOwnNames fails the test if the folder holds anything not named by
+// this package, or anything left over from the making.
+func onlyOwnNames(t *testing.T, dir string) (names []string) {
+	t.Helper()
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || path == dir {
+			return err
+		}
+		rel, _ := filepath.Rel(dir, path)
+		names = append(names, filepath.ToSlash(rel))
+		if !ownNames.MatchString(d.Name()) {
+			t.Errorf("the folder holds %q, which is not a name this package gives", rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return names
+}
+
+// One reading of a film with a track of every sort gives one file for
+// each, named by its place and its sort, and an index that says what each
+// is. Reading the index back gives the same.
+func TestOnePassWritesEveryTrack(t *testing.T) {
+	tl := tools(t)
+	dir, res, percents := extracted(t, tl, madeFilm(t, tl, "five"))
+	want := []Track{
+		{N: 0, Kind: Styled, Codec: "ass", Language: "eng", Title: "Full", Default: true, File: "s0.ass", FirstMs: 1000, Done: true},
+		{N: 1, Kind: Text, Codec: "subrip", Language: "nor", Forced: true, File: "t1.vtt", FirstMs: 500, Done: true},
+		{N: 2, Kind: Picture, Codec: "hdmv_pgs_subtitle", Language: "eng", File: "p2.sup", FirstMs: 2000, Width: 1920, Height: 1080, Done: true},
+		{N: 3, Kind: Picture, Codec: "dvd_subtitle", Language: "ger", File: "p3.mks", FirstMs: 2000, Width: 1920, Height: 1080, Done: true},
+		{N: 4, Kind: Picture, Codec: "dvb_subtitle", File: "p4.mks", FirstMs: 2000, Width: 1920, Height: 1080, Done: true},
+	}
+	if len(res.Tracks) != len(want) {
+		t.Fatalf("%d tracks, want %d: %+v", len(res.Tracks), len(want), res.Tracks)
+	}
+	for i, got := range res.Tracks {
+		st, err := os.Stat(filepath.Join(dir, got.File))
+		if err != nil || st.Size() == 0 || st.Size() != got.Size {
+			t.Errorf("track %d: its file %q: %v, recorded as %d bytes", i, got.File, err, got.Size)
+		}
+		got.Size = 0
+		if got != want[i] {
+			t.Errorf("track %d:\n got %+v\nwant %+v", i, got, want[i])
+		}
+	}
+	if res.DurationMs < 7900 || res.DurationMs > 8200 || res.StartMs < -100 || res.StartMs > 100 {
+		t.Errorf("the film is given as %d ms long, starting at %d", res.DurationMs, res.StartMs)
+	}
+	if len(res.Fonts) != 0 {
+		t.Errorf("fonts in a film that has none: %+v", res.Fonts)
+	}
+	if tr, ok := res.Track(2); !ok || tr.File != "p2.sup" {
+		t.Errorf("asked for track 2: %+v, %v", tr, ok)
+	}
+	for _, n := range []int{-1, 5} {
+		if tr, ok := res.Track(n); ok {
+			t.Errorf("asked for track %d of five: %+v", n, tr)
+		}
+	}
+	if why := rising(percents); why != "" {
+		t.Error(why)
+	}
+	names := onlyOwnNames(t, dir)
+	if len(names) != 7 { // five tracks, the index, and the folder for fonts
+		t.Errorf("the folder holds %v", names)
+	}
+	back, err := Load(dir)
+	if err != nil || !reflect.DeepEqual(back, res) {
+		t.Errorf("read back: %v\n got %+v\nwant %+v", err, back, res)
+	}
+
+	// What is in the files. The styled track is the film's own script: its
+	// lines, instructions and all.
+	ass, _ := os.ReadFile(filepath.Join(dir, "s0.ass"))
+	for _, line := range []string{`Dialogue: 0,0:00:01.00,0:00:02.50,Default,,0,0,0,,Hello, {\i1}world{\i0}`, `{\p1}m 0 0 l 100 0 100 100 0 100{\p0}`, "Style: Sign,Test Font"} {
+		if !bytes.Contains(ass, []byte(line)) {
+			t.Errorf("the styled track lacks %q:\n%s", line, ass)
+		}
+	}
+	// The text track is in the form browsers show, with its words as the
+	// film has them.
+	if vtt := string(mustRead(t, filepath.Join(dir, "t1.vtt"))); vtt != plainAsWebVTT {
+		t.Errorf("the text track:\n%q\nwant\n%q", vtt, plainAsWebVTT)
+	}
+	// The disc's pictures are the film's, piece for piece, at the film's
+	// times.
+	sup, _ := os.ReadFile(filepath.Join(dir, "p2.sup"))
+	if got, want := supPieces(t, sup), supPieces(t, pgs(t, 1920, 1080, twoCaptions)); !reflect.DeepEqual(got, want) {
+		t.Errorf("the disc's picture track is not what went into the film: %d pieces, want %d", len(got), len(want))
+	}
+	// And ffprobe finds in each picture file one track of the right sort
+	// that begins where the index says.
+	for _, tr := range res.Tracks[2:] {
+		got := asked(t, tl, "-show_entries", "packet=pts_time:stream=codec_name", "-read_intervals", "%+#1", "-of", "csv=p=0", filepath.Join(dir, tr.File))
+		if len(got) != 2 || got[0] != "2.000000" || got[1] != tr.Codec {
+			t.Errorf("ffprobe on %s says %v, want a first caption at 2.000000 in a %s track", tr.File, got, tr.Codec)
+		}
+	}
+}
+
+// A styled track comes with its fonts. Every attachment that is a font is
+// written, by its place among the attachments, whatever the film calls it
+// and whether or not the film says it is one; what is not a font is not
+// kept. The film's own names for things are kept as words and are nowhere
+// used as names.
+//
+// The film has four attachments, and the second is a cover picture. ffmpeg
+// does not count a picture among the attachments (it shows it as a still
+// "video"), so the fonts are numbers 0 and 1, and number 2 is the one that
+// turns out to be nothing.
+func TestAStyledTrackComesWithItsFonts(t *testing.T) {
+	tl := tools(t)
+	dir, res, _ := extracted(t, tl, madeFilm(t, tl, "styled"))
+	if len(res.Tracks) != 1 || res.Tracks[0].Kind != Styled || res.Tracks[0].File != "s0.ass" || !res.Tracks[0].Done ||
+		res.Tracks[0].Title != hostileTitle || res.Tracks[0].Language != "eng" || !res.Tracks[0].Default || res.Tracks[0].FirstMs != 1000 {
+		t.Errorf("the styled track: %+v", res.Tracks)
+	}
+	want := []Font{
+		{K: 0, File: "fonts/f0", Size: int64(len(fontA)), Name: hostileName, Mime: "font/ttf"},
+		{K: 1, File: "fonts/f1", Size: int64(len(fontB)), Name: "second", Mime: "application/octet-stream"},
+	}
+	if !reflect.DeepEqual(res.Fonts, want) {
+		t.Errorf("fonts:\n got %+v\nwant %+v", res.Fonts, want)
+	}
+	for file, content := range map[string][]byte{"fonts/f0": fontA, "fonts/f1": fontB} {
+		if got, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(file))); err != nil || !bytes.Equal(got, content) {
+			t.Errorf("%s is not the font the film carries: %v, %d bytes", file, err, len(got))
+		}
+	}
+	names := onlyOwnNames(t, dir)
+	if got := strings.Join(names, " "); got != "fonts fonts/f0 fonts/f1 index.json s0.ass" {
+		t.Errorf("the folder holds: %s", got)
+	}
+	if back, err := Load(dir); err != nil || !reflect.DeepEqual(back, res) {
+		t.Errorf("read back: %v\n got %+v\nwant %+v", err, back, res)
+	}
+}
+
+// A track whose first caption comes late says when, for each sort of
+// picture track, and that is the time ffprobe finds in the file. The size
+// each was made for is read from where that sort keeps it.
+func TestALateFirstCaptionIsRecorded(t *testing.T) {
+	tl := tools(t)
+	dir, res, percents := extracted(t, tl, madeFilm(t, tl, "late"))
+	if len(res.Tracks) != 3 {
+		t.Fatalf("tracks: %+v", res.Tracks)
+	}
+	for i, file := range []string{"p0.sup", "p1.mks", "p2.mks"} {
+		tr := res.Tracks[i]
+		if tr.File != file || tr.Kind != Picture || !tr.Done || tr.FirstMs != 20000 || tr.Width != 720 || tr.Height != 576 {
+			t.Errorf("track %d: %+v, want %s with a first caption at 20000 ms, made for 720 by 576", i, tr, file)
+		}
+		got := asked(t, tl, "-show_entries", "packet=pts_time", "-read_intervals", "%+#1", "-of", "csv=p=0", filepath.Join(dir, file))
+		if len(got) != 1 || got[0] != "20.000000" {
+			t.Errorf("ffprobe finds the first caption of %s at %v", file, got)
+		}
+		// ffprobe knows the size for two of the three sorts; where it
+		// does, it agrees.
+		size := asked(t, tl, "-show_entries", "stream=width,height", "-of", "csv=p=0", filepath.Join(dir, file))
+		if len(size) == 1 && size[0] != "720,576" && size[0] != "N/A,N/A" && size[0] != "," && size[0] != "0,0" {
+			t.Errorf("ffprobe gives the size of %s as %v", file, size)
+		}
+		facts, err := ReadPicture(filepath.Join(dir, file))
+		if err != nil || facts != (PictureFacts{Width: 720, Height: 576, FirstMs: 20000}) {
+			t.Errorf("ReadPicture(%s) = %+v, %v", file, facts, err)
+		}
+	}
+	// A minute of film is long enough for the reading to be seen on its
+	// way: the sound's clock passes every hundredth of it.
+	if why := rising(percents); why != "" || len(percents) < 50 || percents[0] > 2 {
+		t.Errorf("progress: %s %v", why, percents)
+	}
+}
+
+// What a later step relies on when it has ffmpeg begin reading a picture
+// track somewhere in the middle: where ffmpeg counts from. In a ".sup"
+// file that is the first caption, in a ".mks" file zero, and JumpBaseMs
+// says which.
+func TestAJumpIntoAPictureTrackCountsFromItsBase(t *testing.T) {
+	tl := tools(t)
+	dir, res, _ := extracted(t, tl, madeFilm(t, tl, "late"))
+	const wantMs = 45000 // captions are at 20, 24, 28 ... 56 seconds, each 2 seconds long
+	for _, tr := range res.Tracks {
+		if base, sup := tr.JumpBaseMs(), strings.HasSuffix(tr.File, ".sup"); base != map[bool]int64{true: 20000, false: 0}[sup] {
+			t.Errorf("%s: jumps are said to count from %d ms", tr.File, base)
+		}
+		at := wantMs - tr.JumpBaseMs()
+		// Where ffmpeg lands: the time of the first piece it passes on.
+		cmd := exec.Command(tl.FFmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-ss", strconv.FormatInt(at/1000, 10), "-copyts", "-i", filepath.Join(dir, tr.File),
+			"-map", "0", "-c", "copy", "-f", "mkvtimestamp_v2", "pipe:1")
+		out, err := cmd.Output()
+		lines := strings.Fields(strings.ReplaceAll(string(out), "\r", ""))
+		if err != nil || len(lines) < 5 {
+			t.Errorf("%s: reading from %d s: %v %q", tr.File, at/1000, err, out)
+			continue
+		}
+		// It lands on a caption a little before the moment asked for,
+		// never after it and never back at the start.
+		if landed, _ := strconv.ParseInt(lines[4], 10, 64); landed > wantMs || landed < wantMs-6000 {
+			t.Errorf("%s: asked for %d ms of the film by way of -ss %d, ffmpeg began at %d", tr.File, wantMs, at/1000, landed)
+		}
+	}
+}
+
+// Why the files keep the film's own times: laid over the film's picture by
+// ffmpeg, with both left on their own clocks as the converter does it, a
+// caption is there when the film has it and gone when it is over. That
+// holds for a film whose clock starts at zero and for a recording whose
+// clock starts ten hours in, and for each sort of picture file.
+//
+// The film's picture is painted grey first, so that the caption's colour
+// can be told from it, and the track is brought to the picture's size (it
+// was made for a larger one). The captions are yellow, from 20 to 22
+// seconds into the film and every four seconds after.
+func TestAnExtractedTrackLinesUpWithTheFilm(t *testing.T) {
+	tl := tools(t)
+	for _, name := range []string{"late", "recording"} {
+		path := madeFilm(t, tl, name)
+		dir, res, _ := extracted(t, tl, path)
+		for _, tr := range res.Tracks {
+			// Pictures 21, 23 and 25 seconds in, at 24 a second: during
+			// the first caption, after it, and during the second.
+			cmd := exec.Command(tl.FFmpeg, "-hide_banner", "-nostdin", "-loglevel", "error", "-copyts", "-i", path, "-i", filepath.Join(dir, tr.File),
+				"-filter_complex", `[0:v:0]drawbox=c=gray:t=fill[v];[1:s:0]scale=320:180[s];[v][s]overlay=eof_action=pass,select='eq(n\,504)+eq(n\,552)+eq(n\,600)',format=rgb24[o]`,
+				"-map", "[o]", "-fps_mode", "passthrough", "-frames:v", "3", "-f", "rawvideo", "pipe:1")
+			var said bytes.Buffer
+			cmd.Stderr = &said
+			out, err := cmd.Output()
+			if err != nil || len(out) != 3*320*180*3 {
+				t.Errorf("%s, %s: laying the track over the film: %v, %d bytes\n%s", name, tr.File, err, len(out), said.String())
+				continue
+			}
+			// The middle of where the first caption lies, at this size.
+			for i, want := range []bool{true, false, true} {
+				at := i*320*180*3 + (134*320+62)*3
+				r, g, b := int(out[at]), int(out[at+1]), int(out[at+2])
+				yellow := r > 200 && g > 200 && b < 60
+				grey := r > 100 && r < 150 && g > 100 && g < 150 && b > 100 && b < 150
+				if want && !yellow || !want && !grey {
+					t.Errorf("%s, %s: picture %d has %d,%d,%d where the caption lies; caption wanted there: %v", name, tr.File, i, r, g, b, want)
+				}
+			}
+		}
+	}
+}
+
+// A TV recording's clock starts hours in. The files keep the film's own
+// times, the index says where the clock starts, and progress is counted
+// from there, not from zero.
+func TestTimesAreOnTheFilmsOwnClock(t *testing.T) {
+	tl := tools(t)
+	path := madeFilm(t, tl, "recording")
+	dir, res, percents := extracted(t, tl, path)
+	if res.StartMs < 36000000 || res.StartMs > 36003000 || res.DurationMs < 63000 || res.DurationMs > 66000 {
+		t.Errorf("the recording is given as %d ms long, starting at %d", res.DurationMs, res.StartMs)
+	}
+	if len(res.Tracks) != 1 || res.Tracks[0].File != "p0.mks" || !res.Tracks[0].Done || res.Tracks[0].Width != 720 || res.Tracks[0].Height != 576 {
+		t.Fatalf("tracks: %+v", res.Tracks)
+	}
+	// The first caption is where the recording itself has it.
+	inFilm := asked(t, tl, "-select_streams", "s:0", "-show_entries", "packet=pts_time", "-read_intervals", "%+#1", "-of", "csv=p=0", path)
+	inFile := asked(t, tl, "-show_entries", "packet=pts_time", "-read_intervals", "%+#1", "-of", "csv=p=0", filepath.Join(dir, "p0.mks"))
+	if len(inFilm) != 1 || len(inFile) != 1 || inFilm[0] != inFile[0] {
+		t.Fatalf("the first caption is at %v in the recording and at %v in the file taken from it", inFilm, inFile)
+	}
+	sec, _ := strconv.ParseFloat(inFilm[0], 64)
+	if first := res.Tracks[0].FirstMs; first < int64(sec*1000)-1 || first > int64(sec*1000)+1 || first-res.StartMs < 19000 || first-res.StartMs > 21000 {
+		t.Errorf("the first caption is recorded at %d ms; the recording has it at %s s, and starts at %d ms", first, inFilm[0], res.StartMs)
+	}
+	if why := rising(percents); why != "" || len(percents) < 50 || percents[0] > 2 {
+		t.Errorf("progress: %s %v", why, percents)
+	}
+}
+
+// A script may go on after its captions and stop without the end of a
+// line. One converter writes that out as it finds it, the other adds the
+// line end; either way the track is whole, and what comes after the
+// captions is not taken for one.
+func TestAScriptThatGoesOnAfterItsCaptions(t *testing.T) {
+	tl := tools(t)
+	dir, res, _ := extracted(t, tl, madeFilm(t, tl, "tail"))
+	if len(res.Tracks) != 1 || res.Tracks[0].File != "s0.ass" || !res.Tracks[0].Done || res.Tracks[0].FirstMs != 1000 {
+		t.Fatalf("tracks: %+v", res.Tracks)
+	}
+	raw, err := os.ReadFile(filepath.Join(dir, "s0.ass"))
+	if err != nil || !bytes.Contains(raw, []byte("[Aegisub Extradata]")) || !bytes.Contains(raw, []byte("keeps for itself")) {
+		t.Fatalf("the track as written: %v\n%s", err, raw)
+	}
+	t.Logf("the track ends with the end of a line: %v", bytes.HasSuffix(raw, []byte("\n")))
+	want := []Cue{{StartMs: 1000, EndMs: 2000, Text: "One"}, {StartMs: 3000, EndMs: 4000, Text: "Two"}}
+	if got := Flatten(raw); !reflect.DeepEqual(got, want) {
+		t.Errorf("flattened: %+v", got)
+	}
+}
+
+// Films have tracks with nothing in them (a "forced" track for a film in
+// which nobody speaks a foreign language). Such a track is written like
+// any other and says that it has no first caption.
+func TestTracksWithoutCaptions(t *testing.T) {
+	tl := tools(t)
+	dir, res, _ := extracted(t, tl, madeFilm(t, tl, "hollow"))
+	if len(res.Tracks) != 5 {
+		t.Fatalf("tracks: %+v", res.Tracks)
+	}
+	for i, file := range []string{"s0.ass", "t1.vtt", "p2.sup", "p3.mks", "p4.mks"} {
+		if tr := res.Tracks[i]; tr.File != file || !tr.Done || tr.FirstMs != -1 {
+			t.Errorf("track %d: %+v, want %s, done, without a first caption", i, tr, file)
+		}
+	}
+	// A DVD's track says its size in its heading, captions or none.
+	if tr := res.Tracks[3]; tr.Width != 1920 || tr.Height != 1080 {
+		t.Errorf("the DVD track's size: %d by %d", tr.Width, tr.Height)
+	}
+	if back, err := Load(dir); err != nil || !reflect.DeepEqual(back, res) {
+		t.Errorf("read back: %v\n got %+v\nwant %+v", err, back, res)
+	}
+	if got := Flatten(mustRead(t, filepath.Join(dir, "s0.ass"))); len(got) != 0 {
+		t.Errorf("captions from a track that has none: %+v", got)
+	}
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// The sort of text track MP4 files have comes out like any other.
+func TestATextTrackFromAnMP4(t *testing.T) {
+	tl := tools(t)
+	dir, res, _ := extracted(t, tl, madeFilm(t, tl, "phone"))
+	if len(res.Tracks) != 1 || res.Tracks[0].Kind != Text || res.Tracks[0].Codec != "mov_text" || res.Tracks[0].File != "t0.vtt" ||
+		res.Tracks[0].Language != "fra" || res.Tracks[0].FirstMs != 500 || !res.Tracks[0].Done {
+		t.Fatalf("tracks: %+v", res.Tracks)
+	}
+	vtt, _ := os.ReadFile(filepath.Join(dir, "t0.vtt"))
+	if text := strings.ReplaceAll(string(vtt), "\r", ""); !strings.Contains(text, "00:00.500 --> 00:01.500\nFirst plain line\n") {
+		t.Errorf("the text track:\n%s", vtt)
+	}
+}
+
+// A film without sound is followed by its picture. (Its two text tracks
+// are in different formats, and come out in the same one.)
+func TestAFilmWithoutSoundIsFollowedByItsPicture(t *testing.T) {
+	tl := tools(t)
+	dir, res, percents := extracted(t, tl, madeFilm(t, tl, "silent"))
+	if len(res.Tracks) != 2 || res.Tracks[0].Codec != "subrip" || res.Tracks[1].Codec != "webvtt" {
+		t.Fatalf("tracks: %+v", res.Tracks)
+	}
+	for i, file := range []string{"t0.vtt", "t1.vtt"} {
+		if tr := res.Tracks[i]; tr.File != file || tr.Kind != Text || !tr.Done || tr.FirstMs != 500 {
+			t.Errorf("track %d: %+v", i, tr)
+		}
+		if text := string(mustRead(t, filepath.Join(dir, file))); text != plainAsWebVTT {
+			t.Errorf("%s:\n%q\nwant\n%q", file, text, plainAsWebVTT)
+		}
+	}
+	if why := rising(percents); why != "" || len(percents) < 50 {
+		t.Errorf("progress: %s %v", why, percents)
+	}
+}
+
+// A file that holds nothing but subtitles has nothing to follow the
+// reading by; it is read all the same, and says so when it is done.
+func TestAFileOfSubtitlesAlone(t *testing.T) {
+	tl := tools(t)
+	whole := pgs(t, 1920, 1080, twoCaptions)
+	dir, res, percents := extracted(t, tl, written(t, "alone.sup", whole))
+	if len(res.Tracks) != 1 || res.Tracks[0].File != "p0.sup" || !res.Tracks[0].Done || res.Tracks[0].FirstMs != 2000 || res.Tracks[0].Width != 1920 || res.Tracks[0].Height != 1080 {
+		t.Fatalf("tracks: %+v", res.Tracks)
+	}
+	if !reflect.DeepEqual(supPieces(t, mustRead(t, filepath.Join(dir, "p0.sup"))), supPieces(t, whole)) {
+		t.Error("the track that came out is not the one that went in")
+	}
+	if !reflect.DeepEqual(percents, []int{100}) {
+		t.Errorf("progress: %v", percents)
+	}
+}
+
+// A film with no subtitles and no fonts is not read at all: the converter
+// named here does not exist, and is never started. Its folder still gets
+// an index, so that nobody asks again.
+func TestAFilmWithNothingToTakeIsNotRead(t *testing.T) {
+	tl := tools(t)
+	tl.FFmpeg = filepath.Join(t.TempDir(), "no-such-converter")
+	dir, res, percents := extracted(t, tl, madeFilm(t, tools(t), "bare"))
+	if len(res.Tracks) != 0 || len(res.Fonts) != 0 || res.DurationMs < 5900 {
+		t.Errorf("result: %+v", res)
+	}
+	if !reflect.DeepEqual(percents, []int{100}) {
+		t.Errorf("progress: %v", percents)
+	}
+	if back, err := Load(dir); err != nil || !reflect.DeepEqual(back, res) {
+		t.Errorf("read back: %+v, %v", back, err)
+	}
+}
+
+// A film with fonts and no subtitles gives up its fonts without being
+// read through.
+func TestFontsAloneNeedNoReading(t *testing.T) {
+	tl := tools(t)
+	dir, res, percents := extracted(t, tl, madeFilm(t, tl, "fonts"))
+	if len(res.Tracks) != 0 || len(res.Fonts) != 1 || res.Fonts[0] != (Font{K: 0, File: "fonts/f0", Size: int64(len(fontA)), Name: "Only.ttf", Mime: "font/ttf"}) {
+		t.Errorf("result: %+v", res)
+	}
+	if got, _ := os.ReadFile(filepath.Join(dir, "fonts", "f0")); !bytes.Equal(got, fontA) {
+		t.Errorf("the font is not the film's: %d bytes", len(got))
+	}
+	if !reflect.DeepEqual(percents, []int{100}) {
+		t.Errorf("progress: %v", percents)
+	}
+}
+
+// The twin of the test of the same name in internal/hls: every argument
+// but the film's path is made of numbers and of words from this package,
+// whatever the film says about itself.
+func TestCommandLineIsBuiltOnlyFromTypedValues(t *testing.T) {
+	path := `C:\Films\A "quoted"; rm -rf, [in] 'x' -map 0.mkv`
+	plain := regexp.MustCompile(`^[A-Za-z0-9_.:/-]+$`)
+	hostile := `ass -f null; shutdown "now" /etc/passwd`
+	seen := inventory{durationMs: 7200000, clock: clockSound}
+	for n, codec := range []string{"ass", "subrip", "hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle", "mov_text", "ssa", "webvtt", "dvb_teletext", "eia_608", hostile, ""} {
+		seen.tracks = append(seen.tracks, Track{N: n, Codec: codec, Kind: KindOf(codec), Language: hostile, Title: hostile})
+	}
+	seen.attachments = []attachment{{name: hostile + ".ttf", mime: "font/ttf"}, {name: "cover.jpg", mime: "image/jpeg"}, {name: "x", mime: hostile}, {name: `..\..\evil.otf`, mime: hostile}, {}}
+	for _, c := range []clock{clockSound, clockPicture, clockNone} {
+		seen.clock = c
+		a := plan(seen).args(path)
+		paths := 0
+		for i, x := range a {
+			switch {
+			case x == path:
+				// One argument, exactly as given, right after -i.
+				if paths++; a[i-1] != "-i" {
+					t.Errorf("the path follows %q", a[i-1])
+				}
+			case !plain.MatchString(x):
+				t.Errorf("the argument %q is not made of plain words and numbers", x)
+			case strings.Contains(x, "Films") || strings.Contains(x, "passwd") || strings.Contains(x, "shutdown") || strings.Contains(x, "null") || strings.Contains(x, "evil") || strings.Contains(x, "cover"):
+				t.Errorf("the argument %q holds text from outside", x)
+			}
+		}
+		if paths != 1 {
+			t.Errorf("the path is given %d times: %q", paths, a)
+		}
+		joined := "\x00" + strings.Join(a, "\x00") + "\x00"
+		for _, want := range []string{
+			"\x00-copyts\x00-i\x00", "\x00-nostdin\x00", "\x00-y\x00",
+			"-dump_attachment:t:0\x00fonts/f0\x00", "-dump_attachment:t:3\x00fonts/f3\x00", "-dump_attachment:t:4\x00fonts/f4\x00",
+			"-map\x000:s:0\x00-c\x00copy\x00-f\x00ass\x00s0.ass\x00",
+			// A text track is copied out as it is, and its file is written
+			// from that copy afterwards. Only the sort MP4 files have is
+			// converted by ffmpeg.
+			"-map\x000:s:1\x00-c\x00copy\x00-map_metadata\x00-1\x00-map_chapters\x00-1\x00-f\x00matroska\x00t1.mks\x00",
+			"-map\x000:s:2\x00-c\x00copy\x00-f\x00sup\x00p2.sup\x00",
+			"-map\x000:s:3\x00-c\x00copy\x00-map_metadata\x00-1\x00-map_chapters\x00-1\x00-f\x00matroska\x00p3.mks\x00",
+			"\x00p4.mks\x00", "-map\x000:s:5\x00-c\x00webvtt\x00-f\x00webvtt\x00t5.vtt\x00", "\x00s6.ass\x00", "\x00-f\x00matroska\x00t7.mks\x00",
+		} {
+			if !strings.Contains(joined, want) {
+				t.Errorf("missing %q in %q", strings.ReplaceAll(want, "\x00", " "), a)
+			}
+		}
+		// What is not a font by its own account is not written, and a sort
+		// of track that cannot be used is not asked for.
+		for _, not := range []string{"fonts/f1\x00", "fonts/f2\x00", "0:s:8\x00", "0:s:9\x00", "0:s:10\x00", "0:s:11\x00", "\x00-t\x00", "t1.vtt", "t7.vtt"} {
+			if strings.Contains(joined, not) {
+				t.Errorf("%q should not be in %q", strings.ReplaceAll(not, "\x00", " "), a)
+			}
+		}
+		clockArgs := map[clock]string{clockSound: "-map\x000:a:0\x00-c\x00copy\x00-f\x00mkvtimestamp_v2\x00-flush_packets\x001\x00pipe:1\x00",
+			clockPicture: "-map\x000:V:0\x00-c\x00copy\x00-f\x00mkvtimestamp_v2\x00-flush_packets\x001\x00pipe:1\x00"}[c]
+		if got := strings.Contains(joined, "pipe:1"); got != (c != clockNone) || !strings.HasSuffix(joined, clockArgs) {
+			t.Errorf("the clock for %v: %q", c, a)
+		}
+	}
+	// With only fonts to fetch, none of the film is read.
+	fontsOnly := inventory{clock: clockSound, attachments: []attachment{{name: "a.ttf"}}}
+	if a := "\x00" + strings.Join(plan(fontsOnly).args(path), "\x00"); !strings.Contains(a, "\x00-t\x000\x00-f\x00mkvtimestamp_v2") {
+		t.Errorf("fonts only: %q", a)
+	}
+	// With nothing to fetch, or fonts in a file with nothing to keep time
+	// by, ffmpeg is not run.
+	for _, f := range []inventory{{clock: clockSound}, {clock: clockNone, attachments: []attachment{{name: "a.ttf"}}}, {clock: clockSound, tracks: []Track{{Codec: "dvb_teletext"}}}} {
+		if plan(f).runs() {
+			t.Errorf("ffmpeg would be run for %+v", f)
+		}
+	}
+}
+
+// Windows takes a command line of at most 32,767 characters. However many
+// tracks and fonts a file claims to have, the command stays well inside
+// that, with a file name as long as Windows ordinarily allows.
+func TestTheLongestCommandLineFitsOnWindows(t *testing.T) {
+	path := `C:\` + strings.Repeat("a", 259-len(`C:\.mkv`)) + ".mkv"
+	var seen inventory
+	seen.clock = clockSound
+	for n := 0; n < 5000; n++ {
+		seen.tracks = append(seen.tracks, Track{N: n, Codec: "dvd_subtitle"})
+		seen.attachments = append(seen.attachments, attachment{name: "f.ttf"})
+	}
+	j := plan(seen)
+	a := j.args(path)
+	length := len(a) // a space after each, and room for quotes
+	for _, x := range a {
+		length += len(x) + 2
+	}
+	if j.outputs() != maxTracks || len(j.fonts) != maxFonts || length > 30000 {
+		t.Errorf("%d tracks and %d fonts are asked for in a command of %d characters", j.outputs(), len(j.fonts), length)
+	}
+	// The tracks that were left are said to be not done.
+	if last := j.forms[len(j.forms)-1]; last != formNone {
+		t.Errorf("track 4999 would be written as %v", last)
+	}
+}
+
+// What follows uses the stand-in, and so runs everywhere.
+
+// A good run: the reports follow the stand-in's clock (0, 10, 50, 99.9 and
+// 100.5 seconds of a film of 100), and 100 comes only when all is in place.
+func TestProgressFollowsTheClock(t *testing.T) {
+	tl := standInTools(t, "ok")
+	dir, res, percents := extracted(t, tl, "any.mkv")
+	if !reflect.DeepEqual(percents, []int{0, 10, 50, 99, 100}) {
+		t.Errorf("progress: %v", percents)
+	}
+	if len(res.Tracks) != 3 || !res.Tracks[0].Done || !res.Tracks[1].Done || !res.Tracks[2].Done || len(res.Fonts) != 1 ||
+		res.Tracks[0].FirstMs != 1000 || res.Tracks[1].FirstMs != 500 || res.Tracks[2].FirstMs != 2000 || res.Tracks[2].Width != 1920 {
+		t.Errorf("result: %+v", res)
+	}
+	if got := strings.Join(onlyOwnNames(t, dir), " "); got != "fonts fonts/f0 index.json p2.sup s0.ass t1.vtt" {
+		t.Errorf("the folder holds: %s", got)
+	}
+}
+
+// ffmpeg is started inside the folder it writes into. A film, a folder or
+// a converter given by a path that starts from where this program is must
+// still be found from there.
+func TestPathsThatAreNotWholeStillLead(t *testing.T) {
+	tl := standInTools(t, "ok")
+	here, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := t.TempDir()
+	t.Chdir(base)
+	rel, err := filepath.Rel(base, tl.FFmpeg)
+	if err != nil {
+		t.Skipf("the test program cannot be reached from the temporary folder by a relative path: %v", err) // another drive, on Windows
+	}
+	tl.FFmpeg = rel
+	res, err := Extract(context.Background(), tl, filepath.Join("films", "any.mkv"), filepath.Join("cache", "subs"), nil)
+	if err != nil || len(res.Tracks) != 3 {
+		t.Fatalf("with paths that are not whole: %+v, %v", res, err)
+	}
+	if _, err := Load(filepath.Join(base, "cache", "subs")); err != nil {
+		t.Errorf("the result is not where it was asked for (the test began in %s): %v", here, err)
+	}
+}
+
+// nothingKept fails the test unless the folder is as a run that did not
+// finish must leave it: no index, nothing of the making, and Load saying
+// so.
+func nothingKept(t *testing.T, dir string) {
+	t.Helper()
+	if _, err := Load(dir); !errors.Is(err, ErrNotExtracted) {
+		t.Errorf("Load after a run that did not finish: %v", err)
+	}
+	for _, name := range []string{indexName, indexName + ".tmp", workName} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, fs.ErrNotExist) {
+			t.Errorf("%s is still there: %v", name, err)
+		}
+	}
+}
+
+// When the caller's context ends, ffmpeg is stopped (the stand-in would
+// otherwise never end) and nothing is kept. While it runs, a second run
+// for the same folder is refused.
+func TestStoppingEndsTheConverterAndKeepsNothing(t *testing.T) {
+	tl := standInTools(t, "hang")
+	dir := filepath.Join(t.TempDir(), "subs")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	running := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		first := true
+		_, err := Extract(ctx, tl, "any.mkv", dir, func(p int) {
+			if first {
+				first = false
+				close(running)
+			}
+		})
+		done <- err
+	}()
+	select {
+	case <-running:
+	case err := <-done:
+		t.Fatalf("the run ended before it reported anything: %v", err)
+	case <-time.After(time.Minute):
+		t.Fatal("the stand-in never reported")
+	}
+	// (Were it not refused it would hang like the first, so it is given an
+	// end of its own.)
+	second, enough := context.WithTimeout(context.Background(), 20*time.Second)
+	if _, err := Extract(second, tl, "any.mkv", dir, nil); !errors.Is(err, ErrBusy) {
+		t.Errorf("a second run for the same folder: %v", err)
+	}
+	enough()
+	if _, err := os.Stat(filepath.Join(dir, workName, "p2.sup")); err != nil {
+		t.Errorf("the stand-in should have written into the working folder by now: %v", err)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("stopped: %v", err)
+		}
+	case <-time.After(time.Minute):
+		t.Fatal("Extract did not return after its context ended")
+	}
+	nothingKept(t, dir)
+	// A context that has already ended starts nothing.
+	if _, err := Extract(ctx, tl, "any.mkv", dir, nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("with a context that had ended: %v", err)
+	}
+	nothingKept(t, dir)
+}
+
+// When ffmpeg fails, nothing is kept, although files were written; an
+// earlier result in the same folder is not left looking good; and the
+// error names the film without the folder it is in.
+func TestAFailedRunLeavesNoResult(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "subs")
+	if _, err := Extract(context.Background(), standInTools(t, "ok"), "any.mkv", dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(dir); err != nil {
+		t.Fatal(err)
+	}
+	library := filepath.Join(t.TempDir(), "Household Videos")
+	_, err := Extract(context.Background(), standInTools(t, "fail"), filepath.Join(library, "Test Film (2020).mkv"), dir, nil)
+	if err == nil || !strings.Contains(err.Error(), "Test Film (2020).mkv") || strings.Contains(err.Error(), "Household") || strings.Contains(err.Error(), filepath.Dir(library)) {
+		t.Errorf("the error should name the film and not its folder: %v", err)
+	}
+	nothingKept(t, dir)
+}
+
+// ffmpeg ending well is not enough: every file has to be there and
+// complete. A file cut short, as a full disk leaves it, makes the whole
+// run count for nothing.
+func TestAFileCutShortIsNotAResult(t *testing.T) {
+	for _, how := range []string{"cut-sup", "cut-ass", "cut-txt", "no-sup", "no-txt"} {
+		t.Run(how, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "subs")
+			var percents []int
+			_, err := Extract(context.Background(), standInTools(t, how), "any.mkv", dir, func(p int) { percents = append(percents, p) })
+			if err == nil || !strings.Contains(err.Error(), "was not written whole") {
+				t.Errorf("error: %v", err)
+			}
+			if len(percents) > 0 && percents[len(percents)-1] == 100 {
+				t.Errorf("a run that failed reported 100: %v", percents)
+			}
+			nothingKept(t, dir)
+		})
+	}
+	// An attachment with nothing in it is no font, and no reason to fail.
+	dir := filepath.Join(t.TempDir(), "subs")
+	res, err := Extract(context.Background(), standInTools(t, "cut-font"), "any.mkv", dir, nil)
+	if err != nil || len(res.Fonts) != 0 || len(res.Tracks) != 3 {
+		t.Errorf("with an empty attachment: %+v, %v", res, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "fonts", "f0")); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("the empty attachment was kept: %v", err)
+	}
+}
+
+// The real thing: ffmpeg writing to a disk that is full. Linux has a file
+// that behaves like one ("/dev/full": every write to it fails for lack of
+// space), and a link to it is put where ffmpeg is about to write.
+func TestAFullDiskLeavesNoResult(t *testing.T) {
+	tl := tools(t)
+	if runtime.GOOS != "linux" {
+		t.Skip("needs /dev/full, which only Linux has")
+	}
+	if _, err := os.Stat("/dev/full"); err != nil {
+		t.Skip("this machine has no /dev/full")
+	}
+	path := madeFilm(t, tl, "five")
+	// (Of a text track, ffmpeg writes a copy and this package the file that
+	// is kept. The disk can be full for either.)
+	for _, name := range []string{"s0.ass", "t1.mks", "t1.vtt", "p2.sup", "p3.mks"} {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "subs")
+			e := &extraction{tools: tl, film: path, dir: dir, prepared: func(work string) {
+				if err := os.Symlink("/dev/full", filepath.Join(work, name)); err != nil {
+					t.Error(err)
+				}
+			}}
+			_, err := e.run(context.Background())
+			if err == nil {
+				t.Error("a run whose disk was full for " + name + " counted")
+			} else if strings.Contains(err.Error(), filepath.Dir(path)) || strings.Contains(err.Error(), filepath.Dir(dir)) {
+				t.Errorf("the error names the film's folder or the one written to: %v", err)
+			}
+			nothingKept(t, dir)
+		})
+	}
+	// The same for a font, in the film that has them.
+	dir := filepath.Join(t.TempDir(), "subs")
+	e := &extraction{tools: tl, film: madeFilm(t, tl, "styled"), dir: dir, prepared: func(work string) {
+		if err := os.Symlink("/dev/full", filepath.Join(work, "fonts", "f0")); err != nil {
+			t.Error(err)
+		}
+	}}
+	if _, err := e.run(context.Background()); err == nil {
+		t.Error("a run whose disk was full for a font counted")
+	}
+	nothingKept(t, dir)
+}
+
+// Load trusts a folder only as far as it can check: the index must be this
+// version's, every file it lists must be there at its length, and every
+// name in it must be one this package gives.
+func TestLoadRefusesAFolderThatIsNotWhole(t *testing.T) {
+	fresh := func(t *testing.T) string {
+		dir := filepath.Join(t.TempDir(), "subs")
+		if _, err := Extract(context.Background(), standInTools(t, "ok"), "any.mkv", dir, nil); err != nil {
+			t.Fatal(err)
+		}
+		return dir
+	}
+	rewrite := func(t *testing.T, dir string, change func(idx map[string]any)) {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(dir, indexName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var idx map[string]any
+		if err := json.Unmarshal(b, &idx); err != nil {
+			t.Fatal(err)
+		}
+		change(idx)
+		b, _ = json.Marshal(idx)
+		if err := os.WriteFile(filepath.Join(dir, indexName), b, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	track := func(idx map[string]any, n int) map[string]any { return idx["tracks"].([]any)[n].(map[string]any) }
+	for name, spoil := range map[string]func(t *testing.T, dir string){
+		"a track's file is gone":  func(t *testing.T, dir string) { os.Remove(filepath.Join(dir, "p2.sup")) },
+		"a track's file is short": func(t *testing.T, dir string) { os.Truncate(filepath.Join(dir, "s0.ass"), 100) },
+		"a font is gone":          func(t *testing.T, dir string) { os.Remove(filepath.Join(dir, "fonts", "f0")) },
+		"the index is gone":       func(t *testing.T, dir string) { os.Remove(filepath.Join(dir, indexName)) },
+		"the index is cut short":  func(t *testing.T, dir string) { os.Truncate(filepath.Join(dir, indexName), 40) },
+		"another version's index": func(t *testing.T, dir string) {
+			rewrite(t, dir, func(idx map[string]any) { idx["version"] = indexVersion + 1 })
+		},
+		"a name from somewhere": func(t *testing.T, dir string) {
+			rewrite(t, dir, func(idx map[string]any) { track(idx, 0)["file"] = "../s0.ass" })
+		},
+		"another track's file": func(t *testing.T, dir string) {
+			rewrite(t, dir, func(idx map[string]any) { track(idx, 0)["file"] = "t1.vtt" })
+		},
+		"a font from somewhere": func(t *testing.T, dir string) {
+			rewrite(t, dir, func(idx map[string]any) { idx["fonts"].([]any)[0].(map[string]any)["file"] = "index.json" })
+		},
+		"tracks in another order": func(t *testing.T, dir string) { rewrite(t, dir, func(idx map[string]any) { track(idx, 1)["n"] = 5 }) },
+		"a file said to be undone": func(t *testing.T, dir string) {
+			rewrite(t, dir, func(idx map[string]any) { track(idx, 2)["done"] = false })
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := fresh(t)
+			if _, err := Load(dir); err != nil {
+				t.Fatal(err)
+			}
+			spoil(t, dir)
+			if res, err := Load(dir); !errors.Is(err, ErrNotExtracted) {
+				t.Errorf("Load: %+v, %v", res, err)
+			}
+		})
+	}
+	if _, err := Load(filepath.Join(t.TempDir(), "never made")); !errors.Is(err, ErrNotExtracted) {
+		t.Errorf("Load of a folder that is not there: %v", err)
+	}
+}
+
+// What ffprobe says about a film is read with care: tracks are numbered in
+// the file's order whatever sort they are, a cover picture is not the
+// film's picture, and what the film says about itself is cut to a length
+// worth keeping.
+func TestReadingWhatAFilmHolds(t *testing.T) {
+	long := strings.Repeat("x", 5000)
+	f, err := parseInspection([]byte(`{"format": {"start_time": "-0.023000", "duration": "5400.500000"}, "streams": [
+	 {"codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}},
+	 {"codec_type": "subtitle", "codec_name": "dvb_teletext", "tags": {"language": "und"}},
+	 {"codec_type": "subtitle", "codec_name": "ass", "tags": {"LANGUAGE": "ENG", "TITLE": "` + long + `"}, "disposition": {"default": 1, "hearing_impaired": 1}},
+	 {"codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle", "tags": {"title": "Director's Commentary"}, "disposition": {"forced": 1}},
+	 {"codec_type": "attachment", "codec_name": "ttf", "tags": {"filename": "A.TTF", "mimetype": "application/x-truetype-font"}},
+	 {"codec_type": "data", "codec_name": "bin_data"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.durationMs != 5400500 || f.startMs != -23 || f.clock != clockNone || len(f.tracks) != 3 || len(f.attachments) != 1 {
+		t.Fatalf("read as %+v", f)
+	}
+	want := []Track{
+		{N: 0, Kind: Other, Codec: "dvb_teletext", FirstMs: -1},
+		{N: 1, Kind: Styled, Codec: "ass", Language: "eng", Title: long[:200], Default: true, HearingImpaired: true, FirstMs: -1},
+		{N: 2, Kind: Picture, Codec: "hdmv_pgs_subtitle", Title: "Director's Commentary", Forced: true, Commentary: true, FirstMs: -1},
+	}
+	if !reflect.DeepEqual(f.tracks, want) {
+		t.Errorf("tracks:\n got %+v\nwant %+v", f.tracks, want)
+	}
+	if _, err := parseInspection([]byte("not what ffprobe writes")); err == nil {
+		t.Error("nonsense was read as a film")
+	}
+	// What the reading is followed by: the first sound track if it is of a
+	// sort that comes in few enough pieces, else the picture, else whatever
+	// there is.
+	for streams, want := range map[string]clock{
+		`{"codec_type": "video", "codec_name": "hevc"}, {"codec_type": "audio", "codec_name": "eac3"}`:                                                 clockSound,
+		`{"codec_type": "video", "codec_name": "hevc"}, {"codec_type": "audio", "codec_name": "truehd"}, {"codec_type": "audio", "codec_name": "ac3"}`: clockPicture,
+		`{"codec_type": "audio", "codec_name": "ac3"}, {"codec_type": "audio", "codec_name": "truehd"}, {"codec_type": "video", "codec_name": "hevc"}`: clockSound,
+		`{"codec_type": "video", "codec_name": "h264"}, {"codec_type": "audio", "codec_name": "pcm_s16le"}`:                                            clockPicture,
+		`{"codec_type": "audio", "codec_name": "truehd"}`:                                                                                              clockSound,
+		`{"codec_type": "audio", "codec_name": "truehd"}, {"codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}}`:          clockSound,
+		`{"codec_type": "video", "codec_name": "h264"}`:                                                                                                clockPicture,
+		`{"codec_type": "subtitle", "codec_name": "ass"}`:                                                                                              clockNone,
+	} {
+		if f, err := parseInspection([]byte(`{"format": {}, "streams": [` + streams + `]}`)); err != nil || f.clock != want {
+			t.Errorf("a file with %s is followed by %v (%v), want %v", streams, f.clock, err, want)
+		}
+	}
+	for codec, want := range map[string]Kind{"ass": Styled, "ssa": Styled, "subrip": Text, "mov_text": Text, "webvtt": Text, "text": Text,
+		"hdmv_pgs_subtitle": Picture, "dvd_subtitle": Picture, "dvb_subtitle": Picture, "dvb_teletext": Other, "eia_608": Other, "": Other, "h264": Other} {
+		if got := KindOf(codec); got != want {
+			t.Errorf("KindOf(%q) = %q, want %q", codec, got, want)
+		}
+	}
+	// Which attachments are worth writing out to look at.
+	for a, want := range map[attachment]bool{
+		{name: "Arial.TTF", mime: "application/octet-stream"}: true, {name: "x", mime: "font/otf"}: true, {name: "x", mime: "application/vnd.ms-opentype"}: true,
+		{name: "x", mime: "application/x-truetype-font"}: true, {name: "", mime: ""}: true, {name: "x.bin", mime: "application/octet-stream"}: true,
+		{name: "cover.jpg", mime: "image/jpeg"}: false, {name: "notes.txt", mime: "text/plain"}: false, {name: "x", mime: "application/pdf"}: false,
+	} {
+		if got := a.mayBeFont(); got != want {
+			t.Errorf("%+v worth looking at: %v, want %v", a, got, want)
+		}
+	}
+}
+
+// A folder may be used again: for the same film after it changed, or
+// after this package changed what it writes. What an earlier run left
+// there must not outlive it. A font from the film as it was would be
+// drawn with (the program that draws styled subtitles takes every font in
+// the folder), and a track's file would lie about with nothing to say it
+// is stale. Only files with this package's own names are removed.
+func TestAFolderUsedAgainHoldsOnlyTheNewResult(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "subs")
+	if _, err := Extract(context.Background(), standInTools(t, "ok"), "any.mkv", dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(onlyOwnNames(t, dir), " "); got != "fonts fonts/f0 index.json p2.sup s0.ass t1.vtt" {
+		t.Fatalf("after the first run the folder holds: %s", got)
+	}
+	// Someone else's files, which are nobody's to remove.
+	for _, name := range []string{"notes.txt", "fonts/README", "s0.ass.bak", "p2.sup.old"} {
+		if err := os.WriteFile(filepath.Join(dir, filepath.FromSlash(name)), []byte("not ours"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The film as it is now: one styled track, no font.
+	t.Setenv(standInFilmVar, `{"format": {"start_time": "0.000000", "duration": "100.000000"}, "streams": [{"codec_type": "audio", "codec_name": "ac3"}, {"codec_type": "subtitle", "codec_name": "ass"}]}`)
+	res, err := Extract(context.Background(), standInTools(t, "ok"), "any.mkv", dir, nil)
+	if err != nil || len(res.Tracks) != 1 || len(res.Fonts) != 0 {
+		t.Fatalf("the second run: %+v, %v", res, err)
+	}
+	var names []string
+	filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if rel, _ := filepath.Rel(dir, path); rel != "." {
+			names = append(names, filepath.ToSlash(rel))
+		}
+		return err
+	})
+	if got := strings.Join(names, " "); got != "fonts fonts/README index.json notes.txt p2.sup.old s0.ass s0.ass.bak" {
+		t.Errorf("after the second run the folder holds: %s", got)
+	}
+	if back, err := Load(dir); err != nil || !reflect.DeepEqual(back, res) {
+		t.Errorf("read back: %+v, %v", back, err)
+	}
+}
+
+// A film can claim any number of attachments. Past the most this package
+// takes, the rest are left, and the result says how many, so that nobody
+// takes a missing font for a fault in the film.
+func TestFontsLeftOutAreCounted(t *testing.T) {
+	film := `{"format": {"start_time": "0.000000", "duration": "100.000000"}, "streams": [{"codec_type": "audio", "codec_name": "ac3"}, {"codec_type": "subtitle", "codec_name": "ass"}, {"codec_type": "attachment", "tags": {"filename": "cover.jpg", "mimetype": "image/jpeg"}}` +
+		strings.Repeat(`, {"codec_type": "attachment", "tags": {"filename": "A.ttf", "mimetype": "font/ttf"}}`, maxFonts+2) + `]}`
+	t.Setenv(standInFilmVar, film)
+	dir, res, _ := extracted(t, standInTools(t, "ok"), "any.mkv")
+	// (The cover picture is attachment 0, so the fonts are 1 to 300, and
+	// 301 and 302 are the ones left.)
+	if len(res.Fonts) != maxFonts || res.FontsLeftOut != 2 || res.Fonts[0].K != 1 || res.Fonts[maxFonts-1].K != maxFonts {
+		t.Errorf("%d fonts, %d left out, the first is attachment %d", len(res.Fonts), res.FontsLeftOut, res.Fonts[0].K)
+	}
+	if back, err := Load(dir); err != nil || back.FontsLeftOut != 2 || len(back.Fonts) != maxFonts {
+		t.Errorf("read back: %d fonts, %d left out, %v", len(back.Fonts), back.FontsLeftOut, err)
+	}
+	// An ordinary film has none left out, and its index does not speak of it.
+	t.Setenv(standInFilmVar, "")
+	dir, res, _ = extracted(t, standInTools(t, "ok"), "any.mkv")
+	if res.FontsLeftOut != 0 || bytes.Contains(mustRead(t, filepath.Join(dir, indexName)), []byte("LeftOut")) {
+		t.Errorf("an ordinary film: %d fonts left out", res.FontsLeftOut)
+	}
+}
+
+// What a film says about itself is kept as words to show. It is still made
+// fit to be shown on one line, and a language is kept only if it has the
+// shape of one, so that nothing a later step does with it can go wrong.
+func TestWhatAFilmSaysAboutItselfIsTidied(t *testing.T) {
+	f, err := parseInspection([]byte(`{"format": {}, "streams": [
+	 {"codec_type": "subtitle", "codec_name": "ass", "tags": {"language": "ENG", "title": "Line one\nline two\ttabbed\u0000\u0007 \u2028end  "}},
+	 {"codec_type": "subtitle", "codec_name": "ass", "tags": {"language": "en-US", "title": "\n\n"}},
+	 {"codec_type": "subtitle", "codec_name": "ass", "tags": {"language": "pt_BR", "title": "Français (forcé) 日本語"}}]}`))
+	if err != nil || len(f.tracks) != 3 {
+		t.Fatalf("%+v, %v", f, err)
+	}
+	if got := []string{f.tracks[0].Title, f.tracks[1].Title, f.tracks[2].Title}; !reflect.DeepEqual(got, []string{"Line one line two tabbed end", "", "Français (forcé) 日本語"}) {
+		t.Errorf("titles: %q", got)
+	}
+	if got := []string{f.tracks[0].Language, f.tracks[1].Language, f.tracks[2].Language}; !reflect.DeepEqual(got, []string{"eng", "en-us", "pt-br"}) {
+		t.Errorf("languages: %q", got)
+	}
+	for said, want := range map[string]string{
+		"nor": "nor", "NO": "no", " nor ": "nor", "English": "english", "zh-Hant-TW": "zh-hant-tw", "sr-Latn": "sr-latn", "es-419": "es-419",
+		"und": "", "": "", "../..": "", "-vf": "", "en us": "", "e": "", "eng;rm": "", "eng\nnor": "", "en--us": "", "en-": "", "1eng": "",
+		"abcdefghi": "", "a-very-long-row-of-parts-that-no-language-has": "", "nor/eng": "", `nor\eng`: "", "C:": "",
+	} {
+		if got := language(said); got != want {
+			t.Errorf("the language %q is kept as %q, want %q", said, got, want)
+		}
+	}
+	// The name a film gives a font is tidied the same way.
+	t.Setenv(standInFilmVar, `{"format": {"start_time": "0.000000", "duration": "100.000000"}, "streams": [{"codec_type": "audio", "codec_name": "ac3"}, {"codec_type": "subtitle", "codec_name": "ass"},
+	 {"codec_type": "attachment", "tags": {"filename": "Evil\nName\r\n.ttf", "mimetype": "font/ttf\n"}}]}`)
+	_, res, _ := extracted(t, standInTools(t, "ok"), "any.mkv")
+	if len(res.Fonts) != 1 || res.Fonts[0].Name != "Evil Name .ttf" || res.Fonts[0].Mime != "font/ttf" {
+		t.Errorf("fonts: %+v", res.Fonts)
+	}
+}
+
+// An error says what went wrong without saying where on the PC the
+// program keeps its files: the folder's place can hold a person's name,
+// and errors are logged and travel in support bundles.
+func TestErrorsDoNotNameTheFolder(t *testing.T) {
+	base := t.TempDir()
+	private := filepath.Join(base, "Private Folder Name")
+	// A file stands where the folder should be made.
+	if err := os.WriteFile(private, []byte("in the way"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Extract(context.Background(), standInTools(t, "ok"), "any.mkv", filepath.Join(private, "cache", "subs"), nil)
+	if err == nil || strings.Contains(err.Error(), "Private") || strings.Contains(err.Error(), base) {
+		t.Errorf("error: %v", err)
+	}
+	// What it is about is still there to read.
+	if err != nil && !strings.Contains(err.Error(), "mkdir") {
+		t.Errorf("the error no longer says what failed: %v", err)
+	}
+	// And what kind of error it is can still be asked.
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Extract(ended, standInTools(t, "ok"), "any.mkv", filepath.Join(base, "Another Private Name", "subs"), nil); !errors.Is(err, context.Canceled) {
+		t.Errorf("with a context that had ended: %v", err)
+	}
+	// A file of the output that cannot be read back: the copy of the text
+	// track is cut short.
+	dir := filepath.Join(base, "Third Private Name", "subs")
+	_, err = Extract(context.Background(), standInTools(t, "cut-txt"), "any.mkv", dir, nil)
+	if err == nil || strings.Contains(err.Error(), "Private") || !errors.Is(err, errNotWhole) {
+		t.Errorf("error: %v", err)
+	}
+}
+
+// A film given by a path that is not whole is found by the real ffmpeg
+// too, although ffmpeg is started in another folder.
+func TestAFilmGivenByAShortPathIsFound(t *testing.T) {
+	tl := tools(t)
+	film := madeFilm(t, tl, "five")
+	t.Chdir(filepath.Dir(film))
+	out := t.TempDir()
+	res, err := Extract(context.Background(), tl, filepath.Base(film), filepath.Join(out, "subs"), nil)
+	if err != nil || len(res.Tracks) != 5 || !res.Tracks[0].Done || !res.Tracks[4].Done {
+		t.Fatalf("with the film's bare name: %+v, %v", res, err)
+	}
+	// And a folder given the same way is the one the files go to.
+	t.Chdir(out)
+	if _, err := Extract(context.Background(), tl, film, "short", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(filepath.Join(out, "short")); err != nil {
+		t.Errorf("the result is not in the folder that was named: %v", err)
+	}
+}
+
+// Load takes a name from the index only if it is one this package gives
+// that track or font. Here the index names a file that is there, outside
+// the folder, at exactly the length it says: only the name is wrong.
+func TestLoadRefusesANameThisPackageDoesNotGive(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "subs")
+	if _, err := Extract(context.Background(), standInTools(t, "ok"), "any.mkv", dir, nil); err != nil {
+		t.Fatal(err)
+	}
+	for outside, inside := range map[string]string{"outside.ass": "s0.ass", "outside-font": "fonts/f0", "outside.vtt": "t1.vtt"} {
+		if err := os.WriteFile(filepath.Join(filepath.Dir(dir), outside), mustRead(t, filepath.Join(dir, filepath.FromSlash(inside))), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A copy inside the folder too, under a name that is not the track's.
+	if err := os.WriteFile(filepath.Join(dir, "s7.ass"), mustRead(t, filepath.Join(dir, "s0.ass")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "fonts", "f9"), mustRead(t, filepath.Join(dir, "fonts", "f0")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	index := mustRead(t, filepath.Join(dir, indexName))
+	for _, swap := range [][2]string{
+		{`"file": "s0.ass"`, `"file": "../outside.ass"`}, {`"file": "fonts/f0"`, `"file": "../outside-font"`}, {`"file": "t1.vtt"`, `"file": "../outside.vtt"`},
+		{`"file": "s0.ass"`, `"file": "s7.ass"`}, {`"file": "fonts/f0"`, `"file": "fonts/f9"`}, {`"file": "s0.ass"`, `"file": "./s0.ass"`},
+	} {
+		if !bytes.Contains(index, []byte(swap[0])) {
+			t.Fatalf("the index does not hold %s:\n%s", swap[0], index)
+		}
+		if err := os.WriteFile(filepath.Join(dir, indexName), bytes.Replace(index, []byte(swap[0]), []byte(swap[1]), 1), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if res, err := Load(dir); !errors.Is(err, ErrNotExtracted) {
+			t.Errorf("an index with %s was taken: %+v, %v", swap[1], res, err)
+		}
+	}
+	os.WriteFile(filepath.Join(dir, indexName), index, 0o600)
+	if _, err := Load(dir); err != nil {
+		t.Errorf("the index as it was: %v", err)
+	}
+}
+
+// A styled track is whole unless it stops inside a caption. What a script
+// has after its captions may end without the end of a line (one converter
+// writes it as the film has it, the other ends the line); a caption never
+// does.
+func TestCheckingAStyledTrack(t *testing.T) {
+	dir := t.TempDir()
+	head := "[Script Info]\r\nScriptType: v4.00+\r\n\r\n[Events]\r\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n"
+	for name, c := range map[string]struct {
+		file  string
+		whole bool
+		first int64
+	}{
+		"as ffmpeg writes it":                 {head + "Dialogue: 0,0:00:03.00,0:00:04.00,Default,,0,0,0,,Two\r\nDialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,One\r\n", true, 1000},
+		"no captions":                         {head, true, -1},
+		"nothing at all":                      {"", true, -1},
+		"more after the captions, ended":      {head + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,One\n\n[Aegisub Extradata]\nData: 0,e,a note\n", true, 1000},
+		"more after the captions, not ended":  {head + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,One\n\n[Aegisub Extradata]\nData: 0,e,a note", true, 1000},
+		"a heading alone, not ended":          {"[Script Info]\nScriptType: v4.00+", true, -1},
+		"cut inside a caption's words":        {head + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,On", false, -1},
+		"cut inside a caption's times":        {head + "Dialogue: 0,0:00:01.00,0:00:0", false, -1},
+		"cut inside the word that begins one": {head + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,One\r\nDialo", false, -1},
+		"cut after a caption's last letter":   {head + "Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,One", false, -1},
+		"cut after a caption's first letter":  {head + "D", false, -1},
+	} {
+		if err := os.WriteFile(filepath.Join(dir, "s4.ass"), []byte(c.file), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		facts, size, err := check(formASS, dir, 4)
+		if c.whole && (err != nil || facts.FirstMs != c.first || size != int64(len(c.file))) {
+			t.Errorf("%s: first caption at %d ms, %d bytes, %v", name, facts.FirstMs, size, err)
+		}
+		if !c.whole && !errors.Is(err, errNotWhole) {
+			t.Errorf("%s: taken for whole: %v", name, err)
+		}
+	}
+	if _, _, err := check(formASS, dir, 5); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("a file that is not there: %v", err)
+	}
+}
