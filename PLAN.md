@@ -25,6 +25,32 @@ I cannot promise dates. Each milestone is several working sessions with me plus 
 
 **What to do now.** You have said "go", so M0 is under way. Two things remain, in any order: make the repository public (the repository is the project's page on GitHub, where the code is kept; the steps are in the next section), and tell me what the server PC runs and whether there is a TV (question 1 there).
 
+## Where the work stands (26 November 2026), for whoever carries on
+
+This section is for a new chat that picks the project up, for example one running on the owner's own PC. Everything it needs is in this repository, on the branch `claude/nice-ramanujan-2oa59h`. Read `CLAUDE.md` first (status, the owner's answers, the working rules), then the last three entries of `docs/decisions.md`.
+
+**Done**
+
+- M0 to M3 are built. Two versions are published: v0.3.0 and v0.3.1 (the first plus repairs, and keeping the PC awake while someone is watching). The newest is always at https://github.com/Matiaspnyhus/Local-media-project/releases/latest.
+- The owner has checked M0 only. The PC still runs a test build from 11 November, which never updates itself: **v0.3.1 has to be installed by hand once** (download `LocalMedia-Setup.exe` from the link above and run it; the library and sign-in are kept). After that the checklists `docs/checklists/M1.md`, `M2.md` and `M3.md` are the owner's to run, with a few real films in the library folder.
+
+**M4 (plays anything) is about a third built, and unfinished**
+
+- Built and on the branch: a film in a format no browser plays is converted when Play is pressed; the subtitle groundwork (`internal/subs`, nothing uses it yet); the security repair of "Open in another player"; the converter repair that makes sound wait for a converted picture.
+- At GitHub the last push (13 November, commit `b5fe8bf`) passed on Linux, Windows and ARM. **The Mac job failed in the browser test in Safari's engine; the log has not been read to the failing step.** Start there.
+- Saved in the branch's history but **not applied**, to be applied by hand one at a time: the per-device lessons and stepping down (commit `6835888`, starting point `b4b67f2`; server half never independently checked, page half only begun) and a partial repair of the Play code (commit `c8cb842`, same starting point; its last commit is unfinished). How to apply a saved commit is in the commit "Keep the helpers' unfinished work safe" and in `docs/decisions.md`.
+- Every problem found and not yet repaired is in `docs/design/M4-open-findings.md`.
+- Not started: HDR shown as normal colour, measured conversion speeds, subtitles put into the picture, the hardware test.
+- For the owner's graphics card (an NVIDIA RTX 3060 in a laptop, with an Intel Core i7): the research is in `docs/design/M4-hardware-research.md`, and `docs/design/M4-hardware.md` is a design draft that has **not** been revised. Nothing of it is built. A chat on the owner's PC is the first that can actually run the graphics card, which no machine used so far could.
+
+**Things that live outside the repository**
+
+- The line the published versions are made from (v0.3.1 is commit `c8f50fa` plus the documents) existed as a local branch on the machine the work was done on. Its commits are in this branch's history; make the branch again from that commit when the next version is put together. Versions are published by commit message, as `CLAUDE.md` describes under "Releases".
+- The tests need `ffmpeg` and `ffprobe`. The exact build that ships is named, with its checksum, in `packaging/ffmpeg.env`; the installed app has it in its own folder.
+- A separate pull request (branch `docs/relay-media-handoff`) was opened on 26 November from elsewhere. It is not part of the work described here.
+
+**M5 to M9 are not started.**
+
 ## What I need from you
 
 Nothing here blocks M0.
