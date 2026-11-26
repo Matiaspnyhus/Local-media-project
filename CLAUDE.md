@@ -23,3 +23,9 @@ Working rules:
 - The converter tests and the browser test need ffmpeg and ffprobe (on the PATH here; at GitHub the pinned build in `packaging/ffmpeg.env`). `internal/hls` is where files are repackaged; read its package comment before changing how chunks are cut.
 - Do not install Playwright in this environment; `e2e/run.mjs` uses the preinstalled one. Do not put cleanup commands that delete folders into scripts or the Makefile.
 - Never commit anything from the owner's home: file lists, support bundles, recorded app requests, device names, addresses. The repository is public or about to be, so this covers PLAN.md and this file too: record the owner's answers only as kinds of device and choices, never names or details of the household.
+
+## Relay desktop integration
+
+When changing the Windows data directory, catalog migrations or scanned paths, check compatibility with Relay, a separate local program launcher. Relay reads `%LOCALAPPDATA%\localmedia\localmedia.db` in read-only mode. `--data` can place this database elsewhere. Relay resolves each non-missing `files.rel_path` against its `libraries.path`, joins `files.version_id` → `versions.item_id` → `items.title`, and reads `files.duration_ms` when present. Keep a migration fixture covering a library on another drive and a filename containing spaces.
+
+Relay writes its own local snapshot at `%LOCALAPPDATA%\RelayHub\shared-media.json`. Version 1 contains `schemaVersion`, `generatedUtc`, `libraries` (`id`, `name`, `path`) and `files` (`id`, `title`, `path`, `libraryId`, `durationMs`). Paths are absolute Windows paths. A compatible desktop app can read `RELAY_MEDIA_MANIFEST` or use the default snapshot path. Relay’s **Open with** passes the selected original file path as one argument to the chosen executable. Local Media owns scanning and catalog updates. Keep the snapshot and media paths on the PC.
